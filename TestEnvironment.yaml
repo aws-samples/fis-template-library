@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Launch Resource to run AWS Fault Injection Simulator experiments against. 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Launch Template Configuration
+        Parameters:
+          - ImageId
+          - WebServerInstanceType
+      - Label:
+          default: Amazon EC2 Auto Scaling Configuration
+        Parameters:
+          - ASGDesiredCapacity
+          - ASGMinSize
+          - ASGMaxSize
+      - Label:
+          default: AWS Quick Start configuration
+        Parameters:
+          - QSS3BucketName
+          - QSS3BucketRegion
+          - QSS3KeyPrefix
+    ParameterLabels:
+      ImageId:
+        default: Amazon Machine Image (AMI) Id
+      WebServerInstanceType:
+        default: Instance Type
+      ASGMinSize:
+        default: Minimum Size
+      ASGMaxSize:
+        default: Maximum Size
+      ASGDesiredCapacity:
+        default: Desired Capacity
+      QSS3BucketName:
+        default: Quick Start S3 bucket name
+      QSS3BucketRegion:
+        default: Quick Start S3 bucket Region
+      QSS3KeyPrefix:
+        default: Quick Start S3 key prefix
+Parameters:
+  AvailabilityZones:
+    Description: >-
+      List of Availability Zones to use for the subnets in the VPC. The logical order is preserved. At least two Availability Zones must be provided.
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+  NumberOfAZs:
+    AllowedValues:
+      - '2'
+      - '3'
+    Default: '3'
+    Description: >-
+      Number of Availability Zones to use in the VPC. This must correspond to the number of Availability Zones entered in the Availability Zones parameter.
+    Type: String
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: 'Enter an AMI Id. The default value is Amazon Linux 2 with gp2:
+      /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2.'
+  WebServerInstanceType:
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+    Default: t3.micro
+    Description: Amazon EC2 instance type for the Internet Information Services servers
+    Type: String
+  ASGMinSize:
+    Type: Number
+    Description: Minimum instance size for the Auto Scaling Group.
+  ASGMaxSize:
+    Type: Number
+    Description: Maximum instance size for the Auto Scaling Group.
+  ASGDesiredCapacity:
+    Type: Number
+    Description: Desired capacity instance size for the Auto Scaling Group.
+  QSS3BucketName:
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    ConstraintDescription: Can include numbers, lowercase letters, uppercase letters, and hyphens (-). However, it cannot start or end with a hyphen (-).
+    Default: aws-quickstart
+    Description: S3 bucket name for the Quick Start assets. This name
+      can include numbers, lowercase letters, uppercase letters, and hyphens (-).
+      It cannot start or end with a hyphen (-).
+    Type: String
+  QSS3BucketRegion:
+    Default: us-east-1
+    Description: AWS Region where the Quick Start S3 bucket (QSS3BucketName) is hosted. Specify this value when using your own S3 bucket.
+    Type: String
+  QSS3KeyPrefix:
+    AllowedPattern: ^[0-9a-zA-Z-/]*$
+    ConstraintDescription: Can include numbers, lowercase letters,
+      uppercase letters, hyphens (-), and forward slashes (/).
+    Default: quickstart-microsoft-iis/
+    Description: S3 key prefix for the Quick Start assets. This prefix
+      can include numbers, lowercase letters, uppercase letters, hyphens (-), and
+      forward slashes (/).
+    Type: String
+Conditions:
+  UsingDefaultBucket: !Equals [!Ref QSS3BucketName, 'aws-quickstart']
+Resources:
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:
+        Fn::Sub:
+          - 'https://${S3Bucket}.s3.${S3Region}.${AWS::URLSuffix}/${QSS3KeyPrefix}submodules/quickstart-aws-vpc/templates/aws-vpc.template'
+          - S3Region: !If
+              - UsingDefaultBucket
+              - !Ref AWS::Region
+              - !Ref QSS3BucketRegion
+            S3Bucket: !If
+              - UsingDefaultBucket
+              - !Sub '${QSS3BucketName}-${AWS::Region}'
+              - !Ref QSS3BucketName
+      Parameters:
+        NumberOfAZs: !Ref 'NumberOfAZs'
+        AvailabilityZones: !Join
+          - ','
+          - !Ref 'AvailabilityZones'
+  SSMAssocLogs:
+    Type: AWS::S3::Bucket
+  LambdaSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+              Resource:
+                - !Sub "arn:aws:s3:::${SSMAssocLogs}"
+                - !Sub "arn:aws:s3:::${SSMAssocLogs}/*"
+          PolicyName: write-mof-s3
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  PutObjectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import boto3
+          import cfnresponse
+          def create_object(bucket, body, key):
+              s3 = boto3.client('s3')
+              s3.put_object(Body=body,Bucket=bucket, Key=key)
+          def delete_objects(bucket):
+              s3 = boto3.client('s3')
+              objects = s3.list_objects_v2(
+                Bucket=bucket)
+              for key in objects['Contents']:
+                 s3.delete_object(
+                    Bucket=bucket,
+                    Key=key['Key'])
+          def timeout(event, context):
+              logging.error('Execution is about to time out, sending failure response to CloudFormation')
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+          def handler(event, context):
+              # make sure we send a failure to CloudFormation if the function is going to timeout
+              timer = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5, timeout, args=[event, context])
+              timer.start()
+              print('Received event: %s' % json.dumps(event))
+              status = cfnresponse.SUCCESS
+              try:
+                  bucket = event['ResourceProperties']['Bucket']
+                  body = event['ResourceProperties']['Body']
+                  key = event['ResourceProperties']['Key']
+                  if event['RequestType'] == 'Delete':
+                      delete_objects(bucket)
+                  else:
+                      create_object(bucket, body, key)
+              except Exception as e:
+                  logging.error('Exception: %s' % e, exc_info=True)
+                  status = cfnresponse.FAILED
+              finally:
+                  timer.cancel()
+                  cfnresponse.send(event, context, status, {}, None)
+      Handler: index.handler
+      Role: !GetAtt LambdaSSMRole.Arn
+      Runtime: python3.7
+      Timeout: 240
+  WriteDomainJoinMOF:
+    Type: Custom::PutObject
+    Properties:
+      ServiceToken: !GetAtt PutObjectFunction.Arn
+      Bucket: !Ref SSMAssocLogs
+      Key: !Sub "playbook.yml"
+      Body: !Sub |
+        ---
+          - hosts: all
+            become: true
+            become_method: sudo
+            roles:
+              - nginx
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for ALB
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref 'WebAccessCIDR'
+      VpcId: !GetAtt 'VPCStack.Outputs.VPCID'
+  ALBListenersSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Security group for listeners of ALB
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+      VpcId: !GetAtt 'VPCStack.Outputs.VPCID'  
+  SSMInstanceRole: 
+    Type : AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - s3:GetObject
+                Resource: 
+                  - !Sub 'arn:aws:s3:::aws-ssm-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::aws-windows-downloads-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::amazon-ssm-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::amazon-ssm-packages-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::${AWS::Region}-birdwatcher-prod/*'
+                  - !Sub 'arn:aws:s3:::patch-baseline-snapshot-${AWS::Region}/*'
+                Effect: Allow
+          PolicyName: ssm-custom-s3-policy
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SSMAssocLogs}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SSMAssocLogs}'
+                Effect: Allow
+          PolicyName: s3-instance-bucket-policy
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service:
+            - "ec2.amazonaws.com"
+            - "ssm.amazonaws.com"
+          Action: "sts:AssumeRole"
+  SSMInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+      - !Ref SSMInstanceRole
+  AnsibleAssociation:
+    DependsOn: EC2Instance
+    Type: AWS::SSM::Association
+    Properties:
+      Name: AWS-ApplyAnsiblePlaybooks
+      Targets:
+        - Key: tag:nginx
+          Values:
+            - yes
+      OutputLocation:
+        S3Location: 
+          OutputS3BucketName: !Ref SSMAssocLogs
+          OutputS3KeyPrefix: 'logs/'
+      ScheduleExpression: "cron(15 23 * * ? *)"
+      Parameters:
+        SourceType:
+          - 'S3'
+        SourceInfo:
+          -  !Sub |
+              {"path":"https://${SSMAssocLogs.WebsiteURL}/playbook.yml"}
+        InstallDependencies:
+          - 'True'
+        PlaybookFile:
+          - 'playbook.yml'
+        ExtraVariables:
+          - 'SSM=True'
+        Check:
+          - 'False'
+        Verbose:
+          - 
+  EC2LaunchTemplateResource:
+    Type: AWS::EC2::LaunchTemplate
+    DeletionPolicy: Delete
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref 'WebServerInstanceType'
+        ImageId: !Ref 'ImageId'
+        SecurityGroupIds:
+          - !Ref ALBListenersSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref 'SSMInstanceProfileName'
+        TagSpecifications:
+           - 
+            ResourceType: 'instance'
+            Tags:
+              - Key: "DomainToJoin"
+                Value: !Ref "DomainDNSName"
+  ALBResource:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: 'internet-facing'
+      Subnets:
+        - !GetAtt 'VPCStack.Outputs.PublicSubnet1ID'
+        - !GetAtt 'VPCStack.Outputs.PublicSubnet2ID'
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+  ALBTargetGroupResource:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !GetAtt 'VPCStack.Outputs.VPCID'
+      HealthyThresholdCount: 5
+      HealthCheckTimeoutSeconds: 120
+      HealthCheckIntervalSeconds: 300
+      UnhealthyThresholdCount: 10
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+  ALBListenerResource:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref 'ALBResource'
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'ALBTargetGroupResource'
+  ASGResource:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}"
+      MinSize: !Ref 'ASGMinSize'
+      MaxSize: !Ref 'ASGMaxSize'
+      DesiredCapacity: !Ref 'ASGDesiredCapacity'
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 60
+      Cooldown: '30'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref 'EC2LaunchTemplateResource'
+        Version: !GetAtt 'EC2LaunchTemplateResource.LatestVersionNumber'
+      VPCZoneIdentifier:
+        - !GetAtt 'VPCStack.Outputs.PrivateSubnet1AID'
+        - !GetAtt 'VPCStack.Outputs.PrivateSubnet2AID'
+      TargetGroupARNs:
+        - !Ref 'ALBTargetGroupResource'
+#  ExperimentTemplateCanary:
+#    Type: AWS::FIS::ExperimentTemplate
+#    Properties:
+#      description: "CFN Cananry experiment template"
+#      stopConditions:
+#        - source: "none"
+#      targets:
+#         myInstance:
+#           resourceType: "aws:ec2:instance"
+#           resourceTags:
+#             Valkyrie: "tag1"
+#           selectionMode: "COUNT(3)"
+#      actions:
+#         TerminateInstances:
+#           actionId: "aws:ec2:terminate-instances"
+#           description: "kill the instances"
+#           parameters: {}
+#           targets:
+#             Instances: "myInstance"
+#      roleArn:
+#        Fn::ImportValue: CanaryFISIAMRoleARNExport
+#      tags:
+#        Purpose: "CanaryTests"
+Outputs:
+  ELBUrl:
+    Description: DNS name of the ELB.
+    Value: !GetAtt 'ALBResource.DNSName'
+  LaunchTemplateId:
+    Description: Launch template Id
+    Value: !Ref 'EC2LaunchTemplateResource'
+    Export:
+      Name: !Sub '${AWS::StackName}-LaunchTemplateId'

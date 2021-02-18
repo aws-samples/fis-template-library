@@ -1,0 +1,35 @@
+{
+    "tags": {
+         "Name": "StopAndRestartRandomeInstance"
+    },
+    "description": "Stop and Restart One Random Instance",
+    "roleArn": "arn:aws:iam::<AccountID>:role/MyFISExperimentRole”,
+    "stopConditions": [
+         {
+             "source": "aws:cloudwatch:alarm",
+             "value": "arn:aws:cloudwatch:us-east-1:<AccountID>:alarm:No_Traffic"
+         }
+    ],
+    "targets": {
+         "myInstance": {
+             "resourceTags": {
+                 "Env": "test"
+             },
+             "resourceType": "aws:ec2:instance",
+             "selectionMode": "COUNT(1)"
+         }
+    },
+    "actions": {
+         "StopInstances": {
+             "actionId": "aws:ec2:stop-instances",
+             "description": "stop the instances",
+             "parameters": {
+                 "startInstancesAtEnd": "true",
+                 "duration": "PT2M",
+             },
+             "targets": {
+                 "Instances": "myInstance"
+             }
+         }
+     }
+ } 
