@@ -38,6 +38,13 @@ Metadata:
       QSS3KeyPrefix:
         default: Quick Start S3 key prefix
 Parameters:
+  FISRoleCreation:
+    Description: >-
+      Whether the servcie role for FIS needs to be created, No indicates this role exists in your AWS Account.
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Default: 'No'
   AvailabilityZones:
     Description: >-
       List of Availability Zones to use for the subnets in the VPC. The logical order is preserved. At least two Availability Zones must be provided.
