@@ -39,6 +39,7 @@ Metadata:
         default: Quick Start S3 key prefix
 Parameters:
   FISRoleCreation:
+    Type: String
     Description: >-
       Whether the servcie role for FIS needs to be created, No indicates this role exists in your AWS Account.
     AllowedValues:
@@ -81,6 +82,11 @@ Parameters:
   ASGDesiredCapacity:
     Type: Number
     Description: Desired capacity instance size for the Auto Scaling Group.
+  WebAccessCIDR:
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$
+    ConstraintDescription: CIDR block parameter, in the form x.x.x.x/x.
+    Description: The CIDR IP range that is permitted to access the Elastic Load Balancers.
+    Type: String
   QSS3BucketName:
     AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
     ConstraintDescription: Can include numbers, lowercase letters, uppercase letters, and hyphens (-). However, it cannot start or end with a hyphen (-).
@@ -104,6 +110,9 @@ Parameters:
     Type: String
 Conditions:
   UsingDefaultBucket: !Equals [!Ref QSS3BucketName, 'aws-quickstart']
+  CreateFISServiceRole: !Equals
+  - !Ref 'FISRoleCreation'
+  - 'Yes'
 Resources:
   VPCStack:
     Type: AWS::CloudFormation::Stack
@@ -124,6 +133,12 @@ Resources:
         AvailabilityZones: !Join
           - ','
           - !Ref 'AvailabilityZones'
+  FISServiceRole:
+    Condition: CreateFISServiceRole
+    Type: 'AWS::IAM::ServiceLinkedRole'
+    Properties:
+      AWSServiceName: fis.amazonaws.com
+      Description: FIS Basic SLR
   SSMAssocLogs:
     Type: AWS::S3::Bucket
   LambdaSSMRole:
@@ -201,13 +216,13 @@ Resources:
       Role: !GetAtt LambdaSSMRole.Arn
       Runtime: python3.7
       Timeout: 240
-  WriteDomainJoinMOF:
+  WritePlaybook:
     Type: Custom::PutObject
     Properties:
       ServiceToken: !GetAtt PutObjectFunction.Arn
       Bucket: !Ref SSMAssocLogs
-      Key: !Sub "playbook.yml"
-      Body: !Sub |
+      Key: "playbook.yml"
+      Body: |
         ---
           - hosts: all
             become: true
@@ -283,25 +298,23 @@ Resources:
       Roles:
       - !Ref SSMInstanceRole
   AnsibleAssociation:
-    DependsOn: EC2Instance
     Type: AWS::SSM::Association
     Properties:
       Name: AWS-ApplyAnsiblePlaybooks
       Targets:
         - Key: tag:nginx
           Values:
-            - yes
+            - 'yes'
       OutputLocation:
         S3Location: 
           OutputS3BucketName: !Ref SSMAssocLogs
           OutputS3KeyPrefix: 'logs/'
-      ScheduleExpression: "cron(15 23 * * ? *)"
       Parameters:
         SourceType:
           - 'S3'
         SourceInfo:
           -  !Sub |
-              {"path":"https://${SSMAssocLogs.WebsiteURL}/playbook.yml"}
+              {"path":"${SSMAssocLogs.WebsiteURL}/playbook.yml"}
         InstallDependencies:
           - 'True'
         PlaybookFile:
@@ -310,8 +323,6 @@ Resources:
           - 'SSM=True'
         Check:
           - 'False'
-        Verbose:
-          - 
   EC2LaunchTemplateResource:
     Type: AWS::EC2::LaunchTemplate
     DeletionPolicy: Delete
@@ -322,13 +333,13 @@ Resources:
         SecurityGroupIds:
           - !Ref ALBListenersSecurityGroup
         IamInstanceProfile:
-          Name: !Ref 'SSMInstanceProfileName'
+          Name: !Ref 'SSMInstanceProfile'
         TagSpecifications:
            - 
             ResourceType: 'instance'
             Tags:
-              - Key: "DomainToJoin"
-                Value: !Ref "DomainDNSName"
+              - Key: 'nginx'
+                Value: 'yes'
   ALBResource:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
