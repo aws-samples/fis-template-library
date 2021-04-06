@@ -257,6 +257,16 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Action:
+                  - fis:*
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - fis:InjectApiInternalError
+                  - fis:InjectApiThrottleError
+                  - fis:InjectApiUnavailableError
+                Resource: 'arn:*:fis:*:*:experiment/*'
+                Effect: Allow
+              - Action:
                   - ec2:DescribeInstances
                   - ecs:DescribeClusters
                   - ecs:ListContainerInstances
@@ -274,10 +284,18 @@ Resources:
                   - ec2:TerminateInstances
                 Resource: 'arn:aws:ec2:*:*:instance/*'
                 Effect: Allow
-          PolicyName: s3-instance-bucket-policy
+              - Action:
+                  - ssm:SendCommand
+                Resource: 
+                  - 'arn:aws:ec2:*:*:instance/*'
+                  - 'arn:aws:ssm:*:*:document/*'
+                Effect: Allow
+              - Action:
+                  - ssm:CancelCommand
+                Resource: '*'
+                Effect: Allow
+          PolicyName: FIS-Experiment-Pol
       Path: /
-      ManagedPolicyArns:
-        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -429,26 +447,26 @@ Resources:
   ExperimentTemplateStop:
     Type: AWS::FIS::ExperimentTemplate
     Properties:
-      description: "CFN Stop experiment template"
-      stopConditions:
+      Description: "CFN Stop experiment template"
+      StopConditions:
         - source: "none"
-      targets:
+      Targets:
          myInstance:
            resourceType: "aws:ec2:instance"
            resourceTags:
              aws:autoscaling:groupName: !Ref ASGResource
            selectionMode: "COUNT(1)"
-      actions:
+      Actions:
          TerminateInstances:
            actionId: "aws:ec2:stop-instances"
            description: "stop the instances"
-           parameters: {}
+           parameters: {startInstancesAfterDuration: PT1M}
            targets:
              Instances: "myInstance"
-      roleArn:
-        Fn::ImportValue: CanaryFISIAMRoleARNExport
-      tags:
-        Purpose: "CanaryTests"
+      RoleArn:
+        !GetAtt FISRole.Arn
+      Tags:
+        Purpose: "StopTests"
 Outputs:
   ELBUrl:
     Description: DNS name of the ELB.
