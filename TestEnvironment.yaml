@@ -248,7 +248,44 @@ Resources:
           FromPort: 80
           ToPort: 80
           SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
-      VpcId: !GetAtt 'VPCStack.Outputs.VPCID'  
+      VpcId: !GetAtt 'VPCStack.Outputs.VPCID'
+  FISRole: 
+    Type : AWS::IAM::Role
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - ec2:DescribeInstances
+                  - ecs:DescribeClusters
+                  - ecs:ListContainerInstances
+                  - eks:DescribeNodegroup
+                  - iam:ListRoles
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDbClusters
+                  - ssm:ListCommands
+                Resource: '*'
+                Effect: Allow
+              - Action:
+                  - ec2:RebootInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:TerminateInstances
+                Resource: 'arn:aws:ec2:*:*:instance/*'
+                Effect: Allow
+          PolicyName: s3-instance-bucket-policy
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: "Allow"
+          Principal:
+            Service:
+            - "fis.amazonaws.com"
+          Action: "sts:AssumeRole"
   SSMInstanceRole: 
     Type : AWS::IAM::Role
     Properties:
@@ -302,7 +339,7 @@ Resources:
     Properties:
       Name: AWS-ApplyAnsiblePlaybooks
       Targets:
-        - Key: tag:nginx
+        - Key: !Sub 'tag:${ASGResource}'
           Values:
             - 'yes'
       OutputLocation:
@@ -389,29 +426,29 @@ Resources:
         - !GetAtt 'VPCStack.Outputs.PrivateSubnet2AID'
       TargetGroupARNs:
         - !Ref 'ALBTargetGroupResource'
-#  ExperimentTemplateCanary:
-#    Type: AWS::FIS::ExperimentTemplate
-#    Properties:
-#      description: "CFN Cananry experiment template"
-#      stopConditions:
-#        - source: "none"
-#      targets:
-#         myInstance:
-#           resourceType: "aws:ec2:instance"
-#           resourceTags:
-#             Valkyrie: "tag1"
-#           selectionMode: "COUNT(3)"
-#      actions:
-#         TerminateInstances:
-#           actionId: "aws:ec2:terminate-instances"
-#           description: "kill the instances"
-#           parameters: {}
-#           targets:
-#             Instances: "myInstance"
-#      roleArn:
-#        Fn::ImportValue: CanaryFISIAMRoleARNExport
-#      tags:
-#        Purpose: "CanaryTests"
+  ExperimentTemplateStop:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      description: "CFN Stop experiment template"
+      stopConditions:
+        - source: "none"
+      targets:
+         myInstance:
+           resourceType: "aws:ec2:instance"
+           resourceTags:
+             aws:autoscaling:groupName: !Ref ASGResource
+           selectionMode: "COUNT(1)"
+      actions:
+         TerminateInstances:
+           actionId: "aws:ec2:stop-instances"
+           description: "stop the instances"
+           parameters: {}
+           targets:
+             Instances: "myInstance"
+      roleArn:
+        Fn::ImportValue: CanaryFISIAMRoleARNExport
+      tags:
+        Purpose: "CanaryTests"
 Outputs:
   ELBUrl:
     Description: DNS name of the ELB.
