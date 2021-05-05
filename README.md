@@ -82,3 +82,12 @@ Find my github issue here: [(aws-fis): MapProperties generate empty CFN output](
 
 This is why I used CDK to create the baseline CloudFormation but then manually tweaked the resulting CFN to work around the mentioned issues.  
 I plan to move to CDK only again when the bugs are fixed in CDK. In the meantime be aware that the template synthesized by `cdk synth` will not work out-of-the-box and needs some work.
+
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
