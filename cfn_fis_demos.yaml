@@ -755,18 +755,10 @@ Resources:
             - Path: State.Name
               Values:
                 - running
-          ResourceArns:
-            - Fn::Join:
-                - ""
-                - - "arn:aws:ec2:"
-                  - Ref: AWS::Region
-                  - ":"
-                  - Ref: AWS::AccountId
-                  - :instance/
-                  - Ref: instance0B661231D
-          ResourceTags: {}
           ResourceType: aws:ec2:instance
           SelectionMode: ALL
+          ResourceTags:
+            FIS-Target: true
       Actions:
         instanceActions:
           ActionId: aws:ec2:stop-instances

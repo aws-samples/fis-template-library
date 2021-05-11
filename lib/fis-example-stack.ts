@@ -139,7 +139,8 @@ export class FisExampleStack extends cdk.Stack {
       },
       targets: {
         'instanceTargets': {
-          ...target,
+          resourceType: 'aws:ec2:instance',
+          selectionMode: 'ALL',
           resourceTags: {
             'FIS-Target': 'true'
           },
