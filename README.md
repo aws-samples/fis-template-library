@@ -11,6 +11,8 @@ This repo contains a CloudFormation (CFN) template with examples for AWS FIS. Ex
 
 ## Deployment
 
+You can either deploy via the provided CDK stack or use the synthesized CloudFormation YAML.
+
 The deployment will create 6 EC2 instances of type `t3a.nano` spread across two Availability Zones.
 
 To use the EKS experiment templates you will have to have a running EKS cluster. The creation of this cluster is out of scope of the CFN. However, you can create it easily with [eksctl](https://eksctl.io/) and the following example template (make sure to tweak the region accordingly):
@@ -33,7 +35,12 @@ managedNodeGroups:
     enableSsm: true
 ```
 
-Deploy via CLI:
+### Deploy via CDK:
+```bash
+cdk deploy
+```
+
+### Deploy via Cloudformation:
 
 ```bash
 aws cloudformation create-stack --template-body file://cfn_fis_demos.yaml --stack-name fis-demo-stack --capabilities CAPABILITY_NAMED_IAM
@@ -75,13 +82,9 @@ Delete the CloudFormation stack via CLI:
 aws cloudformation delete-stack --stack-name fis-demo-stack
 ```
 
-## CDK Resources
+## Generated CloudFormation YAML
 
-**Note** Initially this was supposed to be a CDK project. However, during development I came across an issue with the `@aws-cdk/aws-fis` CDK module (Version 1.102.0 at the time of writing).  
-Find my github issue here: [(aws-fis): MapProperties generate empty CFN output](https://github.com/aws/aws-cdk/issues/14309) 
-
-This is why I used CDK to create the baseline CloudFormation but then manually tweaked the resulting CFN to work around the mentioned issues.  
-I plan to move to CDK only again when the bugs are fixed in CDK. In the meantime be aware that the template synthesized by `cdk synth` will not work out-of-the-box and needs some work.
+The CFN YAML `cfn_fis_demos.yaml` is generated via CDK's `cdk synth > cfn_fis_demos.yaml` and should not be edited manually.
 
 
 ## Security

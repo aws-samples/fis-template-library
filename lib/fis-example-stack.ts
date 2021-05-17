@@ -188,7 +188,7 @@ export class FisExampleStack extends cdk.Stack {
           parameters: {
             instanceTerminationPercentage: "50"
           },
-          targets: { NodeGroups: 'nodeGroupTarget' }
+          targets: { Nodegroups: 'nodeGroupTarget' }
         }
       },
       targets: {
@@ -210,7 +210,7 @@ export class FisExampleStack extends cdk.Stack {
       parameters: {
         documentArn: `arn:aws:ssm:${this.region}::document/AWS-RunShellScript`,
         documentParameters: JSON.stringify(
-            { commands: [killContainerScript]} ),
+            { commands: killContainerScript} ),
         duration: 'PT1M'
       },
       targets: { Instances: 'workerNodesTarget' }
