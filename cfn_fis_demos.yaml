@@ -1,3 +1,5 @@
+# THIS IS A GENERATED FILE ( cdk synth > cfn_fis_demos.yaml ).
+# DO NOT EDIT MANUALLY.
 Resources:
   vpcA2121C38:
     Type: AWS::EC2::VPC
@@ -329,7 +331,8 @@ Resources:
           - Fn::GetAZs: ""
       IamInstanceProfile:
         Ref: instance0InstanceProfile493621FA
-      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      ImageId:
+        Ref: SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter
       InstanceType: t3a.nano
       SecurityGroupIds:
         - Fn::GetAtt:
@@ -381,7 +384,8 @@ Resources:
           - Fn::GetAZs: ""
       IamInstanceProfile:
         Ref: instance1InstanceProfileD4257E82
-      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      ImageId:
+        Ref: SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter
       InstanceType: t3a.nano
       SecurityGroupIds:
         - Fn::GetAtt:
@@ -433,7 +437,8 @@ Resources:
           - Fn::GetAZs: ""
       IamInstanceProfile:
         Ref: instance2InstanceProfileB3658486
-      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      ImageId:
+        Ref: SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter
       InstanceType: t3a.nano
       SecurityGroupIds:
         - Fn::GetAtt:
@@ -485,7 +490,8 @@ Resources:
           - Fn::GetAZs: ""
       IamInstanceProfile:
         Ref: instance3InstanceProfileDB6091B4
-      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      ImageId:
+        Ref: SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter
       InstanceType: t3a.nano
       SecurityGroupIds:
         - Fn::GetAtt:
@@ -537,7 +543,8 @@ Resources:
           - Fn::GetAZs: ""
       IamInstanceProfile:
         Ref: instance4InstanceProfile12917602
-      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      ImageId:
+        Ref: SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter
       InstanceType: t3a.nano
       SecurityGroupIds:
         - Fn::GetAtt:
@@ -589,7 +596,8 @@ Resources:
           - Fn::GetAZs: ""
       IamInstanceProfile:
         Ref: instance5InstanceProfile61D3A52E
-      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      ImageId:
+        Ref: SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter
       InstanceType: t3a.nano
       SecurityGroupIds:
         - Fn::GetAtt:
@@ -755,10 +763,10 @@ Resources:
             - Path: State.Name
               Values:
                 - running
+          ResourceTags:
+            FIS-Target: "true"
           ResourceType: aws:ec2:instance
           SelectionMode: ALL
-          ResourceTags:
-            FIS-Target: true
       Actions:
         instanceActions:
           ActionId: aws:ec2:stop-instances
@@ -826,7 +834,7 @@ Resources:
       Targets:
         nodeGroupTarget:
           ResourceTags:
-            "eksctl.cluster.k8s.io/v1alpha1/cluster-name": eks-demo
+            eksctl.cluster.k8s.io/v1alpha1/cluster-name: eks-demo
           ResourceType: aws:eks:nodegroup
           SelectionMode: ALL
       Actions:
@@ -834,7 +842,7 @@ Resources:
           ActionId: aws:eks:terminate-nodegroup-instances
           Description: Terminate EKS NodeGroup Instance
           Parameters:
-            instanceTerminationPercentage: 50
+            instanceTerminationPercentage: "50"
           Targets:
             Nodegroups: nodeGroupTarget
     Metadata:
@@ -873,7 +881,7 @@ Resources:
                   - Ref: AWS::Region
                   - ::document/AWS-RunShellScript
             documentParameters: '{"commands":"sudo docker kill $(sudo docker ps -f name=k8s_ecsdemo-frontend -q)"}'
-            duration: PT2M
+            duration: PT1M
           Targets:
             Instances: workerNodesTarget
     Metadata:
@@ -881,10 +889,14 @@ Resources:
   CDKMetadata:
     Type: AWS::CDK::Metadata
     Properties:
-      Analytics: v2:deflate64:H4sIAAAAAAAAE11PQW6DMBB8S+6OE6Kq5yJURVwqC6LcjVkUJ2Ajex0aWf57bShF6mnHM+PdmYxmxxM97j74ZPeifRy80Aaor5GLB6nAamcEkEIri8YJJEWnNrZTUWglSq0CSRs8iBP111Ek7coKwlzTS1G7RsH8d0OVdggX3vSw8RuXW6uF5GnznzmBz5Kl8cXxzBEm/iLMyGeE2+JSIZiIV8OS5PeVYyx2G0AhKWMlrmKNGoQzEl9no904h/lPrNZAJB+or/QSep2rzIzuZKSYjp3nwwsKRPTatRNHcaM+77kZkjiDQDppaWr2PYKRKdkFhrGPcUMgSrdA7/bwzN5o9k6z3d1KuTdOYXTSapk/VBzM/cQBAAA=
+      Analytics: v2:deflate64:H4sIAAAAAAAAE11PQW6DMBB8S+6OE6qo56KoirhEFkS5L2ZRnICN7HVohPh7bSil6mnHM+PdmYQn+wPfbz6gd1tZPXaDNBb5UBDIB8vRGW8lsmOtBVhokdCyo9GOrJcU6b+WIFSKlNEji+sGlG98uHYyaldxZMKXjZKFLzVOf1eUG094gbLBlV+51DkjFcTNv+YIPjMRxxnoBIQ9vJiw6hngujjTIXHAi2FO8vNKKbS8taiJZaES6FCjQOmtotfJGt9NYf4Ti3VkClo+5GYOvcxFFtbUKlDChM7T4RmNTDbGVz2QvPEhbcC2UZzAyGrleGz21aFVMdkF264JcceRaVMhv7vdMznw5J0nm7tTamu9puDk+Ty/AWnNasbRAQAA
     Metadata:
       aws:cdk:path: FisExampleStack/CDKMetadata/Default
     Condition: CDKMetadataAvailable
+Parameters:
+  SsmParameterValueawsserviceamiamazonlinuxlatestamzn2amihvmx8664gp2C96584B6F00A464EAD1953AFF4B05118Parameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
 Conditions:
   CDKMetadataAvailable:
     Fn::Or:
