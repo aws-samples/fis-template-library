@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  An example CodePipeline for deploying to staging and running an experiment before proceeding with deployment in production.
+Transform:
+- AWS::Serverless-2016-10-31
+
+Parameters:
+  StagingExperimentTemplateId:
+    Type: String
+  BranchName:
+    Description: GitHub branch name
+    Type: String
+    Default: main
+  RepositoryName:
+    Description: GitHub repository name
+    Type: String
+  GitHubOwner:
+    Description: GitHub repository owner
+    Type: String
+  CodeStarConnectionId:
+    Description: CodeStar Connection Id
+    Type: String
+  Email:
+    Description: The email address where CodePipeline sends pipeline notifications
+    Type: String
+  StagingCodeDeployConfigName:
+    Type: String
+    Default: CodeDeployDefault.AllAtOnce
+    AllowedValues:
+      - CodeDeployDefault.OneAtATime
+      - CodeDeployDefault.HalfAtATime
+      - CodeDeployDefault.AllAtOnce
+  StagingAutoScalingGroups:
+    Type: String
+  StagingALBTargetGroup:
+    Type: String
+  ProdCodeDeployConfigName:
+    Type: String
+    Default: CodeDeployDefault.OneAtATime
+    AllowedValues:
+      - CodeDeployDefault.OneAtATime
+      - CodeDeployDefault.HalfAtATime
+      - CodeDeployDefault.AllAtOnce
+  ProdAutoScalingGroups:
+    Type: String
+  ProdALBTargetGroup:
+    Type: String
+  IamInstanceRole:
+    Description: The ARN of your IAM instance role
+    Type: String
+
+Resources:  
+  PipelineStartExperiment:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: A Lambda function that starts an AWS FIS experiment from a pipeline action.
+      Runtime: nodejs14.x
+      Handler: src/pipeline-experiment.handler
+      MemorySize: 128
+      Timeout: 100
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - codepipeline:PutJobFailureResult
+                - codepipeline:PutJobSuccessResult
+              Resource:
+                - '*'
+            - Effect: Allow
+              Action:
+                - fis:StartExperiment
+              Resource:
+                - Fn::Join:
+                  - ''
+                  - - 'arn:aws:fis:*:*:experiment-template/'
+                    - Ref: StagingExperimentTemplateId
+                - Fn::Join:
+                  - ''
+                  - - 'arn:aws:fis:*:*:experiment/*'
+      Environment:
+        Variables:
+          EXPERIMENT_TEMPLATE_ID: !Ref StagingExperimentTemplateId
+
+  CodePipelineArtifactStoreBucket:
+    Type: "AWS::S3::Bucket"
+
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+
+  CodePipelineArtifactStoreBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref CodePipelineArtifactStoreBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Join
+              - ""
+              - - !GetAtt
+                  - CodePipelineArtifactStoreBucket
+                  - Arn
+                - /*
+            Condition:
+              StringNotEquals:
+                "s3:x-amz-server-side-encryption": "aws:kms"
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: !Join
+              - ""
+              - - !GetAtt
+                  - CodePipelineArtifactStoreBucket
+                  - Arn
+                - /*
+            Condition:
+              Bool:
+                "aws:SecureTransport": false
+
+  CodeDeployApp:
+    Type: 'AWS::CodeDeploy::Application'
+
+  StagingDeploymentGroup:
+    Type: 'AWS::CodeDeploy::DeploymentGroup'
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentConfigName: !Ref StagingCodeDeployConfigName
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+          - DEPLOYMENT_STOP_ON_REQUEST
+      AutoScalingGroups:
+        - !Ref StagingAutoScalingGroups
+      DeploymentStyle:
+        DeploymentOption: WITHOUT_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !Ref StagingALBTargetGroup
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+
+  ProdDeploymentGroup:
+    Type: 'AWS::CodeDeploy::DeploymentGroup'
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentConfigName: !Ref ProdCodeDeployConfigName
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+          - DEPLOYMENT_STOP_ON_REQUEST
+      AutoScalingGroups:
+        - !Ref ProdAutoScalingGroups
+      DeploymentStyle:
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !Ref ProdALBTargetGroup
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+
+  AppPipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      RoleArn: !GetAtt
+        - CodePipelineServiceRole
+        - Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              ActionTypeId:
+                Version: '1'
+                Owner: AWS
+                Category: Source
+                Provider: CodeStarSourceConnection
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+              Configuration:
+                ConnectionArn: !Sub 'arn:aws:codestar-connections:${AWS::Region}:${AWS::AccountId}:connection/${CodeStarConnectionId}'
+                FullRepositoryId: !Sub '${GitHubOwner}/${RepositoryName}'
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: "CODE_ZIP"
+              Name: ApplicationSource
+        - Name: DeployStaging
+          Actions:
+            - Name: DeployStaging
+              InputArtifacts:
+                - Name: SourceArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref CodeDeployApp
+                DeploymentGroupName: !Ref StagingDeploymentGroup
+              RunOrder: 2
+        - Name: ExperimentStaging
+          Actions:
+            - ActionTypeId:
+                Version: '1'
+                Owner: AWS
+                Category: Invoke
+                Provider: Lambda
+              RunOrder: 1
+              Configuration:
+                FunctionName: !Ref PipelineStartExperiment
+                UserParameters: !Ref StagingExperimentTemplateId
+              InputArtifacts: []
+              Name: StartExperimentStaging
+              Namespace: ExperimentNamespace
+            - ActionTypeId:
+                Version: '1'
+                Owner: AWS
+                Category: Approval
+                Provider: Manual
+              RunOrder: 3
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: 'Review the result of the experiment and approve or deny for pipeline to continue.'
+                ExternalEntityLink: !Sub 'https://${AWS::Region}.console.aws.amazon.com/fis/home?region=${AWS::Region}#ExperimentDetails:ExperimentId=#{ExperimentNamespace.experimentId}'
+              Name: ApprovalExperimentStaging
+        - Name: DeployProd
+          Actions:
+            - Name: DeployProd
+              InputArtifacts:
+                - Name: SourceArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref CodeDeployApp
+                DeploymentGroupName: !Ref ProdDeploymentGroup
+              RunOrder: 4
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactStoreBucket
+
+  CodeDeployServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  CodePipelineServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "codestar-connections:UseConnection"
+                Resource: !Sub 'arn:aws:codestar-connections:${AWS::Region}:${AWS::AccountId}:connection/${CodeStarConnectionId}'
+              - Effect: Allow
+                Action:
+                  - "codedeploy:CreateDeployment"
+                  - "codedeploy:GetApplicationRevision"
+                  - "codedeploy:GetDeployment"
+                  - "codedeploy:GetDeploymentConfig"
+                  - "codedeploy:RegisterApplicationRevision"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref CodePipelineSNSTopic
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: !GetAtt PipelineStartExperiment.Arn
+              - Effect: Allow
+                Action:
+                  - "s3:*"
+                Resource: !Sub 'arn:aws:s3:::${CodePipelineArtifactStoreBucket}/*'
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource: "*"
+
+  ArtifactStorePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: !Ref AWS::StackName
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "s3:GetObject"
+            Resource: !Sub 'arn:aws:s3:::${CodePipelineArtifactStoreBucket}/*'
+      Roles: 
+        - !Ref IamInstanceRole
