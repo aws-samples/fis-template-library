@@ -1,7 +1,10 @@
-*.js
+*.js 
 !jest.config.js
 *.d.ts
 node_modules
+.aws-sam
+.vscode
+samconfig.toml
 
 # CDK asset staging directory
 .cdk.staging

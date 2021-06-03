@@ -1,0 +1,43 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  A Lambda function that starts an AWS FIS experiment triggered by events.
+Transform:
+- AWS::Serverless-2016-10-31
+
+Parameters:
+  ExperimentTemplateId:
+    Type: String
+  EventPattern:
+    Type: String
+
+Resources:
+  EventTriggeredStartExperiment:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: A Lambda function that starts an AWS FIS experiment triggered by an event.
+      Runtime: nodejs14.x
+      Handler: src/event-trigger-experiment.handler
+      Events:
+        Trigger:
+          Type: CloudWatchEvent 
+          Properties:
+            Pattern: !Ref EventPattern
+      MemorySize: 128
+      Timeout: 100
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - fis:StartExperiment
+              Resource:
+                - Fn::Join:
+                  - ''
+                  - - 'arn:aws:fis:*:*:experiment-template/'
+                    - Ref: ExperimentTemplateId
+                - Fn::Join:
+                  - ''
+                  - - 'arn:aws:fis:*:*:experiment/*'
+      Environment:
+        Variables:
+          EXPERIMENT_TEMPLATE_ID: !Ref ExperimentTemplateId

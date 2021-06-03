@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  A Lambda function that starts an AWS FIS experiment on a schedule.
+Transform:
+- AWS::Serverless-2016-10-31
+
+Parameters:
+  ExperimentTemplateId:
+    Type: String
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 12 * * ? *)'
+
+Resources:  
+  ScheduledStartExperiment:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: A Lambda function that starts an AWS FIS experiment on a schedule.
+      Runtime: nodejs14.x
+      Handler: src/schedule-experiment.handler
+      Events:
+        CloudWatchEvent:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+      MemorySize: 128
+      Timeout: 100
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - fis:StartExperiment
+              Resource:
+                - Fn::Join:
+                  - ''
+                  - - 'arn:aws:fis:*:*:experiment-template/'
+                    - Ref: ExperimentTemplateId
+                - Fn::Join:
+                  - ''
+                  - - 'arn:aws:fis:*:*:experiment/*'
+      Environment:
+        Variables:
+          EXPERIMENT_TEMPLATE_ID: !Ref ExperimentTemplateId
