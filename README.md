@@ -37,6 +37,7 @@ managedNodeGroups:
 
 ### Deploy via CDK:
 ```bash
+npm install
 cdk deploy
 ```
 
