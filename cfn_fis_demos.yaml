@@ -689,7 +689,6 @@ Resources:
                   - Ref: AWS::AccountId
                   - :instance/
                   - Ref: instance0B661231D
-          ResourceTags: {}
           ResourceType: aws:ec2:instance
           SelectionMode: ALL
       Actions:
@@ -728,7 +727,6 @@ Resources:
                   - Ref: AWS::AccountId
                   - :instance/
                   - Ref: instance0B661231D
-          ResourceTags: {}
           ResourceType: aws:ec2:instance
           SelectionMode: ALL
       Actions:
@@ -799,7 +797,6 @@ Resources:
                   - Ref: AWS::AccountId
                   - :instance/
                   - Ref: instance0B661231D
-          ResourceTags: {}
           ResourceType: aws:ec2:instance
           SelectionMode: ALL
       Actions:
@@ -889,7 +886,7 @@ Resources:
   CDKMetadata:
     Type: AWS::CDK::Metadata
     Properties:
-      Analytics: v2:deflate64:H4sIAAAAAAAAE11PQW6DMBB8S+6OE6qo56KoirhEFkS5L2ZRnICN7HVohPh7bSil6mnHM+PdmYQn+wPfbz6gd1tZPXaDNBb5UBDIB8vRGW8lsmOtBVhokdCyo9GOrJcU6b+WIFSKlNEji+sGlG98uHYyaldxZMKXjZKFLzVOf1eUG094gbLBlV+51DkjFcTNv+YIPjMRxxnoBIQ9vJiw6hngujjTIXHAi2FO8vNKKbS8taiJZaES6FCjQOmtotfJGt9NYf4Ti3VkClo+5GYOvcxFFtbUKlDChM7T4RmNTDbGVz2QvPEhbcC2UZzAyGrleGz21aFVMdkF264JcceRaVMhv7vdMznw5J0nm7tTamu9puDk+Ty/AWnNasbRAQAA
+      Analytics: v2:deflate64:H4sIAAAAAAAAE11RQW6DMBB8S++OU6qq56KoirhUFkS5L2ZRnICN7HVohPz32lBK1dOOZ8brGTnj2fMbz57eYXQ72dz2kzQW+VQRyBsr0RlvJbJDqwVY6JHQsoPRjqyXlOi/lig0ipTRgaV1E8oXPp0HmbSzODDh607Jytca57sbKo0nPEHd4cZvXO6ckQrS5l9zAh+FSOMT6AiEIzyYsOoe4ba40DFxxKthSfJzyim2vPSoiRWxEuhYo0LpraLH0Ro/zGH+E6s1MAU9n0qzhF7nKgtrWhUpYWLn+eEFBSY745sRSF74lHdg+yTOILBWOZ6afQ1oVUp2wn7oYtwQmDYN8qvb37NXnqVPuzqldtZrik5eLvMbwHqKxdEBAAA=
     Metadata:
       aws:cdk:path: FisExampleStack/CDKMetadata/Default
     Condition: CDKMetadataAvailable
