@@ -85,7 +85,6 @@ export class FisExampleStack extends cdk.Stack {
 
     const target: fis.CfnExperimentTemplate.ExperimentTemplateTargetProperty = {
       resourceType: 'aws:ec2:instance',
-      resourceTags: {},
       selectionMode: 'ALL',
       resourceArns:
          [
