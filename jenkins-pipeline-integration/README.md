@@ -37,3 +37,11 @@ Update your pipeline scripts as per the example provided in [Jenkinsfile](./Jenk
   * **CREDENTIAL_ID** - specify the credential id you added in Step B 5 above.
 
 Note: Install the [Pipeline Utility Steps](https://www.jenkins.io/doc/pipeline/steps/pipeline-utility-steps/) plugin if you do not already have that.
+
+## Security
+
+See [CONTRIBUTING](../CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
