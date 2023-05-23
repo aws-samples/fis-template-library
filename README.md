@@ -92,6 +92,7 @@ The CFN YAML `cfn_fis_demos.yaml` is generated via CDK's `cdk synth > cfn_fis_de
 * [Start an AWS Fault Injection Simulator experiment on a schedule](./schedule-experiment/README.md)
 * [Start an AWS Fault Injection Simulator experiment based on events](./event-trigger-experiment/README.md)
 * [Include AWS Fault Injection Simulator experiments in your CI/CD pipelines](./pipeline-experiment/README.md)
+* [Add AWS Fault Injection Simulator experiments to your Jenkins pipelines](./jenkins-pipeline-integration/README.md)
 
 ## Security
 

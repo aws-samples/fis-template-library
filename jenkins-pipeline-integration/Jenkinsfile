@@ -1,0 +1,55 @@
+pipeline {
+  agent { label "main" }
+  environment {
+    AWS_DEFAULT_REGION="##your AWS region##"
+    EXPERIMENT_TEMPLATE_ID="#AWS FIS Experiment Template Id##"
+  }
+  stages {
+    stage('runexperiment') {
+      steps {
+        withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: '##CREDENTIAL_ID##', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+          script {
+              //start the AWS FIS experiment
+              experimentDetails = sh ( 
+                script: '''
+                  aws fis start-experiment --experiment-template-id ${EXPERIMENT_TEMPLATE_ID}
+                    ''',
+                returnStdout: true
+                )
+              def experimentObj = readJSON text: experimentDetails
+              echo experimentObj
+              env.experimentId = experimentObj['experiment']['id']
+
+              //Wait for the experiment to complete
+              echo "Waiting for the experiment ${experimentId} to complete."
+              experimentStatus = sh ( 
+                script: '''
+                  aws fis get-experiment --id ${experimentId}
+                    ''',
+                returnStdout: true
+                )
+                def experimentStatusObj = readJSON text: experimentStatus
+                
+              while (experimentStatusObj['experiment']['state']['status'] in ['initiating','running']){
+                  sleep(5)
+                  experimentStatus = sh ( 
+                    script: '''
+                            aws fis get-experiment --id ${experimentId}
+                        ''',
+                    returnStdout: true
+                )
+                experimentStatusObj = readJSON text: experimentStatus
+              }
+              
+              //Fail the build if the experiment had failed
+              if(experimentStatusObj['experiment']['state']['status']] == 'failed'){
+                currentBuild.result = "FAILURE"
+                throw new Exception("Experiment failed - ${experimentStatusObj['experiment']['state']['reason']}")  
+              }
+              
+        }
+      }
+    }
+  }
+}
+}
