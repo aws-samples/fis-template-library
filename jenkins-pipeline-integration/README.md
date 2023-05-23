@@ -9,6 +9,7 @@ Achieve continual resilience by integrating fault injection experiments into you
 2.	Select **Policies** in the navigation pane and choose **Create policy**.
 3.	Select the **JSON** tab.
 4.	Replace the example placeholder with the permissions provided in the [AWS FIS user guide to start an experiment](https://docs.aws.amazon.com/fis/latest/userguide/security_iam_id-based-policy-examples.html#security-iam-policy-examples-start-experiment).
+    Add the additional actions  ```"fis:GetExperiment"```,and ```"fis:TagResource"``` to the policy.
 5.	Choose **Next:Tags**. Followed by **Next:Review**.
 6.	On the **Review policy** page, for Name, enter a name for the policy, such as **JenkinsFisPolicy**.
 7.	Choose **Create policy**.

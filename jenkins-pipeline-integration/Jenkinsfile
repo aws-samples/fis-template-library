@@ -12,12 +12,11 @@ pipeline {
               //start the AWS FIS experiment
               experimentDetails = sh ( 
                 script: '''
-                  aws fis start-experiment --experiment-template-id ${EXPERIMENT_TEMPLATE_ID}
+                  aws fis start-experiment --experiment-template-id ${EXPERIMENT_TEMPLATE_ID}  --tags {\\"Name\\":\\"JenkinsBuild\"}
                     ''',
                 returnStdout: true
                 )
               def experimentObj = readJSON text: experimentDetails
-              echo experimentObj
               env.experimentId = experimentObj['experiment']['id']
 
               //Wait for the experiment to complete
@@ -42,7 +41,7 @@ pipeline {
               }
               
               //Fail the build if the experiment had failed
-              if(experimentStatusObj['experiment']['state']['status']] == 'failed'){
+              if(experimentStatusObj['experiment']['state']['status'] == 'failed'){
                 currentBuild.result = "FAILURE"
                 throw new Exception("Experiment failed - ${experimentStatusObj['experiment']['state']['reason']}")  
               }
