@@ -4,6 +4,6 @@
     "version": "0.1.0",
     "private": true,
     "dependencies": {
-        "@aws-sdk/client-fis": "^3.13.0"
+        "@aws-sdk/client-fis": "^3.350.0"
     }
 }
