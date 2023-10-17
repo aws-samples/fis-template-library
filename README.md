@@ -27,7 +27,21 @@ Upload an FIS experiment template to your AWS Account:
 
 "EXTQGczsC6CZPmHa"
 ```
+Start an FIS experiment:
+------------------------
 
+``` {.sourceCode .shell}
+➜ aws fis start-experiment --experiment-template-id EXTQGczsC6CZPmHa --query experiment.id
+
+"EXPNK1ynt3PRLCf9LN"
+```
+
+Stop an FIS experiment:
+-----------------------
+
+``` {.sourceCode .shell}
+➜ aws fis stop-experiment --id EXPNK1ynt3PRLCf9LN
+```
 
 ### CDK
 
