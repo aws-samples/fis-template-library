@@ -1,0 +1,54 @@
+---
+description: Modify Subnets to deny traffic in a particular AZ. Rollback on Cancel or Failure.
+schemaVersion: '0.3'
+assumeRole: "{{AutomationAssumeRole}}"
+parameters:
+  Region:
+    type: String
+    description: "The Region to impact"
+    default: "us-east-1"
+  AvailabilityZone:
+    type: String
+    description: "(Required) The Availability Zone to impact"
+    default: "us-east-1a"
+  VPCId:
+    type: String
+    description: "The ID of the VPC where the subnet reside"
+  Duration:
+    type: String
+    description: "The duration - in ISO-8601 format - of the attack. (Required)"
+    default: "PT1M"
+  FunctionNameInject:
+    type: String
+    description: "The function to inject faults in Nacls"
+  FunctionNameRollback:
+    type: String
+    description: "The function to inject faults in Nacls"
+  AutomationAssumeRole:
+    type: String
+    description: "(Optional) The ARN of the role that allows Automation to perform
+      the actions on your behalf."
+mainSteps:
+- name: InjectFaultNacl
+  action: aws:invokeLambdaFunction
+  maxAttempts: 3
+  timeoutSeconds: 120
+  onFailure: 'step:rollback'
+  onCancel: 'step:rollback'
+  inputs:
+    FunctionName: "{{FunctionNameInject}}"
+    Payload: "{\"Region\":\"{{Region}}\", \"AvailabilityZone\":\"{{AvailabilityZone}}\", \"VPCId\":\"{{VPCId}}\"}"
+- name: sleep
+  action: aws:sleep
+  onFailure: 'step:rollback'
+  onCancel: 'step:rollback'
+  inputs:
+    Duration: "{{ Duration }}"
+- name: rollback
+  action: aws:invokeLambdaFunction
+  maxAttempts: 3
+  timeoutSeconds: 120
+  onFailure: Abort
+  inputs:
+    FunctionName: "{{FunctionNameRollback}}"
+    Payload: "{\"saved_configuration\": \"{{InjectFaultNacl.Payload}}\"}"

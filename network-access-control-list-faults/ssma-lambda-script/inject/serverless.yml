@@ -1,0 +1,16 @@
+service: AutomationInject
+
+provider:
+  name: aws
+  runtime: python3.8
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - "ec2:*"
+      Resource: "*"
+
+functions:
+  hello:
+    handler: inject_fault.inject_fault
+    timeout: 300
+

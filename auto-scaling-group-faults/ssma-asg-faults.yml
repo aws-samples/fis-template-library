@@ -1,0 +1,82 @@
+---
+description: Terminate all instances of ASG in a particular AZ
+schemaVersion: '0.3'
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  AvailabilityZone:
+    type: String
+    description: "(Required) The Availability Zone to impact"
+  AutoscalingGroupName:
+    type: String
+    description: "(Required) The names of the autoscaling group"
+  AutomationAssumeRole:
+    type: String
+    description: "The ARN of the role that allows Automation to perform
+      the actions on your behalf."
+mainSteps:
+- name: ListInstancesAutoscaling
+  action: aws:executeAwsApi
+  timeoutSeconds: 60
+  inputs:
+    Service: autoscaling
+    Api: DescribeAutoScalingGroups
+    AutoScalingGroupNames:
+        - "{{ AutoscalingGroupName }}"
+  outputs:
+    - Name: InstanceIds
+      Selector: "$..InstanceId"
+      Type: StringList
+- name: SelectInstancesAZ
+  action: aws:executeAwsApi
+  timeoutSeconds: 60
+  inputs:
+    Service: ec2
+    Api: DescribeInstances
+    Filters:
+    - Name: "availability-zone"
+      Values:
+        - "{{ AvailabilityZone }}"
+    - Name: "instance-id"
+      Values: "{{ ListInstancesAutoscaling.InstanceIds }}"
+  outputs:
+     - Name: InstanceIds
+       Selector: "$..InstanceId"
+       Type: StringList
+- name: verifyInstanceStateRunning
+  action: aws:waitForAwsResourceProperty
+  timeoutSeconds: 60
+  inputs:
+    Service: ec2
+    Api: DescribeInstanceStatus
+    InstanceIds: 
+      - "{{ SelectInstancesAZ.InstanceIds }}"
+    PropertySelector: "$.InstanceStatuses[0].InstanceState.Name"
+    DesiredValues:
+      - running
+- name: TerminateInstances
+  action: aws:changeInstanceState
+  onFailure: Continue
+  inputs:
+    InstanceIds: "{{ SelectInstancesAZ.InstanceIds }}"
+    DesiredState:  terminated
+- name: forceTerminateInstances
+  action: aws:changeInstanceState
+  inputs:
+    InstanceIds: 
+      - "{{ SelectInstancesAZ.InstanceIds }}"
+    CheckStateOnly: false
+    DesiredState: terminated
+    Force: true
+- name: VerifyInstanceStateTerminated
+  action: aws:waitForAwsResourceProperty
+  timeoutSeconds: 90
+  inputs:
+    Service: ec2
+    Api: DescribeInstanceStatus
+    IncludeAllInstances: true
+    InstanceIds: "{{ SelectInstancesAZ.InstanceIds }}"
+    PropertySelector: "$..InstanceState.Name"
+    DesiredValues:
+      - terminated
+outputs:
+- SelectInstancesAZ.InstanceIds

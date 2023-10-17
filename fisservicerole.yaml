@@ -1,8 +1,0 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: "Servcie Role for AWS Fault Injection Simulator"
-Resources:
-  BasicFISSLR:
-    Type: 'AWS::IAM::ServiceLinkedRole'
-    Properties:
-      AWSServiceName: fis.amazonaws.com
-      Description: FIS Basic SLR

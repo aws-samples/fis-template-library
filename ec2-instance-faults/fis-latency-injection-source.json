@@ -1,0 +1,34 @@
+{
+    "tags": {
+        "Name": "FIS Experiment"
+    },
+    "description": "FIS integration with SSM Demo",
+    "targets": {
+        "myInstance": {
+            "resourceType": "aws:ec2:instance",
+            "resourceArns": ["<INSTANCE_ARN>"],
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "FaultInjection": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Inject Latency",
+            "parameters": {
+                "duration": "PT1M",
+                "documentArn": "arn:aws:ssm:us-east-1::AWSFIS-Run-Network-Latency-Sources",
+                "documentParameters": "{\"Interface\":\"eth0\",\"DelayMilliseconds\":\"200\",\"JitterMilliseconds\":\"10\",\"InstallDependencies\":\"True\",\"Sources\":\"www.amazon.com\",\"DurationSeconds\":\"120\"}"
+            },
+            "targets": {
+                "Instances": "myInstance"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+          "source": "aws:cloudwatch:alarm",
+          "value": "arn:aws:cloudwatch:us-east-1:<ACCOUNT_ID>:alarm:<CLOUDWATCH_ALARM>"
+        }
+      ],
+    "roleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<IAM_ROLE>"
+}

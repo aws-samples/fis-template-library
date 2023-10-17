@@ -1,0 +1,26 @@
+{
+    "tags": {
+        "Name": "FIS Experiment"
+    },
+     "description": "Terminate all EC2 instances from a particular Auto Scaling Group (ASG) in a particular AZ ",
+     "targets": {
+     },
+     "actions": {
+         "injectNaclFault": {
+             "actionId": "aws:ssm:start-automation-execution",
+             "description": "Calling SSMA document to inject faults in the NACLS of a particular AZ.",
+             "parameters": {
+                 "documentArn": "arn:aws:ssm:us-east-1:<ACCOUNT_ID>:document/Test-AWSFIS-SSMA-ASG",
+                 "documentParameters": "{\"AvailabilityZone\": \"us-east-1a\", \"AutoscalingGroupName\": \"Test-FIS-ASG\", \"AutomationAssumeRole\": \"arn:aws:iam::<ACCOUNT_ID>:role/<IAM_ROLE_SSM>\"}",
+                 "maxDuration": "PT2M"
+             }
+         }
+     },
+     "stopConditions": [
+        {
+            "source": "aws:cloudwatch:alarm",
+            "value": "arn:aws:cloudwatch:us-east-1:<ACCOUNT_ID>:alarm:<CLOUDWATCH_ALARM>"
+        }
+    ],
+     "roleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<IAM_ROLE>"
+}
