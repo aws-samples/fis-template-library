@@ -1,0 +1,28 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:SendSpotInstanceInterruptions",
+                "ec2:DescribeSpotInstanceRequests",
+                "ec2:DescribeInstances"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:log-group:/aws/fis/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "fis:*",
+            "Resource": "*"
+        }
+    ]
+}

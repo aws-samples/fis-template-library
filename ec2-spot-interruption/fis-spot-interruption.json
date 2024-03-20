@@ -1,0 +1,36 @@
+{
+    "description": "interrupt-ec2-spot",
+    "targets": {
+        "spot-instances": {
+            "resourceType": "aws:ec2:spot-instance",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "interrupt-ec2-spot": {
+            "actionId": "aws:ec2:send-spot-instance-interruptions",
+            "parameters": {
+                "durationBeforeInterruption": "PT4M"
+            },
+            "targets": {
+                "SpotInstances": "spot-instances"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "interrupt-ec2-spot"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

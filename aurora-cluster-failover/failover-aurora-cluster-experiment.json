@@ -1,5 +1,5 @@
 {
-        "description": "failover-aurora-cluster",
+        "description": "aurora-cluster-failover",
         "targets": {
                 "Clusters-Target-1": {
                         "resourceType": "aws:rds:cluster",

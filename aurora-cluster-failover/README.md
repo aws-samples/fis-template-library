@@ -1,4 +1,4 @@
-# Failover Aurora Cluster
+# AWS Fault Injection Service Experiment: Failover Aurora Cluster
 
 This AWS Fault Injection Service (FIS) experiment is designed to perform a failover operation on Amazon Aurora clusters that have the tag `FIS-Ready=True`. The experiment utilizes the `aws:rds:failover-db-cluster` action provided by FIS.
 
