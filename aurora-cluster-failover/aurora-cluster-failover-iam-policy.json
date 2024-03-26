@@ -9,27 +9,33 @@
             ],
             "Resource": [
                 "arn:aws:rds:*:*:cluster:*"
-            ]
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
         },
         {
             "Effect": "Allow",
             "Action": [
                 "logs:CreateLogGroup",
                 "logs:CreateLogStream",
-                "logs:PutLogEvents"
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams"
             ],
-            "Resource": [
-                "arn:aws:logs:*:*:log-group:/aws/fis/*"
-            ]
+            "Resource": "*"
         },
         {
             "Effect": "Allow",
             "Action": [
-                "fis:*"
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
             ],
-            "Resource": [
-                "*"
-            ]
+            "Resource": "*"
         }
     ]
 }

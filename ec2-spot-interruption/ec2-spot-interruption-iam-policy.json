@@ -8,20 +8,32 @@
                 "ec2:DescribeSpotInstanceRequests",
                 "ec2:DescribeInstances"
             ],
-            "Resource": "*"
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
         },
         {
             "Effect": "Allow",
             "Action": [
                 "logs:CreateLogGroup",
                 "logs:CreateLogStream",
-                "logs:PutLogEvents"
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams"
             ],
-            "Resource": "arn:aws:logs:*:*:log-group:/aws/fis/*"
+            "Resource": "*"
         },
         {
             "Effect": "Allow",
-            "Action": "fis:*",
+            "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
             "Resource": "*"
         }
     ]

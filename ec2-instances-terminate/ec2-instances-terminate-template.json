@@ -1,0 +1,32 @@
+{
+    "description": "ec2-instance-terminate",
+    "targets": {
+            "Instances-Target-1": {
+                    "resourceType": "aws:ec2:instance",
+                    "resourceTags": {
+                            "FIS-Ready": "True"
+                    },
+                    "selectionMode": "PERCENT(25)"
+            }
+    },
+    "actions": {
+            "ec2-instances-terminate": {
+                    "actionId": "aws:ec2:terminate-instances",
+                    "parameters": {},
+                    "targets": {
+                            "Instances": "Instances-Target-1"
+                    }
+            }
+    },
+    "stopConditions": [
+            {
+                    "source": "none"
+            }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {},
+    "experimentOptions": {
+            "accountTargeting": "single-account",
+            "emptyTargetResolutionMode": "fail"
+    }
+}

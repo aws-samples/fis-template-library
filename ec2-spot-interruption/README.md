@@ -1,6 +1,17 @@
-# AWS Fault Injection Service Experiment: Interrupt EC2 Spot Instances
+# AWS Fault Injection Service Experiment: EC2 Spot Instances Interrupt
 
-This experiment simulates an interruption of EC2 Spot Instances in your AWS environment. It is designed to test the resilience of your applications and services running on Spot Instances by triggering an interruption event.
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
+
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Description
+
+Explore the impact the termination of EC2 Spot Instances. 
+
+In this experiment we target EC2 Spot Instances in the current region that have a specific tag attached. 
 
 ## Hypothesis
 
@@ -20,60 +31,30 @@ Specifically, we expect the following behavior:
 
 By validating this hypothesis, we can demonstrate the resilience of our applications and services running on EC2 Spot Instances and ensure that they can gracefully handle interruptions while minimizing the impact on end-users or customers.
 
-## Targets
+## Prerequisites
 
-The experiment targets all EC2 Spot Instances that have the tag `FIS-Ready: True`.
+Before running this experiment, ensure that:
 
-## Actions
+1. You have the necessary permissions to execute the FIS experiment and perform the termination of EC2 Spot Instance
+2. The IAM role specified in the `roleArn` field has the required permissions to perform the termination operation.
+3. The EC2 Spot Instance you want to target have the `FIS-Ready=True` tag.
 
-The experiment performs the following action:
+## How it works
 
-1. **Interrupt EC2 Spot Instances**: The experiment sends an interruption signal to all targeted EC2 Spot Instances using the AWS API `aws:ec2:send-spot-instance-interruptions`. This action simulates a real-world scenario where the Spot Instances are interrupted due to changes in the Spot market or capacity constraints.
+The experiment sends an interruption signal to 25% of targeted EC2 Spot Instances using the AWS API `aws:ec2:send-spot-instance-interruptions`. This action simulates a real-world scenario where the Spot Instances are interrupted due to changes in the Spot market or capacity constraints.
 
-### Parameters
-
-- `durationBeforeInterruption`: A duration of 4 minutes (PT4M) is set before the interruption is triggered. This allows for any necessary preparations or cleanup tasks to be executed before the interruption occurs.
+`durationBeforeInterruption`: A duration of 4 minutes (PT4M) is set before the interruption is triggered. This allows for any necessary preparations or cleanup tasks to be executed before the interruption occurs.
 
 ## Stop Conditions
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until all targeted resources have been interrupted.
 
-## Role ARN
+## Observability and stop conditions
 
-### IAM Role 
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
+business metric requiring an immediate end of the fault injection. This 
+template makes no assumptions about your application and the relevant metrics 
+and does not include stop conditions by default.
 
-The iam-policy.json file within this directory has been provided as an example. This policy includes the following permissions:
-
-1. **ec2:SendSpotInstanceInterruptions**: Allows the IAM role to send interruption signals to EC2 Spot Instances.
-
-2. **ec2:DescribeSpotInstanceRequests** and **ec2:DescribeInstances**: Allows the IAM role to describe Spot Instance requests and instances, which is necessary for the experiment to identify the targeted resources.
-
-3. **logs:CreateLogGroup**, **logs:CreateLogStream**, and **logs:PutLogEvents**: Allows the IAM role to create and write logs to Amazon CloudWatch Logs for monitoring and logging purposes during the fault injection experiment.
-
-4. **fis:***: Grants full access to the AWS Fault Injection Simulator service, allowing the IAM role to create, manage, and run fault injection experiments.
-
-The `Resource` field is set to `*`, which grants permissions to all resources for the specified actions. However, you should review and adjust the `Resource` field based on your specific requirements and best practices for least privilege access.
-
-You can create an IAM role with this policy and specify the role ARN in the `roleArn` field of your FIS experiment configuration.
-
-Note: This is just an example policy, and you should review and customize it according to your specific use case and security requirements. 
-
-## Tags
-
-The experiment is tagged with the name `interrupt-ec2-spot`.
-
-## Experiment Options
-
-- `accountTargeting`: The experiment is configured to run in a single AWS account.
-- `emptyTargetResolutionMode`: If no resources matching the target criteria are found, the experiment will fail.
-
-## Usage
-
-1. Review and customize the experiment configuration as needed.
-2. Create an IAM role with the necessary permissions for the experiment.
-3. Replace `<YOUR AWS ACCOUNT>` and `<YOUR ROLE NAME>` with your AWS account ID and the name of the IAM role you created.
-4. Deploy the experiment using the AWS Fault Injection Service console or CLI.
-5. Monitor the experiment execution and observe the impact on your applications and services running on the targeted EC2 Spot Instances.
-6. Analyze the results and identify any areas for improvement in your application's resilience and fault tolerance.
-
-Please note that this experiment may cause disruptions to your running services, so it is recommended to run it in a non-production environment or during scheduled maintenance windows.
+## Next Steps
+As you adapt this scenario to your needs, we recommend reviewing the tag names you use to ensure they fit your specific use case, identifying business metrics tied to the instances you are stopping, creating an Amazon CloudWatch metric and Amazon CloudWatch alarm, and adding a stop condition tied to the alarm.

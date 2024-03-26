@@ -2,17 +2,6 @@
 
 This repository contains a collection of AWS Fault Injection Service (FIS) experiments designed to test the resilience and fault tolerance of your AWS resources and applications. These experiments simulate various failure scenarios to help you identify potential vulnerabilities and validate your system's ability to recover from disruptions.
 
-## Experiment Types
-
-The repository includes the following types of experiments:
-
-1. **EC2 Instance Experiments**:
-   - Instance Stop/Terminate: Simulate stopping or terminating EC2 instances to test auto-scaling and recovery mechanisms.
-
-2. **Database Experiments**:
-   - RDS Instance Failure: Simulate an Amazon Relational Database Service (RDS) instance failure to test database failover and recovery mechanisms.
-   - DynamoDB Table Outage: Simulate a DynamoDB table outage to test application resilience and data replication strategies.
-
 ## Getting Started
 
 To get started with these experiments, follow these steps:
@@ -28,14 +17,6 @@ To get started with these experiments, follow these steps:
 5. **Monitoring**: Monitor the experiment execution and observe the impact on your resources and applications.
 
 6. **Analysis**: Analyze the results and identify areas for improvement in your system's resilience and fault tolerance.
-
-## Contributing
-
-Contributions to this repository are welcome! If you have developed new FIS experiments or have suggestions for improving existing ones, please submit a pull request or open an issue.
-
-## License
-
-This repository is licensed under the [MIT License](LICENSE).
 
 ## Disclaimer
 
