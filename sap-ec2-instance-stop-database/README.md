@@ -9,15 +9,29 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Description
 
+Explore the impact of the stopping of the EC2 Instances which is hosting the SAP database. 
+
+In this experiment we target EC2 Spot Instances in the current region that have a specific tag attached. 
+
 ## Hypothesis
+
+When an interruption occurs on the EC2 Instances hosting the SAP database, the application will failover to the Standby EC2 instance hosted in another AZ. The failover will occur within 15-30 minutes and user can resume operations. Application has requirement of RTO of 30 minutes RPO of near zero. This validates SAP database cluster configuration.
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
-1. You have the necessary permissions to execute the FIS experiment and perform the termination of EC2 Spot Instance
+1. You have the necessary permissions to execute the FIS experiment.
 2. The IAM role specified in the `roleArn` field has the required permissions to perform the termination operation.
-3.
+3. All your AWS resources are correctly tagged. 
+```
+    "ec2:ResourceTag/FIS-Application": "SAP",
+    "ec2:ResourceTag/FIS-Ready": "True",
+    "ec2:ResourceTag/FIS-SAP-App-Tier": "Database",
+    "ec2:ResourceTag/FIS-SAP-Environment-Type": "Dev",
+    "ec2:ResourceTag/FIS-SAP-HA-Node": "Primary",
+    "ec2:ResourceTag/FIS-SAP-SID": "S4"
+```
 
 ## Stop Conditions
 

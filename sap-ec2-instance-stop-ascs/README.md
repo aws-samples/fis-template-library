@@ -9,15 +9,29 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Description
 
+Explore the impact of the interruption of EC2 Instance which hosts the SAP database. 
+
+In this experiment we target EC2 Instances in the current region that have a specific tag attached. 
+
 ## Hypothesis
+
+When an interruption occurs on the EC2 Instances hosting the ABAP SAP Central Services (ASCS), the ASCS process will failover to the Standby EC2 instance hosting EnQue Replication Server (ERS). The failover will occur within 5-15 minutes and user can resume operations. This validates SAP application cluster configuration.
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
-1. You have the necessary permissions to execute the FIS experiment and perform the termination of EC2 Spot Instance
+1. You have the necessary permissions to execute the FIS experiment.
 2. The IAM role specified in the `roleArn` field has the required permissions to perform the termination operation.
-3.
+3. All your AWS resources are correctly tagged. 
+```
+    "FIS-Application": "SAP",
+    "FIS-Ready": "True",
+    "FIS-SAP-App-Tier": "Application",
+    "FIS-SAP-Environment-Type": "Dev",
+    "FIS-SAP-HA-Node": "Primary",
+    "FIS-SAP-SID": "S4"
+```
 
 ## Stop Conditions
 

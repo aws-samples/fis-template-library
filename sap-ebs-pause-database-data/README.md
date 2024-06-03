@@ -9,15 +9,29 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Description
 
+Explore the impact of the interruption of EBS Volume which hosts the SAP database. 
+
+In this experiment we target EC2 Instances in the current region that have a specific tag attached. 
+
 ## Hypothesis
+
+When an interruption occurs on the Block Storage drive attached to EC2 Instances hosting the SAP database, the application will unable to write data causing a failover to occur to the Standby EC2 instance hosted in another AZ. The failover will occur within 15-30 minutes and user can resume operations. Application has requirement of RTO of 30 minutes RPO of near zero. This validates SAP database cluster configuration.
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
-1. You have the necessary permissions to execute the FIS experiment and perform the termination of EC2 Spot Instance
+1. You have the necessary permissions to execute the FIS experiment.
 2. The IAM role specified in the `roleArn` field has the required permissions to perform the termination operation.
-3.
+3. All your AWS resources are correctly tagged. 
+```
+    "FIS-Application": "SAP",
+    "FIS-Ready": "True",
+    "FIS-SAP-App-Tier": "Database",
+    "FIS-SAP-Database-Type": "Data",
+    "FIS-SAP-Environment-Type": "Dev",
+    "FIS-SAP-SID": "S4"
+```
 
 ## Stop Conditions
 

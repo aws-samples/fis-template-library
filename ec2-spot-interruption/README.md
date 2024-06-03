@@ -9,7 +9,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Description
 
-Explore the impact the termination of EC2 Spot Instances. 
+Explore the impact of the termination of EC2 Spot Instances. 
 
 In this experiment we target EC2 Spot Instances in the current region that have a specific tag attached. 
 
