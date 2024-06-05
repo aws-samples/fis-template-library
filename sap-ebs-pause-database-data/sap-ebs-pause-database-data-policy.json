@@ -1,0 +1,40 @@
+{
+        "Version": "2012-10-17",
+        "Statement": [
+                {
+                        "Effect": "Allow",
+                        "Action": [
+                                "ec2:DescribeVolumes"
+                        ],
+                        "Resource": "*"
+                },
+                {
+                        "Effect": "Allow",
+                        "Action": [
+                                "ec2:PauseVolumeIO"
+                        ],
+                        "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents",
+                        "logs:DescribeLogGroups",
+                        "logs:DescribeLogStreams"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "fis:StartExperiment",
+                        "fis:GetExperimentSummary",
+                        "fis:GetExperimentResults",
+                        "fis:StopExperiment"
+                    ],
+                    "Resource": "*"
+                }
+        ]
+}

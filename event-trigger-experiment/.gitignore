@@ -1,6 +1,0 @@
-!*.js
-.aws-sam
-.vscode
-node_modules
-samconfig.toml
-aws-fis-sample-experiment.json

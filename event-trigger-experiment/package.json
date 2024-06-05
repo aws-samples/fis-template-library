@@ -1,9 +1,0 @@
-{
-    "name": "aws-fis-event-trigger-experiment",
-    "description": " ",
-    "version": "0.1.0",
-    "private": true,
-    "dependencies": {
-        "@aws-sdk/client-fis": "^3.13.0"
-    }
-}

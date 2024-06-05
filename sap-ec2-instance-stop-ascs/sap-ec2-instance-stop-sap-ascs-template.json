@@ -1,0 +1,42 @@
+{
+        "description": "EC2 Stop - SAP ASCS ERS Cluster",
+        "targets": {
+                "SAPASCSERSCLUSTER": {
+                        "resourceType": "aws:ec2:instance",
+                        "resourceTags": {
+                                "FIS-Application": "SAP",
+                                "FIS-Ready": "True",
+                                "FIS-SAP-App-Tier": "Application",
+                                "FIS-SAP-Environment-Type": "Dev",
+                                "FIS-SAP-HA-Node": "Primary",
+                                "FIS-SAP-SID": "S4"
+                        },
+                        "selectionMode": "ALL"
+                }
+        },
+        "actions": {
+                "EC2STOP": {
+                        "actionId": "aws:ec2:stop-instances",
+                        "description": "Stop SAP ASCS Node",
+                        "parameters": {
+                                "startInstancesAfterDuration": "PT5M"
+                        },
+                        "targets": {
+                                "Instances": "SAPASCSERSCLUSTER"
+                        }
+                }
+        },
+        "stopConditions": [
+                {
+                        "source": "none"
+                }
+        ],
+        "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+        "tags": {
+                "Name": "EC2 Stop - SAP ASCS ERS Cluster"
+        },
+        "experimentOptions": {
+                "accountTargeting": "single-account",
+                "emptyTargetResolutionMode": "fail"
+        }
+}

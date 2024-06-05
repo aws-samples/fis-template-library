@@ -1,0 +1,40 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:SendSpotInstanceInterruptions",
+                "ec2:DescribeSpotInstanceRequests",
+                "ec2:DescribeInstances"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

@@ -1,0 +1,45 @@
+{
+        "description": "EBS Pause - SAP Database Cluster",
+        "targets": {
+                "EBSPAUSEDB": {
+                        "resourceType": "aws:ec2:ebs-volume",
+                        "resourceTags": {
+                                "FIS-Application": "SAP",
+                                "FIS-Ready": "True",
+                                "FIS-SAP-App-Tier": "Database",
+                                "FIS-SAP-Database-Type": "Data",
+                                "FIS-SAP-Environment-Type": "Dev",
+                                "FIS-SAP-SID": "S4"
+                        },
+                        "selectionMode": "ALL",
+                        "parameters": {
+                                "availabilityZoneIdentifier": "us-east-1a"
+                        }
+                }
+        },
+        "actions": {
+                "EBSPAUSEDB": {
+                        "actionId": "aws:ebs:pause-volume-io",
+                        "description": "EBS Pause - SAP DB",
+                        "parameters": {
+                                "duration": "PT5M"
+                        },
+                        "targets": {
+                                "Volumes": "EBSPAUSEDB"
+                        }
+                }
+        },
+        "stopConditions": [
+                {
+                        "source": "none"
+                }
+        ],
+        "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+        "tags": {
+                "Name": "EBS Pause - SAP Database Cluster"
+        },
+        "experimentOptions": {
+                "accountTargeting": "single-account",
+                "emptyTargetResolutionMode": "fail"
+        }
+}

@@ -1,0 +1,63 @@
+{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "fis:StartExperiment",
+                    "fis:GetExperimentSummary",
+                    "fis:GetExperimentResults",
+                    "fis:StopExperiment"
+                ],
+                "Resource": "*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": "ec2:StopInstances",
+                "Resource": "arn:aws:ec2:*:*:instance/*",
+                "Condition": {
+                    "StringEquals": {
+                        "ec2:ResourceTag/FIS-Application": "SAP",
+                        "ec2:ResourceTag/FIS-Ready": "True",
+                        "ec2:ResourceTag/FIS-SAP-App-Tier": "Database",
+                        "ec2:ResourceTag/FIS-SAP-Environment-Type": "Dev",
+                        "ec2:ResourceTag/FIS-SAP-HA-Node": "Primary",
+                        "ec2:ResourceTag/FIS-SAP-SID": "S4"
+                    }
+                }
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams"
+                ],
+                "Resource": "*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams"
+                ],
+                "Resource": "*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "fis:StartExperiment",
+                    "fis:GetExperimentSummary",
+                    "fis:GetExperimentResults",
+                    "fis:StopExperiment"
+                ],
+                "Resource": "*"
+            }
+        ]
+    }
+    
