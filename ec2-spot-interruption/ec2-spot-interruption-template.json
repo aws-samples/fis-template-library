@@ -13,7 +13,7 @@
         "interrupt-ec2-spot": {
             "actionId": "aws:ec2:send-spot-instance-interruptions",
             "parameters": {
-                "durationBeforeInterruption": "PT4M"
+                "durationBeforeInterruption": "PT2M"
             },
             "targets": {
                 "SpotInstances": "spot-instances"
