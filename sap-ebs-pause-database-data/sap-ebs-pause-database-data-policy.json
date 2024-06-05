@@ -14,6 +14,27 @@
                                 "ec2:PauseVolumeIO"
                         ],
                         "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents",
+                        "logs:DescribeLogGroups",
+                        "logs:DescribeLogStreams"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "fis:StartExperiment",
+                        "fis:GetExperimentSummary",
+                        "fis:GetExperimentResults",
+                        "fis:StopExperiment"
+                    ],
+                    "Resource": "*"
                 }
         ]
 }
