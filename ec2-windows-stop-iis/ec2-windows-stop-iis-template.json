@@ -1,0 +1,38 @@
+{
+    "description": "This Experiment Stops IIS on target Windows Instances",
+    "targets": {
+        "IISServers": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "StopIIS": {
+            "actionId": "aws:ssm:send-command",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/StopIISAppPool",
+                "documentParameters": "{\"DurationSeconds\": \"60\", \"IISAppPoolName\": \"DefaultAppPool\"}",
+                "duration": "PT5M"
+            },
+            "targets": {
+                "Instances": "IISServers"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "StopIISExperiment"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}
