@@ -42,6 +42,3 @@ As you adapt this scenario to your needs, we recommend:
 
 ## Import Experiment
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling). 
-```
-
-This template has been adapted to focus on stopping IIS on Windows EC2 instances, which simulates a scenario where the web server fails to start. The hypothesis, prerequisites, and next steps have been modified to reflect this specific experiment.
