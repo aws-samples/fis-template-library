@@ -11,6 +11,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 Our application will remain available and resilient when IIS (Internet Information Services) is stopped on one of our Windows EC2 instances, simulating a scenario where the web server crashes or fails to start.
 
+![Stop IIS Experiment](images/ssm.png)
+
 ## Prerequisites
 
 Before running this experiment, ensure that:
