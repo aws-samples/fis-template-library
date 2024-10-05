@@ -30,7 +30,7 @@ Before running this experiment, ensure that:
 
 ## How it works
 
-This template simulate an Aurora DB cluster failover for a DB cluster. It will promotes one of the Aurora Replicas (read-only instances) in the DB cluster to be the primary DB instance (the cluster writer). To use the scenario you must have Amazon Aurora clusters that have the tag `FIS-Ready=True`.
+This template simulate an Aurora DB cluster failover for a DB cluster. It will promote one of the Aurora Replicas (read-only instances) in the DB cluster to be the primary DB instance (the cluster writer). To use the scenario you must have Amazon Aurora clusters that have the tag `FIS-Ready=True`.
 
 ## Observability and stop conditions
 
