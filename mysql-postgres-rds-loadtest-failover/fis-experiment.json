@@ -1,0 +1,33 @@
+{
+    "description": "Database Load Test Experiment",
+    "targets": {
+      "Instances": [
+        {
+          "resourceType": "aws:ec2:instance",
+          "resourceArns": [
+            "arn:aws:ec2:us-west-2:123456789012:instance/i-1234567890abcdef0"
+          ],
+          "selectionMode": "ALL"
+        }
+      ]
+    },
+    "actions": {
+      "RunLoadTest": {
+        "actionId": "aws:ssm:send-command",
+        "parameters": {
+          "documentArn": "arn:aws:ssm:us-west-2:123456789012:document/RunLoadTest",
+          "duration": "PT5M"
+        },
+        "targets": {
+          "Instances": "Instances"
+        }
+      }
+    },
+    "stopConditions": [
+      {
+        "source": "aws:cloudwatch:alarm",
+        "value": "arn:aws:cloudwatch:us-west-2:123456789012:alarm:HighCPUAlarm"
+      }
+    ],
+    "roleArn": "arn:aws:iam::123456789012:role/FISExperimentRole"
+  }

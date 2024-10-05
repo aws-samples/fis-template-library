@@ -1,0 +1,12 @@
+ schemaVersion: '2.2'
+   description: 'Run database load test'
+   parameters: {}
+   mainSteps:
+   - action: 'aws:runShellScript'
+     name: 'runLoadTest'
+     inputs:
+       timeoutSeconds: '600'
+       runCommand:
+       - |
+         #!/bin/bash
+         # Insert the load test script here
