@@ -14,7 +14,7 @@
             "actionId": "aws:ssm:send-command",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/StopIISAppPool",
-                "documentParameters": "{\"DurationSeconds\": \"60\", \"IISAppPoolName\": \"DefaultAppPool\"}",
+                "documentParameters": "{\"DurationSeconds\": \"285\", \"IISAppPoolName\": \"DefaultAppPool\"}",
                 "duration": "PT5M"
             },
             "targets": {
