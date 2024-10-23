@@ -1,33 +1,33 @@
 {
-        "description": "aurora-cluster-failover",
-        "targets": {
-                "Clusters-Target-1": {
-                        "resourceType": "aws:rds:cluster",
-                        "resourceTags": {
-                                "FIS-Ready": "True"
-                        },
-                        "selectionMode": "ALL",
-                        "parameters": {}
-                }
-        },
-        "actions": {
-                "failover-aurora-cluster": {
-                        "actionId": "aws:rds:failover-db-cluster",
-                        "parameters": {},
-                        "targets": {
-                                "Clusters": "Clusters-Target-1"
-                        }
-                }
-        },
-        "stopConditions": [
-                {
-                        "source": "none"
-                }
-        ],
-        "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
-        "tags": {},
-        "experimentOptions": {
-                "accountTargeting": "single-account",
-                "emptyTargetResolutionMode": "fail"
-        }
+  "description": "aurora-cluster-failover",
+  "targets": {
+    "Clusters-Target-1": {
+      "resourceType": "aws:rds:cluster",
+      "resourceTags": {
+        "FIS-Ready": "True"
+      },
+      "selectionMode": "ALL",
+      "parameters": {}
+    }
+  },
+  "actions": {
+    "failover-aurora-cluster": {
+      "actionId": "aws:rds:failover-db-cluster",
+      "parameters": {},
+      "targets": {
+        "Clusters": "Clusters-Target-1"
+      }
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+  "tags": {},
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "fail"
+  }
 }
