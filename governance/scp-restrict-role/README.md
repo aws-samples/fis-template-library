@@ -12,6 +12,13 @@ In order to ensure we are limiting the fault isolation bounds we are testing, we
 
 These policies have conditions to allow an admin and automation to still be allowed to take these actions. 
 
+## Security Considerations
+
+- Always test SCPs in a non-production environment first
+- Monitor policy changes using AWS CloudTrail
+- Regularly review and update policies as your requirements evolve
+- Ensure you maintain access to emergency response procedures
+
 ## Prerequisites
 
 - An AWS Organization with [SCPs enabled](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html)
@@ -24,10 +31,3 @@ These policies have conditions to allow an admin and automation to still be allo
 2. Modify the policies according to your organization's requirements
 3. Test the SCPs in a non-production environment
 4. Apply the SCPs to your organization using the AWS Organizations console or API
-
-## Security Considerations
-
-- Always test SCPs in a non-production environment first
-- Monitor policy changes using AWS CloudTrail
-- Regularly review and update policies as your requirements evolve
-- Ensure you maintain access to emergency response procedures
