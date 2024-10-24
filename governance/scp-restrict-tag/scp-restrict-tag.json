@@ -13,7 +13,8 @@
 				"ForAnyValue:StringEquals": {
 					"aws:TagKeys": [
 						"FIS-Experiment",
-						"FIS-Target"
+						"FIS-Target",
+						"FIS-Ready"
 					]
 				},
 				"ArnNotEquals": {
