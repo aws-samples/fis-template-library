@@ -1,0 +1,35 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "DenyFISExperimentTags",
+			"Effect": "Deny",
+			"Action": [
+				"ec2:CreateTags",
+				"ec2:DeleteTags"
+			],
+			"Resource": "*",
+			"Condition": {
+				"ForAnyValue:StringEquals": {
+					"aws:TagKeys": [
+						"FIS-Experiment",
+						"FIS-Target"
+					]
+				},
+				"ArnNotEquals": {
+					"aws:PrincipalArn": [
+						"arn:aws:iam::<YOUR AWS ACCOUNT>:role/CustomerAutomationRole",
+						"arn:aws:iam::<YOUR AWS ACCOUNT>:role/CustomerAdminRole"
+					]
+				}
+			}
+		}
+	]
+}
+
+
+
+
+
+
+

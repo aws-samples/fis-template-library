@@ -1,0 +1,31 @@
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "AllowAccessToASpecificRole",
+			"Effect": "Deny",
+			"Action": [
+				"ec2:CreateNetworkAcl",
+				"ec2:CreateNetworkAclEntry",
+				"ec2:DeleteNetworkAcl",
+				"ec2:CreateTags",
+				"ec2:DescribeNetworkAcls",
+				"ec2:DescribeManagedPrefixLists",
+				"ec2:DescribeSubnets",
+				"ec2:DescribeVpcs",
+				"ec2:ReplaceNetworkAclAssociation",
+				"ec2:GetManagedPrefixListEntries"
+			],
+			"Resource": "*",
+			"Condition": {
+				"ArnEquals": {
+					"aws:PrincipalArn": [
+						"arn:aws:iam::*:role/AWS-FIS-Experiment-Executor",
+						"arn:aws:iam::<YOUR AWS ACCOUNT>:role/CustomerAutomationRole",
+						"arn:aws:iam::<YOUR AWS ACCOUNT>:role/CustomerAdminRole"
+					]
+				}
+			}
+		}
+	]
+}
