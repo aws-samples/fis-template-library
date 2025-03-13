@@ -1,46 +1,36 @@
-# AWS Fault Injection Service Experiment: Aurora Cluster Failover
+# AWS Fault Injection Service Experiment: RDS Instance CPU Overload and Failover
 
-This is an experiment template for use with AWS Fault Injection Service (FIS) and 
-fis-template-library-tooling. This experiment template requires deployment into 
-your AWS account and requires resources in your AWS account to inject faults into.
-
-THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+This experiment template simulates CPU overload on a single RDS instance within an Aurora cluster and then initiates a failover.
 
 ## Description
 
-Explore the impact of failing over of an Amazon Aurora cluster. 
-
-In this experiment we target an Amazon Aurora Cluster in the current region that have a specific tag attached. 
+This experiment targets a single RDS instance in an Aurora cluster, generates CPU load, and then initiates a cluster failover.
 
 ## Hypothesis
 
-Failover of an Aurora Cluster between the reader and writer instance may cause requests to fail for a brief period of time, but requests will automatically recover, and the application will continue to function as normal after the failover.
+High CPU load on a single RDS instance will cause degraded performance, and a subsequent failover will restore normal operation.
 
 ## Prerequisites
 
-Before running this experiment, ensure that:
-
-1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on the targeted Aurora clusters.
-2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation.
-3. The Aurora clusters you want to target have the `FIS-Ready=True` tag.
-4. The targeted Aurora clusters are configured for Multi-AZ deployment with writer and reader instances, and proper replication is set up.
+1. Ensure you have the necessary permissions to execute the FIS experiment and perform operations on RDS instances and clusters.
+2. The IAM role specified in the `roleArn` field must have the required permissions.
+3. Target RDS instances must have the `FIS-Target=True` tag.
+4. The Aurora cluster must be configured for Multi-AZ deployment.
+5. Create a CloudWatch alarm for CPU utilization to act as a stop condition.
 
 ## How it works
 
-This template simulate an Aurora DB cluster failover for a DB cluster. It will promote one of the Aurora Replicas (read-only instances) in the DB cluster to be the primary DB instance (the cluster writer). To use the scenario you must have Amazon Aurora clusters that have the tag `FIS-Ready=True`.
+1. The template selects a single RDS instance with the `FIS-Target=True` tag.
+2. It executes a SQL function to generate CPU load on the selected instance.
+3. After the load generation, it initiates a failover for the cluster containing the targeted instance.
 
 ## Observability and stop conditions
 
-Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
-business metric requiring an immediate end of the fault injection. This 
-template makes no assumptions about your application and the relevant metrics 
-and does not include stop conditions by default.
+A CloudWatch alarm based on CPU utilization acts as the stop condition. Ensure you create and specify this alarm before running the experiment.
 
 ## Next Steps
-As you adapt this scenario to your needs, we recommend reviewing the tag names you use to ensure they fit your specific use case, identifying business metrics tied to the instances you are stopping, creating an Amazon CloudWatch metric and Amazon CloudWatch alarm, and adding a stop condition tied to the alarm.
 
-## Import Experiment
-You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling). 
+1. Review and adjust the tag names used for targeting.
+2. Create additional CloudWatch alarms for other relevant metrics (e.g., DatabaseConnections, ReadLatency, WriteLatency).
+3. Implement application-level monitoring to measure the impact on your workload.
+4. Consider creating a CloudWatch dashboard to visualize the experiment's effects.

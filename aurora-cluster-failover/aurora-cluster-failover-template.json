@@ -1,33 +1,38 @@
 {
-        "description": "aurora-cluster-failover",
+        "description": "RDS Instance CPU Overload and Failover",
         "targets": {
-                "Clusters-Target-1": {
-                        "resourceType": "aws:rds:cluster",
-                        "resourceTags": {
-                                "FIS-Ready": "True"
-                        },
-                        "selectionMode": "ALL",
-                        "parameters": {}
-                }
+          "RDSInstances": {
+            "resourceType": "aws:rds:instance",
+            "resourceTags": {
+              "FIS-Target": "True"
+            },
+            "selectionMode": "COUNT(1)"
+          }
         },
         "actions": {
-                "failover-aurora-cluster": {
-                        "actionId": "aws:rds:failover-db-cluster",
-                        "parameters": {},
-                        "targets": {
-                                "Clusters": "Clusters-Target-1"
-                        }
-                }
+          "GenerateCPULoad": {
+            "actionId": "aws:rds:execute-sql",
+            "parameters": {
+              "sql": "SELECT generate_cpu_load(300);"
+            },
+            "targets": {
+              "Instances": "RDSInstances"
+            }
+          },
+          "FailoverCluster": {
+            "actionId": "aws:rds:failover-db-cluster",
+            "parameters": {},
+            "targets": {
+              "Clusters": "RDSInstances"
+            }
+          }
         },
         "stopConditions": [
-                {
-                        "source": "none"
-                }
+          {
+            "source": "aws:cloudwatch:alarm",
+            "value": "${CPUAlarmArn}"
+          }
         ],
-        "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
-        "tags": {},
-        "experimentOptions": {
-                "accountTargeting": "single-account",
-                "emptyTargetResolutionMode": "fail"
-        }
-}
+        "roleArn": "${FISRoleArn}"
+      }
+      
