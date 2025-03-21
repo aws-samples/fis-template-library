@@ -251,6 +251,36 @@ Resources:
           yum update -y
           yum install -y amazon-ssm-agent
           
+          # Clean yum cache to avoid repository issues
+          yum clean all
+          rm -rf /var/cache/yum
+          
+          # Install PostgreSQL client
+          yum install -y postgresql
+          
+          # Make sure psql is in PATH for all users
+          echo 'export PATH=$PATH:/usr/bin' > /etc/profile.d/psql-path.sh
+          chmod +x /etc/profile.d/psql-path.sh
+          
+          # Create symlink to ensure psql is available in common paths
+          if [ -f /usr/bin/psql ]; then
+            ln -sf /usr/bin/psql /usr/local/bin/psql
+          fi
+          
+          # Make sure ssm-user can run psql without sudo
+          # Create a wrapper script in /usr/local/bin that all users can execute
+          cat > /usr/local/bin/pg_connect << 'EOF'
+          #!/bin/bash
+          # This script allows non-root users to connect to PostgreSQL
+          if [ $# -lt 3 ]; then
+            echo "Usage: pg_connect <password> <username> <database>"
+            exit 1
+          fi
+          PGPASSWORD=$1 psql -h ${RDSInstance.Endpoint.Address} -p ${RDSInstance.Endpoint.Port} -U $2 -d $3
+          EOF
+          
+          chmod +x /usr/local/bin/pg_connect
+          
           # Ensure SSM agent is running
           systemctl enable amazon-ssm-agent
           systemctl start amazon-ssm-agent
@@ -269,8 +299,17 @@ Resources:
           # Add a cron job to check SSM agent every minute
           echo "* * * * * root /usr/local/bin/check-ssm-agent.sh" > /etc/cron.d/check-ssm-agent
           
+          # Log the installation status
+          echo "PostgreSQL client installation status:" > /var/log/user-data-complete.log
+          if command -v psql &> /dev/null; then
+            echo "PostgreSQL client installed successfully: $(which psql)" >> /var/log/user-data-complete.log
+            psql --version >> /var/log/user-data-complete.log
+          else
+            echo "PostgreSQL client installation FAILED" >> /var/log/user-data-complete.log
+          fi
+          
           # Log the completion
-          echo "EC2 instance setup completed at $(date)" > /var/log/user-data-complete.log
+          echo "EC2 instance setup completed at $(date)" >> /var/log/user-data-complete.log
       Tags:
         - Key: Name
           Value: SSM Managed Instance
