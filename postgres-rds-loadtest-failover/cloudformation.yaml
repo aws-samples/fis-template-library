@@ -233,6 +233,22 @@ Resources:
     Properties:
       Roles:
         - !Ref EC2Role
+        
+  # FIS Experiment Role with proper trust policy
+  FISExperimentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FISExperimentRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorSSMAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
 
   # EC2 Instance
   EC2Instance:

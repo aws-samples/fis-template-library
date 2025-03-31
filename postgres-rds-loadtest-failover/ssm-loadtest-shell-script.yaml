@@ -3,6 +3,16 @@
    parameters: {}
    mainSteps:
    - action: 'aws:runShellScript'
+     name: 'installDependencies'
+     inputs:
+      runCommand:
+      - |
+        #!/bin/bash
+        # Install newer PostgreSQL client
+        sudo amazon-linux-extras enable postgresql13
+        sudo yum clean metadata
+        sudo yum install -y postgresql
+   - action: 'aws:runShellScript'
      name: 'runLoadTest'
      inputs:
        timeoutSeconds: '600'
