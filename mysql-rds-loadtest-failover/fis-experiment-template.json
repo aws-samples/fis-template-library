@@ -10,9 +10,6 @@
         },
         "RDSCluster": {
             "resourceType": "aws:rds:db",
-            "resourceArns": [
-                "arn:aws:rds:us-east-1:456498356358:db:mysql-loadtest-db"
-            ],
             "selectionMode": "ALL",
             "filters": [
                 {
@@ -36,13 +33,7 @@
             "description": "Run MySQL load test using Systems Manager document",
             "parameters": {
                 "documentArn": "arn:aws:ssm:us-east-1:456498356358:document/RunMySQLLoadTest",
-                "documentParameters": {
-                    "Duration": "300",
-                    "Concurrency": "10",
-                    "DBHost": "{{ RESOURCE_ARN }}",
-                    "DBName": "testdb",
-                    "DBUsername": "admin"
-                },
+                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\",\"DBHost\":\"{{ RESOURCE_ARN }}\",\"DBName\":\"testdb\",\"DBUsername\":\"admin\"}",
                 "duration": "PT10M"
             },
             "targets": {
@@ -53,7 +44,7 @@
             "actionId": "aws:rds:reboot-db-instance",
             "description": "Force a failover by rebooting the primary instance with failover",
             "parameters": {
-                "forceFailover": true,
+                "forceFailover": "true",
                 "startTime": "PT2M"
             },
             "targets": {
