@@ -8,7 +8,7 @@
             ],
             "selectionMode": "ALL"
         },
-        "RDSCluster": {
+        "DBInstances": {
             "resourceType": "aws:rds:db",
             "selectionMode": "ALL",
             "filters": [
@@ -41,15 +41,15 @@
             }
         },
         "ForceFailover": {
-            "actionId": "aws:rds:reboot-db-instance",
+            "actionId": "aws:rds:reboot-db-instances",
             "description": "Force a failover by rebooting the primary instance with failover",
             "parameters": {
-                "forceFailover": "true",
-                "startTime": "PT2M"
+                "forceFailover": "true"
             },
             "targets": {
-                "Instances": "RDSCluster"
-            }
+                "DBInstances": "DBInstances"
+            },
+            "startAfter": ["RunLoadTest"]
         }
     },
     "stopConditions": [
