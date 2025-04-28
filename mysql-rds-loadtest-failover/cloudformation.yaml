@@ -36,6 +36,11 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Database admin password
+    
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI from SSM Parameter Store
 
 Resources:
   VPC:
@@ -235,6 +240,46 @@ Resources:
       Roles:
         - !Ref EC2Role
 
+  FISLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/fis/experiment
+      RetentionInDays: 7
+      
+  FISLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for FIS to write logs to CloudWatch
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:DescribeLogGroups
+              - logs:DescribeResourcePolicies
+              - logs:PutResourcePolicy
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+
+  FISSSMPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for FIS to execute SSM commands
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:SendCommand
+              - ssm:GetCommandInvocation
+              - ssm:ListCommands
+              - ssm:ListCommandInvocations
+            Resource: '*'
+
   FISExperimentRole:
     Type: AWS::IAM::Role
     Properties:
@@ -247,6 +292,8 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorRDSAccess
+        - !Ref FISLoggingPolicy
+        - !Ref FISSSMPolicy
 
   RDSInstance:
     Type: AWS::RDS::DBInstance

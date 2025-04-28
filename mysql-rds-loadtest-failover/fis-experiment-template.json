@@ -4,27 +4,16 @@
         "EC2Instance": {
             "resourceType": "aws:ec2:instance",
             "resourceArns": [
-                "arn:aws:ec2:us-east-1:456498356358:instance/i-0cfb85a0e5b50a836"
+                "${EC2InstanceArn}"
             ],
             "selectionMode": "ALL"
         },
         "DBInstances": {
             "resourceType": "aws:rds:db",
-            "selectionMode": "ALL",
-            "filters": [
-                {
-                    "path": "State.Name",
-                    "values": [
-                        "available"
-                    ]
-                },
-                {
-                    "path": "MultiAZ",
-                    "values": [
-                        "true"
-                    ]
-                }
-            ]
+            "resourceArns": [
+                "${RDSInstanceArn}"
+            ],
+            "selectionMode": "ALL"
         }
     },
     "actions": {
@@ -32,8 +21,8 @@
             "actionId": "aws:ssm:send-command",
             "description": "Run MySQL load test using Systems Manager document",
             "parameters": {
-                "documentArn": "arn:aws:ssm:us-east-1:456498356358:document/RunMySQLLoadTest",
-                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\",\"DBHost\":\"{{ RESOURCE_ARN }}\",\"DBName\":\"testdb\",\"DBUsername\":\"admin\"}",
+                "documentArn": "${SSMDocumentArn}",
+                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\",\"DBHost\":\"${RDSEndpoint}\",\"DBName\":\"${DBName}\",\"DBUsername\":\"${DBUsername}\",\"DBPassword\":\"${DBPassword}\"}",
                 "duration": "PT10M"
             },
             "targets": {
@@ -54,15 +43,14 @@
     },
     "stopConditions": [
         {
-            "source": "aws:cloudwatch:alarm",
-            "value": "arn:aws:cloudwatch:us-east-1:456498356358:alarm:RDSHighCPUAlarm"
+            "source": "none"
         }
     ],
-    "roleArn": "arn:aws:iam::456498356358:role/FISExperimentRole",
+    "roleArn": "${FISExperimentRoleArn}",
     "logConfiguration": {
         "logSchemaVersion": 2,
         "cloudWatchLogsConfiguration": {
-            "logGroupArn": "arn:aws:logs:us-east-1:456498356358:log-group:/aws/fis/experiment:*"
+            "logGroupArn": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/fis/experiment:*"
         }
     },
     "tags": {
