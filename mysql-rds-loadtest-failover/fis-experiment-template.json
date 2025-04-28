@@ -1,0 +1,65 @@
+{
+    "description": "MySQL RDS Load Test and Failover Experiment",
+    "targets": {
+        "EC2Instance": {
+            "resourceType": "aws:ec2:instance",
+            "resourceArns": [
+                "${EC2InstanceArn}"
+            ],
+            "selectionMode": "ALL"
+        },
+        "DBInstances": {
+            "resourceType": "aws:rds:db",
+            "resourceArns": [
+                "${RDSInstanceArn}"
+            ],
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "RunLoadTest": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Run MySQL load test using Systems Manager document",
+            "parameters": {
+                "documentArn": "${SSMDocumentArn}",
+                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\",\"DBHost\":\"${RDSEndpoint}\",\"DBName\":\"${DBName}\",\"DBUsername\":\"${DBUsername}\",\"DBPassword\":\"${DBPassword}\"}",
+                "duration": "PT10M"
+            },
+            "targets": {
+                "Instances": "EC2Instance"
+            }
+        },
+        "ForceFailover": {
+            "actionId": "aws:rds:reboot-db-instances",
+            "description": "Force a failover by rebooting the primary instance with failover",
+            "parameters": {
+                "forceFailover": "true"
+            },
+            "targets": {
+                "DBInstances": "DBInstances"
+            },
+            "startAfter": ["RunLoadTest"]
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "${FISExperimentRoleArn}",
+    "logConfiguration": {
+        "logSchemaVersion": 2,
+        "cloudWatchLogsConfiguration": {
+            "logGroupArn": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/fis/experiment:*"
+        }
+    },
+    "tags": {
+        "Name": "MySQL-RDS-LoadTest-Failover",
+        "Environment": "Test",
+        "Application": "RDS-Failover-Testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}
