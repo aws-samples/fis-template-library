@@ -1,0 +1,40 @@
+{
+    "description": "SAP HANA Database Process Kill Experiment",
+    "targets": {
+        "SAPHANAInstance": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "FIS-SAP-Tier": "DB"
+            },
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "KillHANAProcess": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Kill SAP HANA database processes using HDB kill-9 command",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sap-hdb-kill-ssm-doc",
+                "documentParameters": "{\"Sid\":\"HDB\"}",
+                "duration": "PT5M"
+            },
+            "targets": {
+                "Instances": "SAPHANAInstance"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "SAP HANA Database Process Kill Experiment"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}
