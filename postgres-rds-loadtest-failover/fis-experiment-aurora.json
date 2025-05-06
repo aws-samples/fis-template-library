@@ -1,0 +1,34 @@
+{
+  "description": "Aurora PostgreSQL Failover Test",
+  "targets": {
+    "cluster": {
+      "resourceType": "aws:rds:cluster",
+      "resourceArns": [],
+      "selectionMode": "ALL"
+    }
+  },
+  "actions": {
+    "failover": {
+      "actionId": "aws:rds:failover-db-cluster",
+      "parameters": {},
+      "targets": {
+        "Clusters": "cluster"
+      }
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "",
+  "tags": {
+    "Name": "Aurora-PostgreSQL-Failover-Test"
+  },
+  "logConfiguration": {
+    "logSchemaVersion": 2,
+    "cloudWatchLogsConfiguration": {
+      "logGroupArn": ""
+    }
+  }
+}
