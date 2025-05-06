@@ -51,6 +51,34 @@ aws fis list-experiment-templates
 aws fis start-experiment --experiment-template-id YOUR_TEMPLATE_ID
 ```
 
+## How the Experiment Works
+
+The experiment follows this workflow:
+
+1. **Load Generation Phase**:
+   - The SSM document runs a high CPU load test on the RDS instance
+   - Multiple worker processes create concurrent connections (default: 25)
+   - The script monitors CPU utilization until it reaches the target (default: 80%)
+   - Once target CPU is reached (or timeout occurs), the script continues running in the background
+   - The SSM document completes successfully, allowing FIS to proceed to the next action
+
+2. **Failover Phase**:
+   - FIS triggers a forced failover of the RDS instance
+   - The standby instance becomes the new primary
+   - The database endpoint DNS name remains the same
+   - Applications experience ~25 seconds of downtime during the transition
+   - The load test continues running during and after the failover
+
+3. **Post-Failover Phase**:
+   - The load test continues running for 5 minutes after the failover completes
+   - This allows observation of how the new primary instance handles the load
+   - After 5 minutes, FIS automatically stops the load test
+
+4. **Monitoring**:
+   - CloudWatch logs capture the entire experiment
+   - RDS events record the failover timeline
+   - CPU utilization metrics show the impact of failover
+
 ## Monitoring
 
 Monitor the experiment using these methods:
@@ -88,8 +116,8 @@ You can also run manual tests:
 ```bash
 aws ssm send-command \
   --instance-ids YOUR_EC2_INSTANCE_ID \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["/tmp/high_load_test.sh \"YOUR_PASSWORD\" \"admin\" \"testdb\" \"25\" \"300\" \"YOUR_RDS_ENDPOINT\""]'
+  --document-name YOUR_SSM_DOCUMENT_NAME \
+  --parameters "DBHost=YOUR_RDS_ENDPOINT,DBUsername=admin,DBPassword=YOUR_PASSWORD,DBName=testdb,Concurrency=25,Duration=600,TargetCPU=80,DBInstanceId=YOUR_RDS_INSTANCE_ID"
 ```
 
 2. **Manually trigger a failover**:
