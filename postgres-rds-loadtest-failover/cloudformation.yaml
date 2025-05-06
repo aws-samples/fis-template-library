@@ -1,6 +1,27 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'VPC with EC2 (SSM access) and RDS PostgreSQL deployment'
 
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0e731c8a588258d0d # Amazon Linux 2 AMI in us-east-1
+    us-east-2:
+      AMI: ami-0f9c9c7e59304193e # Amazon Linux 2 AMI in us-east-2
+    us-west-1:
+      AMI: ami-0ce2cb35386fc22e9 # Amazon Linux 2 AMI in us-west-1
+    us-west-2:
+      AMI: ami-0b75998a97c952252 # Amazon Linux 2 AMI in us-west-2
+    eu-west-1:
+      AMI: ami-0e309a5f3a6dd97ea # Amazon Linux 2 AMI in eu-west-1
+    eu-central-1:
+      AMI: ami-0a9e2b8a093c01e43 # Amazon Linux 2 AMI in eu-central-1
+    ap-northeast-1:
+      AMI: ami-0f36b22ddc523dec8 # Amazon Linux 2 AMI in ap-northeast-1
+    ap-southeast-1:
+      AMI: ami-0dc5785603ad4ff54 # Amazon Linux 2 AMI in ap-southeast-1
+    ap-southeast-2:
+      AMI: ami-0310483fb2b488153 # Amazon Linux 2 AMI in ap-southeast-2
+
 Parameters:
   VpcCIDR:
     Type: String
@@ -255,7 +276,7 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t2.micro
-      ImageId: ami-0aa7d40eeae50c9a9  # Amazon Linux 2 AMI in us-east-1
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
       SubnetId: !Ref PrivateSubnet1
       IamInstanceProfile: !Ref EC2InstanceProfile
       SecurityGroupIds:
@@ -397,6 +418,16 @@ Resources:
             description: "Duration of the load test in seconds"
             default: "60"
         mainSteps:
+        - action: 'aws:runShellScript'
+          name: 'installDependencies'
+          inputs:
+            runCommand:
+            - |
+              #!/bin/bash
+              # Install newer PostgreSQL client
+              sudo amazon-linux-extras enable postgresql13
+              sudo yum clean metadata
+              sudo yum install -y postgresql
         - action: 'aws:runShellScript'
           name: 'runLoadTest'
           inputs:

@@ -4,7 +4,7 @@
     "EC2Instance": {
       "resourceType": "aws:ec2:instance",
       "resourceArns": [
-        "arn:aws:ec2:us-east-1:456498356358:instance/i-0cfb85a0e5b50a836"
+        "${EC2InstanceArn}"
       ],
       "selectionMode": "ALL"
     }
@@ -13,7 +13,7 @@
     "RunLoadTest": {
       "actionId": "aws:ssm:send-command",
       "parameters": {
-        "documentArn": "arn:aws:ssm:us-east-1:456498356358:document/RunLoadTest",
+        "documentArn": "${SSMDocumentArn}",
         "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\"}",
         "duration": "PT10M"
       },
@@ -27,8 +27,14 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::456498356358:role/FISExperimentRole",
+  "roleArn": "${FISRoleArn}",
   "tags": {
     "Name": "PostgreSQL-RDS-LoadTest-Failover"
+  },
+  "logConfiguration": {
+    "logSchemaVersion": 1,
+    "cloudWatchLogsConfiguration": {
+      "logGroupArn": "${LogGroupArn}"
+    }
   }
 }
