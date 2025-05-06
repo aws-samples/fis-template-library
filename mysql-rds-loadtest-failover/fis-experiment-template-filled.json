@@ -4,14 +4,14 @@
         "EC2Instance": {
             "resourceType": "aws:ec2:instance",
             "resourceArns": [
-                "${EC2InstanceArn}"
+                "arn:aws:ec2:us-east-1:386742307312:instance/i-06180e4904ccf5c08"
             ],
             "selectionMode": "ALL"
         },
         "DBInstances": {
             "resourceType": "aws:rds:db",
             "resourceArns": [
-                "${RDSInstanceArn}"
+                "arn:aws:rds:us-east-1:386742307312:db:mysql-rds-loadtest-failover-rdsinstance-7lnsqbmo9icy"
             ],
             "selectionMode": "ALL"
         }
@@ -19,10 +19,10 @@
     "actions": {
         "RunLoadTest": {
             "actionId": "aws:ssm:send-command",
-            "description": "Run MySQL high CPU load test using Systems Manager document",
+            "description": "Run MySQL load test using Systems Manager document",
             "parameters": {
-                "documentArn": "${SSMDocumentArn}",
-                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"25\",\"DBHost\":\"${RDSEndpoint}\",\"DBName\":\"${DBName}\",\"DBUsername\":\"${DBUsername}\",\"DBPassword\":\"${DBPassword}\"}",
+                "documentArn": "arn:aws:ssm:us-east-1:386742307312:document/mysql-rds-loadtest-failover-SSMLoadTestDocument-zDiY3BrTEbQs",
+                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\",\"DBHost\":\"mysql-rds-loadtest-failover-rdsinstance-7lnsqbmo9icy.ck3zxsrxdcgk.us-east-1.rds.amazonaws.com\",\"DBName\":\"testdb\",\"DBUsername\":\"admin\",\"DBPassword\":\"DBPassword!\"}",
                 "duration": "PT10M"
             },
             "targets": {
@@ -46,11 +46,11 @@
             "source": "none"
         }
     ],
-    "roleArn": "${FISExperimentRoleArn}",
+    "roleArn": "arn:aws:iam::386742307312:role/mysql-rds-loadtest-failover-FISExperimentRole-luB3Gesjweym",
     "logConfiguration": {
         "logSchemaVersion": 2,
         "cloudWatchLogsConfiguration": {
-            "logGroupArn": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/fis/experiment:*"
+            "logGroupArn": "arn:aws:logs:us-east-1:386742307312:log-group:/aws/fis/experiment:*"
         }
     },
     "tags": {

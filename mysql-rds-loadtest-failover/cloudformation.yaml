@@ -303,8 +303,11 @@ Resources:
       EngineVersion: 8.0
       MasterUsername: !Ref DBUsername
       MasterUserPassword: !Ref DBPassword
-      DBInstanceClass: db.t3.micro
+      DBInstanceClass: db.t3.small
       AllocatedStorage: '20'
+      MultiAZ: true
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 1
       VPCSecurityGroups:
         - !Ref RDSSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup

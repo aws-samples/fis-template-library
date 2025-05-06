@@ -1,6 +1,33 @@
 schemaVersion: '2.2'
-description: 'Run database load test for MySQL'
-parameters: {}
+description: 'Run high CPU load test for MySQL RDS'
+parameters:
+  DBHost:
+    type: String
+    description: 'Database host endpoint'
+    default: ''
+  DBPort:
+    type: String
+    description: 'Database port'
+    default: '3306'
+  DBName:
+    type: String
+    description: 'Database name'
+    default: 'testdb'
+  DBUsername:
+    type: String
+    description: 'Database username'
+    default: 'admin'
+  DBPassword:
+    type: String
+    description: 'Database password'
+  Duration:
+    type: String
+    description: 'Duration of the test in seconds'
+    default: '300'
+  Concurrency:
+    type: String
+    description: 'Number of concurrent connections'
+    default: '25'
 mainSteps:
 - action: 'aws:runShellScript'
   name: 'installDependencies'
@@ -8,24 +35,23 @@ mainSteps:
     runCommand:
     - |
       #!/bin/bash
-      # Install MySQL client
-      sudo yum install -y mysql
+      # Install MySQL client and other dependencies
+      sudo yum install -y mysql bc
 - action: 'aws:runShellScript'
-  name: 'runLoadTest'
+  name: 'runHighLoadTest'
   inputs:
-    timeoutSeconds: '600'
+    timeoutSeconds: '3600'
     runCommand:
     - |
       #!/bin/bash
       # Configuration
-      DB_HOST="${1:-rds-loadtest-stack-rdsinstance.cddryekhk93k.us-east-1.rds.amazonaws.com}"
-      DB_PORT="${2:-3306}"
-      DB_NAME="${3:-mydb}"
-      DB_USER="${4:-admin}"
-      DB_PASSWORD="${5:-NewPassword123!}"
-      NUM_RECORDS="${6:-10000}"
-      CONCURRENCY="${7:-5}"
-      DURATION="${8:-60}"  # Duration in seconds
+      DB_HOST="{{DBHost}}"
+      DB_PORT="{{DBPort}}"
+      DB_NAME="{{DBName}}"
+      DB_USER="{{DBUsername}}"
+      DB_PASSWORD="{{DBPassword}}"
+      DURATION="{{Duration}}"
+      CONCURRENCY="{{Concurrency}}"
 
       # Function to execute SQL
       execute_sql() {
@@ -44,253 +70,62 @@ mainSteps:
         exit 1
       fi
 
-      # Create test tables if they don't exist
-      echo "Setting up test tables..."
-      execute_sql "
-      CREATE TABLE IF NOT EXISTS load_test_users (
-        id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        username VARCHAR(50) NOT NULL,
-        email VARCHAR(100) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status VARCHAR(20) DEFAULT 'active',
-        login_count INT DEFAULT 0,
-        INDEX idx_load_test_users_username (username),
-        INDEX idx_load_test_users_email (email),
-        INDEX idx_load_test_users_status (status)
-      );
-
-      CREATE TABLE IF NOT EXISTS load_test_transactions (
-        id BIGINT AUTO_INCREMENT PRIMARY KEY,
-        user_id BIGINT,
-        amount DECIMAL(10,2) NOT NULL,
-        transaction_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        description TEXT,
-        category VARCHAR(50),
-        FOREIGN KEY (user_id) REFERENCES load_test_users(id),
-        INDEX idx_load_test_transactions_user_id (user_id),
-        INDEX idx_load_test_transactions_date (transaction_date),
-        INDEX idx_load_test_transactions_category (category)
+      # Create test database and table if they don't exist
+      echo "Setting up test database and tables..."
+      mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p$DB_PASSWORD -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
+      
+      execute_sql "CREATE TABLE IF NOT EXISTS loadtest (
+        id INT AUTO_INCREMENT PRIMARY KEY, 
+        data VARCHAR(1024), 
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );"
 
-      # Check if we need to populate the tables
-      user_count=$(execute_sql_return "SELECT COUNT(*) FROM load_test_users;")
-      if [ "$user_count" -lt "$NUM_RECORDS" ]; then
-        echo "Populating test tables with initial data..."
+      # Function to run a single worker process
+      run_worker() {
+        local worker_id=$1
+        local end_time=$2
         
-        # Generate random data for users
-        for i in $(seq 1 $NUM_RECORDS); do
-          username="user_$(printf "%05d" $i)"
-          email="user_$(printf "%05d" $i)@example.com"
-          status=$( [ $(($RANDOM % 10)) -lt 8 ] && echo "active" || echo "inactive" )
-          login_count=$(($RANDOM % 100))
+        while [ $(date +%s) -lt $end_time ]; do
+          # Insert random data
+          execute_sql "INSERT INTO loadtest (data) VALUES (REPEAT(MD5(RAND()), 8));"
           
-          execute_sql "INSERT INTO load_test_users (username, email, status, login_count) 
-                      VALUES ('$username', '$email', '$status', $login_count);"
+          # Run complex queries to increase CPU load
+          execute_sql "SELECT COUNT(*) FROM loadtest WHERE id % 10 = $worker_id;"
+          execute_sql "SELECT AVG(LENGTH(data)) FROM loadtest WHERE id % 10 = $worker_id;"
+          execute_sql "SELECT data, COUNT(*) FROM loadtest GROUP BY data HAVING COUNT(*) > 1 LIMIT 10;"
           
-          # Print progress every 100 records
-          if [ $(($i % 100)) -eq 0 ]; then
-            echo "Inserted $i users..."
-          fi
-        done
-        
-        # Generate transactions for each user
-        echo "Generating transactions..."
-        execute_sql "
-        INSERT INTO load_test_transactions (user_id, amount, transaction_date, description, category)
-        SELECT 
-          id as user_id,
-          ROUND(RAND() * 1000, 2) as amount,
-          DATE_SUB(NOW(), INTERVAL FLOOR(RAND() * 90) DAY) as transaction_date,
-          CONCAT('Transaction description ', id) as description,
-          CASE (id % 5)
-            WHEN 0 THEN 'food'
-            WHEN 1 THEN 'entertainment'
-            WHEN 2 THEN 'transport'
-            WHEN 3 THEN 'utilities'
-            ELSE 'other'
-          END as category
-        FROM load_test_users;"
-        
-        echo "Initial data population complete."
-      fi
-
-      # Function to run a simple query
-      run_simple_query() {
-        local pid=$1
-        local query="SELECT * FROM load_test_users ORDER BY RAND() LIMIT 10;"
-        while [ true ]; do
-          execute_sql "$query" > /dev/null
-          sleep 0.1
+          # Run a join query that will force table scans
+          execute_sql "SELECT a.id, b.id, LENGTH(a.data) + LENGTH(b.data) 
+                      FROM loadtest a JOIN loadtest b ON a.id % 100 = b.id % 100 
+                      LIMIT 100;"
         done
       }
 
-      # Function to run a medium complexity query
-      run_medium_query() {
-        local pid=$1
-        local query="
-        SELECT u.username, COUNT(t.id) as transaction_count, SUM(t.amount) as total_amount
-        FROM load_test_users u
-        JOIN load_test_transactions t ON u.id = t.user_id
-        WHERE u.status = 'active'
-        GROUP BY u.username
-        ORDER BY total_amount DESC
-        LIMIT 20;"
-        while [ true ]; do
-          execute_sql "$query" > /dev/null
-          sleep 0.5
-        done
-      }
+      # Calculate end time
+      END_TIME=$(($(date +%s) + DURATION))
 
-      # Function to run a complex query
-      run_complex_query() {
-        local pid=$1
-        local query="
-        WITH monthly_stats AS (
-          SELECT 
-            u.id as user_id,
-            u.username,
-            DATE_FORMAT(t.transaction_date, '%Y-%m-01') as month,
-            COUNT(t.id) as transaction_count,
-            SUM(t.amount) as total_amount,
-            AVG(t.amount) as avg_amount,
-            t.category
-          FROM load_test_users u
-          JOIN load_test_transactions t ON u.id = t.user_id
-          WHERE u.login_count > 10
-          GROUP BY u.id, u.username, DATE_FORMAT(t.transaction_date, '%Y-%m-01'), t.category
-        )
-        SELECT 
-          username,
-          month,
-          category,
-          transaction_count,
-          total_amount,
-          avg_amount,
-          RANK() OVER (PARTITION BY month, category ORDER BY total_amount DESC) as rank
-        FROM monthly_stats
-        ORDER BY month DESC, category, rank
-        LIMIT 50;"
-        while [ true ]; do
-          execute_sql "$query" > /dev/null
-          sleep 1
-        done
-      }
-
-      # Function to run insert operations
-      run_insert_operations() {
-        local pid=$1
-        while [ true ]; do
-          local username="user_$(date +%s%N | md5sum | head -c 10)"
-          local email="${username}@example.com"
-          local status=$( [ $(($RANDOM % 10)) -lt 8 ] && echo "active" || echo "inactive" )
-          local login_count=$(($RANDOM % 100))
-          
-          # Insert a new user
-          local user_id=$(execute_sql_return "
-            INSERT INTO load_test_users (username, email, status, login_count) 
-            VALUES ('$username', '$email', '$status', $login_count);
-            SELECT LAST_INSERT_ID();
-          ")
-          
-          # Insert transactions for this user
-          local num_transactions=$(($RANDOM % 5 + 1))
-          for j in $(seq 1 $num_transactions); do
-            local amount=$(printf "%.2f" $(echo "scale=2; $RANDOM/100" | bc))
-            local days_ago=$(($RANDOM % 90))
-            local category_id=$(($RANDOM % 5))
-            local category=""
-            
-            case $category_id in
-              0) category="food" ;;
-              1) category="entertainment" ;;
-              2) category="transport" ;;
-              3) category="utilities" ;;
-              *) category="other" ;;
-            esac
-            
-            execute_sql "
-              INSERT INTO load_test_transactions (user_id, amount, transaction_date, description, category)
-              VALUES ($user_id, $amount, DATE_SUB(NOW(), INTERVAL $days_ago DAY), 'Transaction for $username', '$category');" > /dev/null
-          done
-          
-          sleep 0.2
-        done
-      }
-
-      # Function to monitor MySQL statistics
-      monitor_mysql_stats() {
-        while [ true ]; do
-          echo "--- MySQL Statistics $(date) ---"
-          execute_sql "
-          SHOW GLOBAL STATUS WHERE Variable_name IN (
-            'Threads_connected',
-            'Com_commit',
-            'Com_rollback',
-            'Innodb_buffer_pool_read_requests',
-            'Innodb_buffer_pool_reads',
-            'Select_scan',
-            'Com_select',
-            'Com_insert',
-            'Com_update',
-            'Com_delete'
-          );"
-          sleep 5
-        done
-      }
-
-      # Start the load test
-      echo "Starting load test with concurrency $CONCURRENCY for $DURATION seconds..."
-
-      # Start monitoring in the background
-      monitor_mysql_stats &
-      MONITOR_PID=$!
-
-      # Start the worker processes
-      pids=()
-
-      # Start simple query workers
+      # Start worker processes in background
+      echo "Starting $CONCURRENCY worker processes for $DURATION seconds..."
       for i in $(seq 1 $CONCURRENCY); do
-        run_simple_query $i &
-        pids+=($!)
+        run_worker $i $END_TIME &
       done
 
-      # Start medium query workers
-      for i in $(seq 1 $(($CONCURRENCY / 2))); do
-        run_medium_query $i &
-        pids+=($!)
+      # Monitor CPU usage during the test
+      echo "Monitoring CPU usage during test..."
+      while [ $(date +%s) -lt $END_TIME ]; do
+        # Get current connections
+        CONNECTIONS=$(execute_sql_return "SELECT COUNT(*) FROM information_schema.processlist WHERE user = '$DB_USER';")
+        echo "$(date): Active connections: $CONNECTIONS"
+        sleep 10
       done
 
-      # Start complex query workers
-      for i in $(seq 1 $(($CONCURRENCY / 3))); do
-        run_complex_query $i &
-        pids+=($!)
-      done
-
-      # Start insert operations
-      for i in $(seq 1 $(($CONCURRENCY / 4 + 1))); do
-        run_insert_operations $i &
-        pids+=($!)
-      done
-
-      echo "Load test is running with ${#pids[@]} worker processes. Will run for $DURATION seconds."
-
-      # Sleep for the specified duration
-      sleep $DURATION
-
-      # Kill all worker processes
-      echo "Stopping load test..."
-      for pid in "${pids[@]}"; do
-        kill -9 $pid 2>/dev/null
-      done
-
-      # Kill the monitoring process
-      kill -9 $MONITOR_PID 2>/dev/null
+      # Wait for all workers to complete
+      wait
 
       # Final statistics
       echo "--- Final Database Statistics ---"
-      execute_sql "
-      SELECT COUNT(*) as total_users FROM load_test_users;
-      SELECT COUNT(*) as total_transactions FROM load_test_transactions;
-      "
+      execute_sql "SELECT COUNT(*) as total_rows FROM loadtest;"
+      execute_sql "SELECT AVG(LENGTH(data)) as avg_data_length FROM loadtest;"
+      execute_sql "SELECT COUNT(DISTINCT data) as unique_data_values FROM loadtest;"
 
-      echo "Load test completed."
+      echo "Load test completed successfully."
