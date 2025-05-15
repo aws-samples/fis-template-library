@@ -72,6 +72,9 @@ The RDS PostgreSQL experiment:
    
    # Or specify a custom stack name and region
    ./create-aurora-fis-concurrent-experiment.sh my-stack-name us-west-2
+   
+   # Alternative: Use the simplified script that creates the log group first
+   ./run-experiment.sh
    ```
 
 ### Experiment Details
@@ -138,6 +141,8 @@ SELECT n, fib_n FROM fibonacci;"
 - `create-aurora-fis-experiment.sh` - Script to create and run Aurora failover experiment
 - `create-aurora-fis-loadtest-experiment.sh` - Script to create and run Aurora load test and failover experiment
 - `create-aurora-fis-concurrent-experiment.sh` - Script to create and run Aurora load test with concurrent failover
+- `run-experiment.sh` - Simplified script that creates the log group first and runs the Aurora load test with concurrent failover
+- `cleanup.sh` - Script to clean up all resources created by the experiments
 - `ssm-loadtest-shell-script.yaml` - SSM document template for load testing
 
 ## Troubleshooting
@@ -157,6 +162,28 @@ SELECT n, fib_n FROM fibonacci;"
 3. **SSM Document Issues**: If the SSM document fails to execute:
    - Update the SSM document to use direct PostgreSQL installation instead of amazon-linux-extras
    - Ensure the SSM document has the correct permissions
+
+## Cleanup
+
+After you've completed your experiments, you can clean up all the resources to avoid unnecessary AWS charges:
+
+```bash
+# Run the cleanup script with default stack name
+./cleanup.sh
+
+# Or specify a custom stack name and region
+./cleanup.sh my-stack-name us-west-2
+```
+
+The cleanup script will:
+1. Delete all FIS experiment templates related to PostgreSQL experiments
+2. Delete all CloudWatch Log Groups with the prefix "/aws/fis/postgres"
+3. Delete the CloudFormation stack and all its resources
+
+Note: If you have any running FIS experiments, you may need to stop them manually:
+```bash
+aws fis stop-experiment --id <experiment-id> --region <region>
+```
 
 ## Additional Resources
 
