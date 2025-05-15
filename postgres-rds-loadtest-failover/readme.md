@@ -9,10 +9,11 @@ This repository contains templates and scripts for running AWS Fault Injection S
 1. Deploy the CloudFormation stack for RDS PostgreSQL:
    ```bash
    aws cloudformation deploy \
-     --template-file postgres-rds-loadtest.yaml \
-     --stack-name postgres-rds-loadtest-v3 \
-     --capabilities CAPABILITY_IAM \
-     --region us-east-2
+     --template-file cloudformation.yaml \
+     --stack-name postgres-rds-loadtest \
+     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+     --region us-east-2 \
+     --parameter-overrides DBUsername=postgres DBPassword=Password123!
    ```
 
 2. Create a CloudWatch Log Group for FIS experiment logging:
@@ -42,87 +43,52 @@ The RDS PostgreSQL experiment:
 1. Deploy the CloudFormation stack for Aurora PostgreSQL:
    ```bash
    aws cloudformation deploy \
-     --template-file postgres-aurora-loadtest.yaml \
-     --stack-name postgres-aurora-loadtest-v2 \
-     --capabilities CAPABILITY_IAM \
-     --region us-east-2
+     --template-file cloudformation-aurora.yaml \
+     --stack-name postgres-rds-loadtest \
+     --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+     --region us-east-2 \
+     --parameter-overrides DBUsername=postgres DBPassword=Password123!
    ```
 
-2. Create an IAM role for FIS experiments with Aurora:
+2. The IAM role for FIS experiments with Aurora is automatically created by the CloudFormation template with the name `FISExperimentRoleAurora`.
+
+### Aurora Failover-Only Experiment
+
+3. Run the Aurora failover-only experiment:
    ```bash
-   aws iam create-role --role-name FISExperimentRoleAurora \
-     --assume-role-policy-document '{
-       "Version": "2012-10-17",
-       "Statement": [
-         {
-           "Effect": "Allow",
-           "Principal": {
-             "Service": "fis.amazonaws.com"
-           },
-           "Action": "sts:AssumeRole"
-         }
-       ]
-     }'
-   
-   aws iam attach-role-policy --role-name FISExperimentRoleAurora \
-     --policy-arn arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorRDSAccess
-   ```
-
-3. Create a CloudWatch Log Group for Aurora FIS experiment logging:
-   ```bash
-   aws logs create-log-group --log-group-name /aws/fis/postgres-aurora-loadtest --region us-east-2
-   aws logs put-retention-policy --log-group-name /aws/fis/postgres-aurora-loadtest --retention-in-days 30 --region us-east-2
-   ```
-
-4. Create the FIS experiment template file (fis-experiment-aurora.json):
-   ```json
-   {
-     "description": "Aurora PostgreSQL Failover Test",
-     "targets": {
-       "cluster": {
-         "resourceType": "aws:rds:cluster",
-         "resourceArns": [],
-         "selectionMode": "ALL"
-       }
-     },
-     "actions": {
-       "failover": {
-         "actionId": "aws:rds:failover-db-cluster",
-         "parameters": {},
-         "targets": {
-           "Clusters": "cluster"
-         }
-       }
-     },
-     "stopConditions": [
-       {
-         "source": "none"
-       }
-     ],
-     "roleArn": "",
-     "tags": {
-       "Name": "Aurora-PostgreSQL-Failover-Test"
-     },
-     "logConfiguration": {
-       "logSchemaVersion": 2,
-       "cloudWatchLogsConfiguration": {
-         "logGroupArn": ""
-       }
-     }
-   }
-   ```
-
-5. Create and run the Aurora FIS experiment using the provided script:
-   ```bash
+   # Run the experiment with default stack name
    ./create-aurora-fis-experiment.sh
+   
+   # Or specify a custom stack name and region
+   ./create-aurora-fis-experiment.sh my-stack-name us-west-2
+   ```
+
+### Aurora Load Test with Concurrent Failover Experiment
+
+3. For a more realistic test that includes a failover during the load test:
+   ```bash
+   # Run the experiment with default stack name
+   ./create-aurora-fis-concurrent-experiment.sh
+   
+   # Or specify a custom stack name and region
+   ./create-aurora-fis-concurrent-experiment.sh my-stack-name us-west-2
    ```
 
 ### Experiment Details
 
-The Aurora PostgreSQL experiment:
-- Initiates a failover on the Aurora PostgreSQL cluster
-- Tests application resilience during database failover
-- Logs all experiment activities to CloudWatch
+The Aurora PostgreSQL experiments come in two variants:
+
+1. **Failover-Only Experiment**:
+   - Initiates a failover on the Aurora PostgreSQL cluster
+   - Tests application resilience during database failover
+   - Logs all experiment activities to CloudWatch
+
+2. **Load Test with Concurrent Failover Experiment**:
+   - Runs a load test on the Aurora PostgreSQL database for 10 minutes
+   - Generates significant database traffic with 10 concurrent connections
+   - Initiates a failover 5 minutes into the load test (halfway through)
+   - Tests application resilience during database failover under load
+   - Logs all experiment activities to CloudWatch
 
 ## Monitoring Experiments
 
@@ -130,13 +96,15 @@ You can monitor the experiments with the following commands:
 
 ```bash
 # For RDS experiment
-aws fis get-experiment --id <experiment-id> --region us-east-2
-aws logs get-log-events --log-group-name /aws/fis/postgres-rds-loadtest --log-stream-name <experiment-id> --region us-east-2
+aws fis get-experiment --id <experiment-id> --region <region>
+aws logs get-log-events --log-group-name /aws/fis/postgres-rds-loadtest --log-stream-name <experiment-id> --region <region>
 
-# For Aurora experiment
-aws fis get-experiment --id <experiment-id> --region us-east-2
-aws logs get-log-events --log-group-name /aws/fis/postgres-aurora-loadtest --log-stream-name <experiment-id> --region us-east-2
+# For Aurora experiment (replace with your actual log group name)
+aws fis get-experiment --id <experiment-id> --region <region>
+aws logs get-log-events --log-group-name /aws/fis/postgres-aurora-loadtest-<random-string> --log-stream-name <experiment-id> --region <region>
 ```
+
+The experiment scripts will output the exact commands to use for monitoring.
 
 ## Load Testing Scripts
 
@@ -157,6 +125,38 @@ psql -c "WITH RECURSIVE fibonacci(n, fib_n, next_fib_n) AS (
 )
 SELECT n, fib_n FROM fibonacci;"
 ```
+
+## File Structure
+
+- `cloudformation.yaml` - CloudFormation template for RDS PostgreSQL setup
+- `cloudformation-aurora.yaml` - CloudFormation template for Aurora PostgreSQL setup with fixed SSM document
+- `fis-experiment.json` - FIS experiment template for RDS load test
+- `fis-experiment-aurora.json` - FIS experiment template for Aurora failover
+- `fis-experiment-aurora-loadtest.json` - FIS experiment template for Aurora load test and failover
+- `fis-experiment-aurora-loadtest-concurrent.json` - FIS experiment template for Aurora load test with concurrent failover
+- `create-rds-fis-experiment.sh` - Script to create and run RDS experiment
+- `create-aurora-fis-experiment.sh` - Script to create and run Aurora failover experiment
+- `create-aurora-fis-loadtest-experiment.sh` - Script to create and run Aurora load test and failover experiment
+- `create-aurora-fis-concurrent-experiment.sh` - Script to create and run Aurora load test with concurrent failover
+- `ssm-loadtest-shell-script.yaml` - SSM document template for load testing
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Connection Timeout**: If you encounter connection timeouts between the EC2 instance and the Aurora cluster:
+   - Ensure the Aurora security group allows traffic from the EC2 security group
+   - Add a rule to allow PostgreSQL traffic (port 5432) from the entire VPC CIDR range
+   - Verify the Aurora cluster is using the correct port (5432 for PostgreSQL)
+
+2. **SQL Syntax Errors**: If you see SQL syntax errors in the load test:
+   - Check the `execute_sql_return` function to ensure it properly trims whitespace from results
+   - Verify the user ID retrieval in the insert operations function
+   - Add error handling for transaction inserts
+
+3. **SSM Document Issues**: If the SSM document fails to execute:
+   - Update the SSM document to use direct PostgreSQL installation instead of amazon-linux-extras
+   - Ensure the SSM document has the correct permissions
 
 ## Additional Resources
 

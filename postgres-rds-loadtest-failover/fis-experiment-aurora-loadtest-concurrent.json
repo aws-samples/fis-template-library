@@ -1,0 +1,57 @@
+{
+  "description": "Aurora PostgreSQL Load Test with Concurrent Failover Experiment",
+  "targets": {
+    "cluster": {
+      "resourceType": "aws:rds:cluster",
+      "resourceArns": [],
+      "selectionMode": "ALL"
+    },
+    "EC2Instance": {
+      "resourceType": "aws:ec2:instance",
+      "resourceArns": [],
+      "selectionMode": "ALL"
+    }
+  },
+  "actions": {
+    "DelayAction": {
+      "actionId": "aws:fis:wait",
+      "parameters": {
+        "duration": "PT5M"
+      }
+    },
+    "RunLoadTest": {
+      "actionId": "aws:ssm:send-command",
+      "parameters": {
+        "documentArn": "${SSMDocumentArn}",
+        "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"10\"}",
+        "duration": "PT10M"
+      },
+      "targets": {
+        "Instances": "EC2Instance"
+      }
+    },
+    "failover": {
+      "actionId": "aws:rds:failover-db-cluster",
+      "parameters": {},
+      "targets": {
+        "Clusters": "cluster"
+      },
+      "startAfter": ["DelayAction"]
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "",
+  "tags": {
+    "Name": "Aurora-PostgreSQL-LoadTest-Concurrent-Failover"
+  },
+  "logConfiguration": {
+    "logSchemaVersion": 2,
+    "cloudWatchLogsConfiguration": {
+      "logGroupArn": ""
+    }
+  }
+}

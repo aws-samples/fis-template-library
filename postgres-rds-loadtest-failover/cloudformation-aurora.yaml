@@ -197,6 +197,11 @@ Resources:
           FromPort: 5432
           ToPort: 5432
           SourceSecurityGroupId: !Ref EC2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCIDR
+          Description: Allow PostgreSQL from entire VPC
 
   # VPC Endpoints for SSM - Adding all required endpoints
   SSMEndpoint:
@@ -304,7 +309,7 @@ Resources:
           yum clean all
           rm -rf /var/cache/yum
           
-          # Install PostgreSQL client
+          # Install PostgreSQL client directly (avoid amazon-linux-extras)
           yum install -y postgresql
           
           # Make sure psql is in PATH for all users
@@ -342,6 +347,9 @@ Resources:
           EOF
           
           chmod +x /usr/local/bin/pg_connect_reader
+          
+          # Install telnet for connectivity testing
+          yum install -y telnet
           
           # Ensure SSM agent is running
           systemctl enable amazon-ssm-agent
@@ -391,12 +399,14 @@ Resources:
     Properties:
       Engine: aurora-postgresql
       EngineVersion: 13.9
+      Port: 5432
       DatabaseName: !Ref DBName
       MasterUsername: !Ref DBUsername
       MasterUserPassword: !Ref DBPassword
       DBSubnetGroupName: !Ref DBSubnetGroup
       VpcSecurityGroupIds:
         - !Ref AuroraSecurityGroup
+        - !Ref EC2SecurityGroup
       BackupRetentionPeriod: 7
       StorageEncrypted: true
       DeletionProtection: false
@@ -480,9 +490,7 @@ Resources:
             runCommand:
             - |
               #!/bin/bash
-              # Install newer PostgreSQL client
-              sudo amazon-linux-extras enable postgresql13
-              sudo yum clean metadata
+              # Install PostgreSQL client directly without using amazon-linux-extras
               sudo yum install -y postgresql
         - action: 'aws:runShellScript'
           name: 'runLoadTest'
@@ -508,7 +516,7 @@ Resources:
 
               # Function to execute SQL and return result
               execute_sql_return() {
-                PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -t -c "$1"
+                PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -t -c "$1" | tr -d '[:space:]'
               }
 
               # Check connection
@@ -664,12 +672,18 @@ Resources:
                   local status=$( [ $(($RANDOM % 10)) -lt 8 ] && echo "active" || echo "inactive" )
                   local login_count=$(($RANDOM % 100))
                   
-                  # Insert a new user
-                  local user_id=$(execute_sql_return "
-                    INSERT INTO load_test_users (username, email, status, login_count) 
-                    VALUES ('$username', '$email', '$status', $login_count)
-                    RETURNING id;
-                  ")
+                  # Insert a new user and get the ID
+                  local insert_query="INSERT INTO load_test_users (username, email, status, login_count) VALUES ('$username', '$email', '$status', $login_count) RETURNING id;"
+                  local user_id=$(execute_sql_return "$insert_query")
+                  
+                  # Debug output
+                  echo "Inserted user with ID: $user_id"
+                  
+                  # Check if user_id is valid
+                  if [[ -z "$user_id" || "$user_id" == "INSERT 0 1" ]]; then
+                    echo "Failed to get valid user_id, skipping transactions"
+                    continue
+                  fi
                   
                   # Insert transactions for this user
                   local num_transactions=$(($RANDOM % 5 + 1))
@@ -687,10 +701,8 @@ Resources:
                       *) category="other" ;;
                     esac
                     
-                    execute_sql "
-                      INSERT INTO load_test_transactions (user_id, amount, transaction_date, description, category)
-                      VALUES ($user_id, $amount, NOW() - INTERVAL '$days_ago days', 'Transaction for $username', '$category');
-                    " > /dev/null
+                    local trans_query="INSERT INTO load_test_transactions (user_id, amount, transaction_date, description, category) VALUES ($user_id, $amount, NOW() - INTERVAL '$days_ago days', 'Transaction for $username', '$category');"
+                    execute_sql "$trans_query" > /dev/null 2>&1 || echo "Failed to insert transaction: $trans_query"
                   done
                   
                   sleep 0.2

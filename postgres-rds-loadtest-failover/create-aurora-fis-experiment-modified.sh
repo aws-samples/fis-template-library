@@ -1,20 +1,11 @@
 #!/bin/bash
 
-# Default values
-STACK_NAME=${1:-"postgres-rds-loadtest"}
-REGION=${2:-$(aws configure get region || echo "us-east-2")}
-RANDOM_STRING=${3:-$(openssl rand -hex 4)}
-LOG_GROUP_NAME="/aws/fis/postgres-aurora-loadtest-$RANDOM_STRING"
+# Set variables
+STACK_NAME="postgres-rds-loadtest-v5"
+REGION="us-east-2"
+LOG_GROUP_NAME="/aws/fis/postgres-aurora-loadtest-a13833fd"
 EXPERIMENT_TEMPLATE_FILE="fis-experiment-aurora.json"
 RETENTION_DAYS=30
-FIS_ROLE_NAME="FISExperimentRoleAurora"
-
-# Display configuration
-echo "Configuration:"
-echo "  Stack Name: $STACK_NAME"
-echo "  Region: $REGION"
-echo "  Log Group: $LOG_GROUP_NAME"
-echo "  FIS Role Name: $FIS_ROLE_NAME"
 
 # Get Aurora Cluster ARN
 AURORA_CLUSTER_ARN=$(aws cloudformation describe-stacks \
@@ -34,7 +25,7 @@ fi
 echo "Aurora Cluster ARN: $AURORA_CLUSTER_ARN"
 
 # Get FIS Experiment Role ARN
-FIS_ROLE_ARN=$(aws iam get-role --role-name $FIS_ROLE_NAME --query "Role.Arn" --output text)
+FIS_ROLE_ARN=$(aws iam get-role --role-name FISExperimentRoleAurora --query "Role.Arn" --output text)
 
 if [ -z "$FIS_ROLE_ARN" ]; then
   echo "Error: Could not find FIS Experiment Role ARN"
@@ -43,18 +34,8 @@ fi
 
 echo "FIS Role ARN: $FIS_ROLE_ARN"
 
-# Create CloudWatch Log Group if it doesn't exist
-if ! aws logs describe-log-groups --log-group-name-prefix $LOG_GROUP_NAME --region $REGION --query "logGroups[?logGroupName=='$LOG_GROUP_NAME']" --output text > /dev/null 2>&1; then
-  echo "Creating CloudWatch Log Group: $LOG_GROUP_NAME"
-  aws logs create-log-group --log-group-name $LOG_GROUP_NAME --region $REGION
-  aws logs put-retention-policy --log-group-name $LOG_GROUP_NAME --retention-in-days $RETENTION_DAYS --region $REGION
-else
-  echo "CloudWatch Log Group $LOG_GROUP_NAME already exists"
-fi
-
 # Get Log Group ARN - Construct it with the correct format
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-LOG_GROUP_ARN="arn:aws:logs:$REGION:$ACCOUNT_ID:log-group:$LOG_GROUP_NAME:*"
+LOG_GROUP_ARN="arn:aws:logs:$REGION:$(aws sts get-caller-identity --query Account --output text):log-group:$LOG_GROUP_NAME:*"
 
 echo "Log Group ARN: $LOG_GROUP_ARN"
 

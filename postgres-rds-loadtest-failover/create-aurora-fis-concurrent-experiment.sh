@@ -5,7 +5,7 @@ STACK_NAME=${1:-"postgres-rds-loadtest"}
 REGION=${2:-$(aws configure get region || echo "us-east-2")}
 RANDOM_STRING=${3:-$(openssl rand -hex 4)}
 LOG_GROUP_NAME="/aws/fis/postgres-aurora-loadtest-$RANDOM_STRING"
-EXPERIMENT_TEMPLATE_FILE="fis-experiment-aurora.json"
+EXPERIMENT_TEMPLATE_FILE="fis-experiment-aurora-loadtest-concurrent.json"
 RETENTION_DAYS=30
 FIS_ROLE_NAME="FISExperimentRoleAurora"
 
@@ -15,6 +15,26 @@ echo "  Stack Name: $STACK_NAME"
 echo "  Region: $REGION"
 echo "  Log Group: $LOG_GROUP_NAME"
 echo "  FIS Role Name: $FIS_ROLE_NAME"
+
+# Get EC2 Instance ARN
+EC2_INSTANCE_ID=$(aws cloudformation describe-stacks \
+  --stack-name $STACK_NAME \
+  --region $REGION \
+  --query "Stacks[0].Outputs[?OutputKey=='EC2InstanceId'].OutputValue" \
+  --output text)
+
+if [ -z "$EC2_INSTANCE_ID" ]; then
+  echo "Error: Could not find EC2 Instance ID"
+  exit 1
+fi
+
+echo "EC2 Instance ID: $EC2_INSTANCE_ID"
+
+# Get EC2 Instance ARN
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+EC2_INSTANCE_ARN="arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$EC2_INSTANCE_ID"
+
+echo "EC2 Instance ARN: $EC2_INSTANCE_ARN"
 
 # Get Aurora Cluster ARN
 AURORA_CLUSTER_ARN=$(aws cloudformation describe-stacks \
@@ -32,6 +52,21 @@ if [ -z "$AURORA_CLUSTER_ARN" ]; then
 fi
 
 echo "Aurora Cluster ARN: $AURORA_CLUSTER_ARN"
+
+# Get SSM Document ARN
+SSM_DOCUMENT_NAME=$(aws cloudformation describe-stacks \
+  --stack-name $STACK_NAME \
+  --region $REGION \
+  --query "Stacks[0].Outputs[?OutputKey=='SSMDocumentName'].OutputValue" \
+  --output text)
+
+if [ -z "$SSM_DOCUMENT_NAME" ]; then
+  echo "Error: Could not find SSM Document Name"
+  exit 1
+fi
+
+SSM_DOCUMENT_ARN="arn:aws:ssm:$REGION:$ACCOUNT_ID:document/$SSM_DOCUMENT_NAME"
+echo "SSM Document ARN: $SSM_DOCUMENT_ARN"
 
 # Get FIS Experiment Role ARN
 FIS_ROLE_ARN=$(aws iam get-role --role-name $FIS_ROLE_NAME --query "Role.Arn" --output text)
@@ -53,7 +88,6 @@ else
 fi
 
 # Get Log Group ARN - Construct it with the correct format
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 LOG_GROUP_ARN="arn:aws:logs:$REGION:$ACCOUNT_ID:log-group:$LOG_GROUP_NAME:*"
 
 echo "Log Group ARN: $LOG_GROUP_ARN"
@@ -62,6 +96,8 @@ echo "Log Group ARN: $LOG_GROUP_ARN"
 TMP_TEMPLATE=$(mktemp)
 cat $EXPERIMENT_TEMPLATE_FILE | \
   jq --arg cluster "$AURORA_CLUSTER_ARN" '.targets.cluster.resourceArns = [$cluster]' | \
+  jq --arg ec2 "$EC2_INSTANCE_ARN" '.targets.EC2Instance.resourceArns = [$ec2]' | \
+  jq --arg ssm "$SSM_DOCUMENT_ARN" '.actions.RunLoadTest.parameters.documentArn = $ssm' | \
   jq --arg role "$FIS_ROLE_ARN" '.roleArn = $role' | \
   jq --arg log "$LOG_GROUP_ARN" '.logConfiguration.cloudWatchLogsConfiguration.logGroupArn = $log' > $TMP_TEMPLATE
 
