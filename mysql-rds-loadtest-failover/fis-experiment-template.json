@@ -19,11 +19,11 @@
     "actions": {
         "RunLoadTest": {
             "actionId": "aws:ssm:send-command",
-            "description": "Run MySQL load test using Systems Manager document",
+            "description": "Run MySQL high CPU load test until target CPU utilization is reached",
             "parameters": {
                 "documentArn": "${SSMDocumentArn}",
-                "documentParameters": "{\"Duration\":\"300\",\"Concurrency\":\"10\",\"DBHost\":\"${RDSEndpoint}\",\"DBName\":\"${DBName}\",\"DBUsername\":\"${DBUsername}\",\"DBPassword\":\"${DBPassword}\"}",
-                "duration": "PT10M"
+                "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"25\",\"DBHost\":\"${RDSEndpoint}\",\"DBName\":\"${DBName}\",\"DBUsername\":\"${DBUsername}\",\"DBPassword\":\"${DBPassword}\",\"TargetCPU\":\"80\",\"DBInstanceId\":\"${RDSInstanceId}\"}",
+                "duration": "PT15M"
             },
             "targets": {
                 "Instances": "EC2Instance"
@@ -39,6 +39,20 @@
                 "DBInstances": "DBInstances"
             },
             "startAfter": ["RunLoadTest"]
+        },
+        "StopLoadTest": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Stop the load test after failover completes",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript",
+                "documentParameters": "{\"commands\":[\"pkill -f 'run_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
+                "duration": "PT1M"
+            },
+            "targets": {
+                "Instances": "EC2Instance"
+            },
+            "startAfter": ["ForceFailover"],
+            "startAfterDelay": "PT5M"
         }
     },
     "stopConditions": [
