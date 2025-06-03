@@ -1,8 +1,25 @@
 #!/bin/bash
 
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --region)
+      REGION="$2"
+      shift 2
+      ;;
+    --stack-name)
+      STACK_NAME="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
 # Default values
-STACK_NAME="postgres-test-stack"
-REGION="us-east-2"
+STACK_NAME="${STACK_NAME:-postgres-test-stack}"
+REGION="${REGION:-us-east-2}"
 RANDOM_STRING=$(openssl rand -hex 4)
 LOG_GROUP_NAME="/aws/fis/postgres-aurora-loadtest-$RANDOM_STRING"
 EXPERIMENT_TEMPLATE_FILE="fis-experiment-aurora-loadtest-concurrent.json"

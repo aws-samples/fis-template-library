@@ -25,13 +25,16 @@ High CPU load on an Aurora cluster will cause degraded performance, and a subseq
 Deploy the CloudFormation template to create the required infrastructure:
 
 ```bash
+# Replace REGION with your desired AWS region (e.g., us-east-2, us-west-2, etc.)
+export REGION="us-east-2"
+
 aws cloudformation create-stack \
   --stack-name postgres-test-stack \
   --template-body file://cloudformation-aurora.yaml \
   --parameters ParameterKey=DBUsername,ParameterValue=postgres \
                ParameterKey=DBPassword,ParameterValue=YourSecurePassword \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region us-east-2
+  --region $REGION
 ```
 
 This template creates:
@@ -47,7 +50,7 @@ Execute the experiment using the provided script:
 
 ```bash
 chmod +x run-experiment.sh
-./run-experiment.sh
+./run-experiment.sh --region $REGION
 ```
 
 The script will:
@@ -62,10 +65,10 @@ Monitor the experiment using:
 
 ```bash
 # Get experiment status
-aws fis get-experiment --id <EXPERIMENT_ID> --region us-east-2
+aws fis get-experiment --id <EXPERIMENT_ID> --region $REGION
 
 # View experiment logs
-aws logs get-log-events --log-group-name <LOG_GROUP_NAME> --log-stream-name <EXPERIMENT_ID> --region us-east-2
+aws logs get-log-events --log-group-name <LOG_GROUP_NAME> --log-stream-name <EXPERIMENT_ID> --region $REGION
 ```
 
 ## How it works
@@ -81,6 +84,26 @@ aws logs get-log-events --log-group-name <LOG_GROUP_NAME> --log-stream-name <EXP
 - `fis-experiment-aurora-loadtest-concurrent.json`: FIS experiment template
 - `ssm-loadtest-shell-script.yaml`: SSM document content for load testing
 - `run-experiment.sh`: Script to deploy and run the experiment
+- `cleanup.sh`: Script to clean up all resources created by this experiment
+
+## Cleanup
+
+After you've completed the experiment, you can clean up all the resources using the provided cleanup script:
+
+```bash
+chmod +x cleanup.sh
+./cleanup.sh --stack-name <STACK_NAME> --region <REGION>
+```
+
+For example:
+```bash
+./cleanup.sh --stack-name postgres-test-stack --region us-east-2
+```
+
+The cleanup script will:
+1. Delete any FIS experiment templates related to the stack
+2. Delete CloudWatch Log Groups created by the experiment
+3. Delete the CloudFormation stack and all its resources
 
 ## Next Steps
 
