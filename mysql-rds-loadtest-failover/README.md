@@ -25,31 +25,53 @@ Based on extensive testing, this template demonstrates the following performance
 - **Database Availability**: Applications experience ~25 seconds of downtime during failover
 - **DNS Continuity**: The endpoint DNS name remains the same during failover, providing connection continuity
 
-## Deployment
+## Deployment Instructions
 
-Deploy the CloudFormation template:
+### 1. Deploy CloudFormation Stack
+
+Deploy the CloudFormation template with a secure password for the RDS instance:
 
 ```bash
 aws cloudformation deploy \
   --template-file cloudformation.yaml \
-  --stack-name mysql-rds-loadtest-failover \
+  --stack-name <your-stack-name> \
+  --region <your-region> \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides DBPassword=YourSecurePassword
+  --parameter-overrides DBPassword=<your-secure-password>
 ```
 
-## Running the Experiment
+### 2. Create FIS Experiment Template
 
-After deployment, you can run the FIS experiment:
+Run the provided script to create the FIS experiment template. The script will automatically retrieve necessary resource information from the CloudFormation stack outputs:
 
-1. Get the experiment template ID:
 ```bash
-aws fis list-experiment-templates
+./create-fis-experiment.sh <your-stack-name> <your-region> <your-db-password>
 ```
 
-2. Start the experiment:
+The script will output the experiment template ID that you'll need for the next step.
+
+### 3. Run the Experiment
+
+Start the FIS experiment using the template ID from the previous step:
+
 ```bash
-aws fis start-experiment --experiment-template-id YOUR_TEMPLATE_ID
+aws fis start-experiment \
+  --experiment-template-id <template-id> \
+  --region <your-region>
 ```
+
+### 4. Clean Up Resources
+
+When you're done testing, use the cleanup script to remove all resources:
+
+```bash
+./cleanup.sh <your-stack-name> <your-region>
+```
+
+This will:
+- Stop any running FIS experiments
+- Delete the FIS experiment template
+- Delete the CloudFormation stack and all associated resources
 
 ## How the Experiment Works
 
@@ -74,11 +96,6 @@ The experiment follows this workflow:
    - This allows observation of how the new primary instance handles the load
    - After 5 minutes, FIS automatically stops the load test
 
-4. **Monitoring**:
-   - CloudWatch logs capture the entire experiment
-   - RDS events record the failover timeline
-   - CPU utilization metrics show the impact of failover
-
 ## Monitoring
 
 Monitor the experiment using these methods:
@@ -92,39 +109,22 @@ Monitor the experiment using these methods:
 aws cloudwatch get-metric-statistics \
   --namespace AWS/RDS \
   --metric-name CPUUtilization \
-  --dimensions Name=DBInstanceIdentifier,Value=YOUR_RDS_INSTANCE_ID \
+  --dimensions Name=DBInstanceIdentifier,Value=<your-rds-instance-id> \
   --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ') \
   --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ') \
   --period 60 \
-  --statistics Average
+  --statistics Average \
+  --region <your-region>
 ```
 
 5. **RDS Events**: Check for failover events:
 
 ```bash
 aws rds describe-events \
-  --source-identifier YOUR_RDS_INSTANCE_ID \
+  --source-identifier <your-rds-instance-id> \
   --source-type db-instance \
-  --start-time $(date -u -d '1 hour ago' '+%Y-%m-%dT%H:%M:%SZ')
-```
-
-## Manual Testing
-
-You can also run manual tests:
-
-1. **Start a high CPU load test**:
-```bash
-aws ssm send-command \
-  --instance-ids YOUR_EC2_INSTANCE_ID \
-  --document-name YOUR_SSM_DOCUMENT_NAME \
-  --parameters "DBHost=YOUR_RDS_ENDPOINT,DBUsername=admin,DBPassword=YOUR_PASSWORD,DBName=testdb,Concurrency=25,Duration=600,TargetCPU=80,DBInstanceId=YOUR_RDS_INSTANCE_ID"
-```
-
-2. **Manually trigger a failover**:
-```bash
-aws rds reboot-db-instance \
-  --db-instance-identifier YOUR_RDS_INSTANCE_ID \
-  --force-failover
+  --start-time $(date -u -d '1 hour ago' '+%Y-%m-%dT%H:%M:%SZ') \
+  --region <your-region>
 ```
 
 ## Key Findings
@@ -133,14 +133,6 @@ aws rds reboot-db-instance \
 - The database endpoint DNS name remains the same during failover
 - After failover, the database returns to normal operation with no read-only mode
 - The t3.small instance can handle high load testing but reaches CPU saturation at 25 concurrent connections
-
-## Cleanup
-
-Delete the CloudFormation stack:
-
-```bash
-aws cloudformation delete-stack --stack-name mysql-rds-loadtest-failover
-```
 
 ## References
 
