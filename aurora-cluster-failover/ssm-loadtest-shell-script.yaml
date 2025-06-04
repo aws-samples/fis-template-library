@@ -1,6 +1,38 @@
  schemaVersion: '2.2'
    description: 'Run database load test'
-   parameters: {}
+   parameters:
+     DBHost:
+       type: String
+       description: "Database host endpoint"
+       default: "{{DBHost}}"
+     DBPort:
+       type: String
+       description: "Database port"
+       default: "5432"
+     DBName:
+       type: String
+       description: "Database name"
+       default: "mydb"
+     DBUser:
+       type: String
+       description: "Database username"
+       default: "postgres"
+     DBPassword:
+       type: String
+       description: "Database password"
+       default: "{{DBPassword}}"
+     NumRecords:
+       type: String
+       description: "Number of records to generate"
+       default: "10000"
+     Concurrency:
+       type: String
+       description: "Concurrency level for the load test"
+       default: "5"
+     Duration:
+       type: String
+       description: "Duration of the load test in seconds"
+       default: "60"
    mainSteps:
    - action: 'aws:runShellScript'
      name: 'installDependencies'
@@ -8,9 +40,7 @@
       runCommand:
       - |
         #!/bin/bash
-        # Install newer PostgreSQL client
-        sudo amazon-linux-extras enable postgresql13
-        sudo yum clean metadata
+        # Install PostgreSQL client directly without using amazon-linux-extras
         sudo yum install -y postgresql
    - action: 'aws:runShellScript'
      name: 'runLoadTest'
@@ -20,14 +50,14 @@
        - |
          #!/bin/bash
           # Configuration
-          DB_HOST="${1:-rds-loadtest-stack-rdsinstance-13dayw9c8vry.cddryekhk93k.us-east-1.rds.amazonaws.com}"
-          DB_PORT="${2:-5432}"
-          DB_NAME="${3:-mydb}"
-          DB_USER="${4:-dbadmin}"
-          DB_PASSWORD="${5:-NewPassword123!}"
-          NUM_RECORDS="${6:-10000}"
-          CONCURRENCY="${7:-5}"
-          DURATION="${8:-60}"  # Duration in seconds
+          DB_HOST="{{ DBHost }}"
+          DB_PORT="{{ DBPort }}"
+          DB_NAME="{{ DBName }}"
+          DB_USER="{{ DBUser }}"
+          DB_PASSWORD="{{ DBPassword }}"
+          NUM_RECORDS="{{ NumRecords }}"
+          CONCURRENCY="{{ Concurrency }}"
+          DURATION="{{ Duration }}"  # Duration in seconds
 
           # Function to execute SQL
           execute_sql() {
@@ -36,7 +66,7 @@
 
           # Function to execute SQL and return result
           execute_sql_return() {
-            PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -t -c "$1"
+            PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -t -c "$1" | tr -d '[:space:]'
           }
 
           # Check connection
@@ -192,12 +222,18 @@
               local status=$( [ $(($RANDOM % 10)) -lt 8 ] && echo "active" || echo "inactive" )
               local login_count=$(($RANDOM % 100))
               
-              # Insert a new user
-              local user_id=$(execute_sql_return "
-                INSERT INTO load_test_users (username, email, status, login_count) 
-                VALUES ('$username', '$email', '$status', $login_count)
-                RETURNING id;
-              ")
+              # Insert a new user and get the ID
+              local insert_query="INSERT INTO load_test_users (username, email, status, login_count) VALUES ('$username', '$email', '$status', $login_count) RETURNING id;"
+              local user_id=$(execute_sql_return "$insert_query")
+              
+              # Debug output
+              echo "Inserted user with ID: $user_id"
+              
+              # Check if user_id is valid
+              if [[ -z "$user_id" || "$user_id" == "INSERT 0 1" ]]; then
+                echo "Failed to get valid user_id, skipping transactions"
+                continue
+              fi
               
               # Insert transactions for this user
               local num_transactions=$(($RANDOM % 5 + 1))
@@ -215,10 +251,8 @@
                   *) category="other" ;;
                 esac
                 
-                execute_sql "
-                  INSERT INTO load_test_transactions (user_id, amount, transaction_date, description, category)
-                  VALUES ($user_id, $amount, NOW() - INTERVAL '$days_ago days', 'Transaction for $username', '$category');
-                " > /dev/null
+                local trans_query="INSERT INTO load_test_transactions (user_id, amount, transaction_date, description, category) VALUES ($user_id, $amount, NOW() - INTERVAL '$days_ago days', 'Transaction for $username', '$category');"
+                execute_sql "$trans_query" > /dev/null 2>&1 || echo "Failed to insert transaction: $trans_query"
               done
               
               sleep 0.2
