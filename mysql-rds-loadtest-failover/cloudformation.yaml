@@ -35,7 +35,14 @@ Parameters:
   DBPassword:
     Type: String
     NoEcho: true
-    Description: Database admin password
+    Description: >
+      Database admin password. Must be at least 8 characters long.
+      Cannot contain '/', '@', '"', or spaces. Only printable ASCII characters allowed.
+    MinLength: 8
+    AllowedPattern: '[^\s\/@\"]*'
+    ConstraintDescription: >
+      Password must be at least 8 characters long.
+      Cannot contain '/', '@', '"', or spaces. Only printable ASCII characters allowed.
     
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
