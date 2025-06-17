@@ -1,141 +1,62 @@
-# MySQL RDS Load Test and Failover
+# AWS Fault Injection Service Experiment: MySQL RDS Load Test and Failover
 
-This template creates an environment for testing MySQL RDS failover under load. It includes:
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
-1. A VPC with public and private subnets
-2. A Multi-AZ MySQL RDS instance
-3. An EC2 instance with MySQL client for load testing
-4. An AWS FIS experiment template for simulating failover
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## Architecture
+## Description
 
-- **VPC**: Custom VPC with public and private subnets across two availability zones
-- **RDS**: Multi-AZ MySQL 8.0 database in private subnets across two availability zones
-- **EC2**: Amazon Linux 2 instance in a private subnet with SSM access
-- **FIS**: Fault injection experiment that runs a load test and then forces an RDS failover
+This experiment tests the resilience of a Multi-AZ MySQL RDS instance by generating high CPU load and then forcing a failover. It helps validate that your applications can handle database failover events with minimal disruption.
 
-## Performance Characteristics
+## Hypothesis
 
-Based on extensive testing, this template demonstrates the following performance characteristics:
+Under high CPU load conditions, a Multi-AZ MySQL RDS instance will successfully failover from the primary to the standby instance with approximately 25 seconds of downtime. Applications using proper connection handling should automatically reconnect and continue functioning normally after the failover completes.
 
-- **Failover Time**: ~25 seconds under high CPU load (97-98% utilization)
-- **CPU Utilization**:
-  - 10 concurrent connections: ~37-40% CPU utilization
-  - 25 concurrent connections: ~95-98% CPU utilization (recommended for stress testing)
-- **Database Availability**: Applications experience ~25 seconds of downtime during failover
-- **DNS Continuity**: The endpoint DNS name remains the same during failover, providing connection continuity
+## Prerequisites
 
-## Deployment Instructions
+Before running this experiment, ensure that:
 
-### 1. Deploy CloudFormation Stack
+1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on RDS instances.
+2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation and execute SSM documents.
+3. You have deployed the CloudFormation template to create the required infrastructure including a Multi-AZ MySQL RDS instance.
+4. The EC2 instance used for load testing has network connectivity to the RDS instance.
+5. You have reviewed the experiment parameters and adjusted them according to your specific requirements.
 
-Deploy the CloudFormation template with a secure password for the RDS instance:
+## How it works
 
-```bash
-aws cloudformation deploy \
-  --template-file cloudformation.yaml \
-  --stack-name <your-stack-name> \
-  --region <your-region> \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides DBPassword=<your-secure-password>
-```
-
-### 2. Create FIS Experiment Template
-
-Run the provided script to create the FIS experiment template. The script will automatically retrieve necessary resource information from the CloudFormation stack outputs:
-
-```bash
-./create-fis-experiment.sh <your-stack-name> <your-region> <your-db-password>
-```
-
-The script will output the experiment template ID that you'll need for the next step.
-
-### 3. Run the Experiment
-
-Start the FIS experiment using the template ID from the previous step:
-
-```bash
-aws fis start-experiment \
-  --experiment-template-id <template-id> \
-  --region <your-region>
-```
-
-### 4. Clean Up Resources
-
-When you're done testing, use the cleanup script to remove all resources:
-
-```bash
-./cleanup.sh <your-stack-name> <your-region>
-```
-
-This will:
-- Stop any running FIS experiments
-- Delete the FIS experiment template
-- Delete the CloudFormation stack and all associated resources
-
-## How the Experiment Works
-
-The experiment follows this workflow:
+This template simulates high CPU load on a MySQL RDS instance and then initiates a failover. The experiment follows this workflow:
 
 1. **Load Generation Phase**:
    - The SSM document runs a high CPU load test on the RDS instance
    - Multiple worker processes create concurrent connections (default: 25)
    - The script monitors CPU utilization until it reaches the target (default: 80%)
    - Once target CPU is reached (or timeout occurs), the script continues running in the background
-   - The SSM document completes successfully, allowing FIS to proceed to the next action
 
 2. **Failover Phase**:
    - FIS triggers a forced failover of the RDS instance
    - The standby instance becomes the new primary
    - The database endpoint DNS name remains the same
    - Applications experience ~25 seconds of downtime during the transition
-   - The load test continues running during and after the failover
 
 3. **Post-Failover Phase**:
    - The load test continues running for 5 minutes after the failover completes
    - This allows observation of how the new primary instance handles the load
-   - After 5 minutes, FIS automatically stops the load test
 
-## Monitoring
+## Observability and stop conditions
 
-Monitor the experiment using these methods:
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
-1. **AWS FIS Console**: View experiment progress and status
-2. **CloudWatch Logs**: Check detailed logs at `/aws/fis/experiment`
-3. **RDS Console**: Monitor CPU utilization, connections, and failover events
-4. **CloudWatch Metrics**: Track RDS metrics during the experiment:
+## Next Steps
 
-```bash
-aws cloudwatch get-metric-statistics \
-  --namespace AWS/RDS \
-  --metric-name CPUUtilization \
-  --dimensions Name=DBInstanceIdentifier,Value=<your-rds-instance-id> \
-  --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ') \
-  --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ') \
-  --period 60 \
-  --statistics Average \
-  --region <your-region>
-```
+As you adapt this scenario to your needs, we recommend:
 
-5. **RDS Events**: Check for failover events:
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to your MySQL RDS instance performance.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of high CPU load and failover.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Customizing the experiment parameters to adjust load test concurrency and duration.
+6. Testing with different instance types to understand performance characteristics under various workloads.
 
-```bash
-aws rds describe-events \
-  --source-identifier <your-rds-instance-id> \
-  --source-type db-instance \
-  --start-time $(date -u -d '1 hour ago' '+%Y-%m-%dT%H:%M:%SZ') \
-  --region <your-region>
-```
+## Import Experiment
 
-## Key Findings
-
-- Multi-AZ failover completes in approximately 25 seconds under high CPU load
-- The database endpoint DNS name remains the same during failover
-- After failover, the database returns to normal operation with no read-only mode
-- The t3.small instance can handle high load testing but reaches CPU saturation at 25 concurrent connections
-
-## References
-
-- [RDS Multi-AZ Documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.html)
-- [AWS FIS Documentation](https://docs.aws.amazon.com/fis/latest/userguide/what-is.html)
-- [MySQL Performance Best Practices](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_BestPractices.MySQL.html)
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
