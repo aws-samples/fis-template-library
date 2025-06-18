@@ -7,10 +7,6 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTIO
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
-## Description
-
-This experiment tests the resilience of a Multi-AZ MySQL RDS instance by generating high CPU load and then forcing a failover. It validates that applications can handle database failover events with minimal disruption while under load conditions.
-
 ## Hypothesis
 
 Under high CPU load conditions, a Multi-AZ MySQL RDS instance will successfully failover from the primary to the standby instance with approximately 25 seconds of downtime. Applications using proper connection handling should automatically reconnect and continue functioning normally after the failover completes.
@@ -22,36 +18,15 @@ Before running this experiment, ensure that:
 1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on RDS instances.
 2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation and execute SSM documents.
 3. The MySQL RDS instances you want to target have the `FIS-Ready=True` tag.
-4. The targeted MySQL RDS instances are configured for Multi-AZ deployment with primary and standby instances.
-5. You have EC2 instances tagged with `FIS-Ready=True` and `FIS-Application=MySQL-LoadTest` for running the load tests.
-6. You have deployed the required SSM document for load testing (see examples directory).
-7. Your EC2 instances have network connectivity to the RDS instances and proper IAM permissions for SSM and CloudWatch.
-
-## How it works
-
-This template simulates high CPU load on a MySQL RDS instance and then initiates a failover. The experiment follows this workflow:
-
-1. **Load Generation Phase**:
-   - FIS executes an SSM document on tagged EC2 instances
-   - The SSM document runs a high CPU load test against the MySQL database
-   - Multiple worker processes create concurrent connections (configurable)
-   - The script monitors CPU utilization until it reaches the target threshold
-   - Load continues running in the background once target is reached
-
-2. **Failover Phase**:
-   - FIS triggers a forced failover of the RDS instance
-   - The standby instance becomes the new primary
-   - The database endpoint DNS name remains the same
-   - Applications experience brief downtime during the transition
-
-3. **Post-Failover Phase**:
-   - The load test continues running for 5 minutes after the failover completes
-   - This allows observation of how the new primary instance handles the load
-   - Load test is then stopped automatically
+4. The EC2 instances you want to use for load testing have the `FIS-Ready=True` tag.
+5. The targeted MySQL RDS instances are configured for Multi-AZ deployment.
+6. SSM Agent is installed and running on the target EC2 instances.
+7. The IAM role associated with the EC2 instances has the necessary permissions for SSM.
+8. You have deployed the SSM document template (`mysql-rds-loadtest-failover-ssm-template.json`) to your account.
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until all actions complete successfully.
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until all actions have been completed on the targeted resources.
 
 ## Observability and stop conditions
 
@@ -68,15 +43,12 @@ As you adapt this scenario to your needs, we recommend:
 2. Identifying business metrics tied to your MySQL RDS instance performance.
 3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of high CPU load and failover.
 4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. Customizing the experiment parameters in the SSM document to adjust load test concurrency, duration, and target CPU utilization.
+5. Customizing the SSM document parameters to adjust load test concurrency, duration, and target CPU utilization.
 6. Testing the load generation script independently before running the full FIS experiment.
 
 ## Infrastructure Examples
 
-See the `examples/` directory for:
-- Complete CloudFormation template for deploying test infrastructure
-- SSM document for MySQL load testing
-- Detailed setup and customization instructions
+See the `examples/` directory for complete infrastructure templates and deployment guidance to help you set up the necessary resources for this experiment.
 
 ## Import Experiment
 

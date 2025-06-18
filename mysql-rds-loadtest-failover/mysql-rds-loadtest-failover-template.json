@@ -4,18 +4,14 @@
         "LoadTestInstances": {
             "resourceType": "aws:ec2:instance",
             "resourceTags": {
-                "FIS-Ready": "True",
-                "FIS-Application": "MySQL-LoadTest",
-                "FIS-Environment": "Test"
+                "FIS-Ready": "True"
             },
             "selectionMode": "ALL"
         },
         "MySQLInstances": {
             "resourceType": "aws:rds:db",
             "resourceTags": {
-                "FIS-Ready": "True",
-                "FIS-Application": "MySQL",
-                "FIS-Environment": "Test"
+                "FIS-Ready": "True"
             },
             "selectionMode": "ALL"
         }
@@ -25,7 +21,7 @@
             "actionId": "aws:ssm:send-command",
             "description": "Run MySQL high CPU load test until target CPU utilization is reached",
             "parameters": {
-                "documentArn": "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/MySQL-LoadTest-Document",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/MySQL-LoadTest-Document",
                 "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"25\",\"TargetCPU\":\"80\"}",
                 "duration": "PT15M"
             },
@@ -48,7 +44,7 @@
             "actionId": "aws:ssm:send-command",
             "description": "Stop the load test after failover completes",
             "parameters": {
-                "documentArn": "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>::document/AWS-RunShellScript",
                 "documentParameters": "{\"commands\":[\"pkill -f 'mysql_load_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
                 "duration": "PT1M"
             },
@@ -68,13 +64,11 @@
     "logConfiguration": {
         "logSchemaVersion": 2,
         "cloudWatchLogsConfiguration": {
-            "logGroupArn": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/fis/experiment:*"
+            "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/fis/experiment:*"
         }
     },
     "tags": {
-        "Name": "MySQL-RDS-LoadTest-Failover",
-        "Environment": "Test",
-        "Application": "RDS-Failover-Testing"
+        "Name": "MySQL-RDS-LoadTest-Failover"
     },
     "experimentOptions": {
         "accountTargeting": "single-account",

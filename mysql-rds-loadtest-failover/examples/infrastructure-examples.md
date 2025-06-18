@@ -44,22 +44,15 @@ An SSM document that:
 ## Customization Guide
 
 ### 1. Tagging Strategy
-The example uses these tags for FIS targeting:
+The example uses this tag for FIS targeting:
 ```yaml
-# For RDS instances
+# For both RDS instances and EC2 instances
 FIS-Ready: "True"
-FIS-Application: "MySQL"
-FIS-Environment: "Test"
-
-# For EC2 instances  
-FIS-Ready: "True"
-FIS-Application: "MySQL-LoadTest"
-FIS-Environment: "Test"
 ```
 
 **Customize for your environment:**
-- Change `FIS-Environment` to match your environment (Dev, Staging, Prod)
-- Add additional tags for more granular targeting
+- Ensure the `FIS-Ready=True` tag is applied to all resources you want to target
+- Add additional tags for organizational purposes (but FIS targeting uses only FIS-Ready)
 - Ensure tags match those specified in your FIS experiment template
 
 ### 2. Database Configuration

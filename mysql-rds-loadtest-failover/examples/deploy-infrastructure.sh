@@ -6,7 +6,6 @@
 # Configuration - Modify these values for your environment
 STACK_NAME="mysql-loadtest-infrastructure"
 REGION="us-east-1"
-ENVIRONMENT="Test"
 
 # Prompt for database password securely
 echo "Enter database password (minimum 8 characters, no spaces, '/', '@', or '\"'):"
@@ -25,12 +24,10 @@ aws cloudformation create-stack \
     --template-body file://cloudformation-infrastructure.yaml \
     --parameters \
         ParameterKey=DBPassword,ParameterValue="$DB_PASSWORD" \
-        ParameterKey=Environment,ParameterValue="$ENVIRONMENT" \
     --capabilities CAPABILITY_IAM \
     --region "$REGION" \
     --tags \
-        Key=Purpose,Value=FIS-Testing \
-        Key=Environment,Value="$ENVIRONMENT"
+        Key=Purpose,Value=FIS-Testing
 
 if [ $? -eq 0 ]; then
     echo "Stack creation initiated successfully!"

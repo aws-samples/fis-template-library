@@ -49,16 +49,6 @@ Parameters:
     Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
     Description: Latest Amazon Linux 2 AMI from SSM Parameter Store
 
-  Environment:
-    Type: String
-    Default: Test
-    Description: Environment name for tagging
-    AllowedValues:
-      - Test
-      - Dev
-      - Staging
-      - Prod
-
 Resources:
   VPC:
     Type: AWS::EC2::VPC
@@ -288,10 +278,6 @@ Resources:
           Value: MySQL-LoadTest-Database
         - Key: FIS-Ready
           Value: "True"
-        - Key: FIS-Application
-          Value: MySQL
-        - Key: FIS-Environment
-          Value: !Ref Environment
 
   # EC2 Instance for load testing with FIS tags
   EC2Instance:
@@ -322,10 +308,6 @@ Resources:
           Value: MySQL-LoadTest-Instance
         - Key: FIS-Ready
           Value: "True"
-        - Key: FIS-Application
-          Value: MySQL-LoadTest
-        - Key: FIS-Environment
-          Value: !Ref Environment
 
 Outputs:
   EC2InstanceId:

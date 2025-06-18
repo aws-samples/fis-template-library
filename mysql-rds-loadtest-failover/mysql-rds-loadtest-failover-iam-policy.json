@@ -4,6 +4,16 @@
         {
             "Effect": "Allow",
             "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
                 "rds:RebootDBInstance",
                 "rds:DescribeDBInstances",
                 "rds:DescribeDBClusters"
@@ -11,14 +21,36 @@
             "Resource": "*",
             "Condition": {
                 "StringEquals": {
-                    "rds:ResourceTag/FIS-Ready": "True"
+                    "aws:ResourceTag/FIS-Ready": "True"
                 }
             }
         },
         {
             "Effect": "Allow",
             "Action": [
-                "ssm:SendCommand",
+                "ssm:SendCommand"
+            ],
+            "Resource": [
+                "arn:aws:ssm:*:*:document/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ssm:SendCommand"
+            ],
+            "Resource": [
+                "arn:aws:ec2:*:*:instance/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
                 "ssm:GetCommandInvocation",
                 "ssm:ListCommands",
                 "ssm:ListCommandInvocations",
@@ -36,14 +68,15 @@
         {
             "Effect": "Allow",
             "Action": [
-                "logs:CreateLogDelivery",
-                "logs:DeleteLogDelivery",
-                "logs:DescribeLogGroups",
-                "logs:DescribeResourcePolicies",
-                "logs:PutResourcePolicy",
                 "logs:CreateLogGroup",
                 "logs:CreateLogStream",
-                "logs:PutLogEvents"
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams",
+                "logs:CreateLogDelivery",
+                "logs:DeleteLogDelivery",
+                "logs:DescribeResourcePolicies",
+                "logs:PutResourcePolicy"
             ],
             "Resource": "*"
         }
