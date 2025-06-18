@@ -1,18 +1,22 @@
 {
     "description": "MySQL RDS Load Test and Failover Experiment",
     "targets": {
-        "EC2Instance": {
+        "LoadTestInstances": {
             "resourceType": "aws:ec2:instance",
-            "resourceArns": [
-                "${EC2InstanceArn}"
-            ],
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "FIS-Application": "MySQL-LoadTest",
+                "FIS-Environment": "Test"
+            },
             "selectionMode": "ALL"
         },
-        "DBInstances": {
+        "MySQLInstances": {
             "resourceType": "aws:rds:db",
-            "resourceArns": [
-                "${RDSInstanceArn}"
-            ],
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "FIS-Application": "MySQL",
+                "FIS-Environment": "Test"
+            },
             "selectionMode": "ALL"
         }
     },
@@ -21,12 +25,12 @@
             "actionId": "aws:ssm:send-command",
             "description": "Run MySQL high CPU load test until target CPU utilization is reached",
             "parameters": {
-                "documentArn": "${SSMDocumentArn}",
-                "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"25\",\"DBHost\":\"${RDSEndpoint}\",\"DBName\":\"${DBName}\",\"DBUsername\":\"${DBUsername}\",\"DBPassword\":\"${DBPassword}\",\"TargetCPU\":\"80\",\"DBInstanceId\":\"${RDSInstanceId}\"}",
+                "documentArn": "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/MySQL-LoadTest-Document",
+                "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"25\",\"TargetCPU\":\"80\"}",
                 "duration": "PT15M"
             },
             "targets": {
-                "Instances": "EC2Instance"
+                "Instances": "LoadTestInstances"
             }
         },
         "ForceFailover": {
@@ -36,7 +40,7 @@
                 "forceFailover": "true"
             },
             "targets": {
-                "DBInstances": "DBInstances"
+                "DBInstances": "MySQLInstances"
             },
             "startAfter": ["RunLoadTest"]
         },
@@ -45,11 +49,11 @@
             "description": "Stop the load test after failover completes",
             "parameters": {
                 "documentArn": "arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript",
-                "documentParameters": "{\"commands\":[\"pkill -f 'run_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
+                "documentParameters": "{\"commands\":[\"pkill -f 'mysql_load_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
                 "duration": "PT1M"
             },
             "targets": {
-                "Instances": "EC2Instance"
+                "Instances": "LoadTestInstances"
             },
             "startAfter": ["ForceFailover"],
             "startAfterDelay": "PT5M"
@@ -60,7 +64,7 @@
             "source": "none"
         }
     ],
-    "roleArn": "${FISExperimentRoleArn}",
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
     "logConfiguration": {
         "logSchemaVersion": 2,
         "cloudWatchLogsConfiguration": {
