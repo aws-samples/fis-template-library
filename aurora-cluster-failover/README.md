@@ -16,38 +16,44 @@ High CPU load on an Aurora cluster will cause degraded performance, but a subseq
 
 Before running this experiment, ensure that:
 
-1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on the targeted Aurora clusters.
-2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation and execute SSM documents.
-3. You have deployed the CloudFormation template to create the required infrastructure including an Aurora PostgreSQL cluster with the `FIS-Ready=True` tag.
-4. The targeted Aurora clusters are configured for Multi-AZ deployment with writer and reader instances, and proper replication is set up.
-5. You have reviewed the experiment parameters and adjusted them according to your specific requirements.
+1. You have an Aurora PostgreSQL cluster tagged with `FIS-Ready=True`
+2. You have an EC2 instance tagged with `FIS-Ready=True` that can connect to the Aurora cluster
+3. The Aurora cluster is configured for Multi-AZ deployment with writer and reader instances
+4. You have created the required IAM role with the provided policy document
+5. You have deployed the SSM document for load testing
+6. You have configured appropriate CloudWatch monitoring and alarms
 
 ## How it works
 
-This template simulates a high CPU load scenario followed by an Aurora DB cluster failover. The experiment follows this workflow:
+This experiment simulates a high CPU load scenario followed by an Aurora DB cluster failover:
 
-1. The experiment first runs a 5-minute delay action to establish baseline metrics
-2. It executes an SSM document on an EC2 instance to generate load on the Aurora cluster
-3. After the delay, it initiates a failover for the Aurora cluster, promoting one of the Aurora Replicas (read-only instances) to be the primary DB instance (the cluster writer)
-4. The load test continues running to observe the impact of the failover on application performance
+1. **Baseline establishment**: 5-minute delay to establish baseline metrics
+2. **CPU load generation**: SSM document executes CPU-intensive queries on the Aurora cluster
+3. **Failover initiation**: After the delay, promotes an Aurora Replica to be the primary writer
+4. **Impact observation**: Load test continues to observe failover impact on performance
 
-To use this scenario, you must have Amazon Aurora clusters that have the tag `FIS-Ready=True`.
+The experiment targets resources with the `FIS-Ready=True` tag for safety and control.
 
 ## Observability and stop conditions
 
-Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+This template does not include stop conditions by default. You should add CloudWatch alarms based on your specific operational metrics to automatically halt the experiment if critical thresholds are breached.
 
-## Next Steps
+## Files included
 
-As you adapt this scenario to your needs, we recommend:
+- `aurora-cluster-failover-template.json`: Main FIS experiment template
+- `aurora-cluster-failover-iam-policy.json`: Required IAM permissions
+- `aurora-cluster-failover-ssm-template.json`: SSM document for load testing
+- `fis-iam-trust-relationship.json`: IAM trust policy for FIS service
+- `examples/`: Infrastructure examples and deployment guidance
 
-1. Reviewing the tag names you use to ensure they fit your specific use case.
-2. Identifying business metrics tied to your Aurora database performance.
-3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of high CPU load and failover.
-4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. Customizing the experiment parameters in the template file to adjust load test duration and intensity.
-6. Creating a CloudWatch dashboard to visualize the experiment's effects on database performance.
+## Next steps
 
-## Import Experiment
+1. Review and customize the experiment parameters for your environment
+2. Set up CloudWatch monitoring and create appropriate alarms
+3. Add stop conditions based on your operational metrics
+4. Test the experiment in a non-production environment first
+5. Create a CloudWatch dashboard to visualize experiment effects
 
-You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+## Import experiment
+
+You can import the JSON experiment template into your AWS account via CLI or AWS CDK. For step-by-step instructions, see the [fis-template-library-tooling](https://github.com/aws-samples/fis-template-library-tooling) repository.
