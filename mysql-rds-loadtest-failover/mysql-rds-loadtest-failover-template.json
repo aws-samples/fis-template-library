@@ -1,0 +1,77 @@
+{
+    "description": "MySQL RDS Load Test and Failover Experiment",
+    "targets": {
+        "LoadTestInstances": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "selectionMode": "ALL"
+        },
+        "MySQLInstances": {
+            "resourceType": "aws:rds:db",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "RunLoadTest": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Run MySQL high CPU load test until target CPU utilization is reached",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/MySQL-LoadTest-Document",
+                "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"25\",\"TargetCPU\":\"80\"}",
+                "duration": "PT15M"
+            },
+            "targets": {
+                "Instances": "LoadTestInstances"
+            }
+        },
+        "ForceFailover": {
+            "actionId": "aws:rds:reboot-db-instances",
+            "description": "Force a failover by rebooting the primary instance with failover",
+            "parameters": {
+                "forceFailover": "true"
+            },
+            "targets": {
+                "DBInstances": "MySQLInstances"
+            },
+            "startAfter": ["RunLoadTest"]
+        },
+        "StopLoadTest": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Stop the load test after failover completes",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>::document/AWS-RunShellScript",
+                "documentParameters": "{\"commands\":[\"pkill -f 'mysql_load_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
+                "duration": "PT1M"
+            },
+            "targets": {
+                "Instances": "LoadTestInstances"
+            },
+            "startAfter": ["ForceFailover"],
+            "startAfterDelay": "PT5M"
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "logConfiguration": {
+        "logSchemaVersion": 2,
+        "cloudWatchLogsConfiguration": {
+            "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/fis/experiment:*"
+        }
+    },
+    "tags": {
+        "Name": "MySQL-RDS-LoadTest-Failover"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}
