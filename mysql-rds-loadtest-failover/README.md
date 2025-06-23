@@ -24,6 +24,26 @@ Before running this experiment, ensure that:
 7. The IAM role associated with the EC2 instances has the necessary permissions for SSM.
 8. You have deployed the SSM document template (`mysql-rds-loadtest-failover-ssm-template.json`) to your account.
 
+## ⚠️ Database Impact Warning
+
+**IMPORTANT**: This experiment will create test tables in your MySQL database:
+
+### Tables Created:
+- `loadtest` - Load testing table with auto-increment primary key
+- Test database (if `DBName` parameter specifies a non-existing database)
+
+### Impact:
+- Tables will persist after the experiment completes
+- Test data will be inserted during load testing
+- No existing data will be modified or deleted
+- Tables use `IF NOT EXISTS` clauses to avoid conflicts
+
+### Cleanup:
+If you need to remove the test table after the experiment, you can manually drop it:
+```sql
+DROP TABLE IF EXISTS loadtest;
+```
+
 ## Stop Conditions
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until all actions have been completed on the targeted resources.
