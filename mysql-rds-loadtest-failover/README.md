@@ -73,3 +73,11 @@ See the `examples/` directory for complete infrastructure templates and deployme
 ## Import Experiment
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+
+## Monitoring Recommendations
+
+For optimal experiment observability, consider monitoring these key metrics during execution:
+- RDS CPU Utilization (target: sustained high load before failover)
+- RDS Database Connections (monitor connection drops during failover)
+- Application response times and error rates
+- RDS Failover completion time via CloudWatch Events
