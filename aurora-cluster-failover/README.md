@@ -10,7 +10,7 @@ This experiment simulates CPU overload on an Aurora PostgreSQL cluster and then 
 
 ## Hypothesis
 
-High CPU load on an Aurora cluster will cause degraded performance, but a subsequent failover will restore normal operation with minimal disruption to application functionality. The system should automatically recover and continue processing requests after the failover completes.
+High CPU load on an Aurora cluster will cause degraded performance, but a subsequent failover will restore normal operation with minimal disruption to application functionality. The system should automatically recover and will continue processing requests after the failover completes.
 
 ## Prerequisites
 
@@ -22,6 +22,28 @@ Before running this experiment, ensure that:
 4. You have created the required IAM role with the provided policy document
 5. You have deployed the SSM document for load testing
 6. You have configured appropriate CloudWatch monitoring and alarms
+
+## ⚠️ Database Impact Warning
+
+**IMPORTANT**: This experiment will create test tables in your Aurora PostgreSQL database:
+
+### Tables Created:
+- `load_test_users` - User records with status and timestamps
+- `load_test_transactions` - Transaction records with foreign key relationships
+
+### Impact:
+- Tables will persist after the experiment completes
+- Test data will be inserted during load testing
+- No existing data will be modified or deleted
+- Tables use `IF NOT EXISTS` clauses to avoid conflicts
+- Indexes will be created for performance testing
+
+### Cleanup:
+If you need to remove the test tables after the experiment, you can manually drop them:
+```sql
+DROP TABLE IF EXISTS load_test_transactions;
+DROP TABLE IF EXISTS load_test_users;
+```
 
 ## How it works
 
