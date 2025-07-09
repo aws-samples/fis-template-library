@@ -1,0 +1,46 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowFISExperimentLogging",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogDelivery",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSSMDocumentExecution",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:StartAutomationExecution",
+        "ssm:GetAutomationExecution",
+        "ssm:StopAutomationExecution"
+      ],
+      "Resource": [
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsDenyAllPolicy",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+      ]
+    },
+    {
+      "Sid": "AllowLambdaInvocation",
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": "arn:aws:lambda:<YOUR REGION>:<YOUR AWS ACCOUNT>:function:<YOUR FUNCTION NAME>"
+    },
+    {
+      "Sid": "AllowSQSOperations",
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueAttributes", "sqs:SetQueueAttributes"],
+      "Resource": "arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Purpose": "resilience-testing"
+        }
+      }
+    }
+  ]
+}

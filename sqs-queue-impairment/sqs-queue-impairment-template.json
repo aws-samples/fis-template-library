@@ -1,0 +1,108 @@
+{
+  "description": "Simulate worsening impairment of SQS by applying deny-all policy for increasing durations",
+  "targets": {},
+  "actions": {
+    "impairSqs2m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 2 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsDenyAllPolicy",
+        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"sqsQueueArn\": \"arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:<YOUR SQS QUEUE>\", \"duration\": \"PT2M\"}"
+      },
+      "targets": {}
+    },
+    "wait3m1": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait for 3 minutes",
+      "parameters": {
+        "duration": "PT3M"
+      },
+      "targets": {},
+      "startAfter": [
+        "impairSqs2m"
+      ]
+    },
+    "impairSqs5m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 5 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsDenyAllPolicy",
+        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"sqsQueueArn\": \"arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:<YOUR SQS QUEUE>\", \"duration\": \"PT5M\"}"
+      },
+      "targets": {},
+      "startAfter": [
+        "wait3m1"
+      ]
+    },
+    "wait3m2": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait for 3 minutes",
+      "parameters": {
+        "duration": "PT3M"
+      },
+      "targets": {},
+      "startAfter": [
+        "impairSqs5m"
+      ]
+    },
+    "impairSqs7m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 7 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsDenyAllPolicy",
+        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"sqsQueueArn\": \"arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:<YOUR SQS QUEUE>\", \"duration\": \"PT7M\"}"
+      },
+      "targets": {},
+      "startAfter": [
+        "wait3m2"
+      ]
+    },
+    "wait2m1": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait for 2 minutes",
+      "parameters": {
+        "duration": "PT2M"
+      },
+      "targets": {},
+      "startAfter": [
+        "impairSqs7m"
+      ]
+    },
+    "impairSqs15m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 15 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsDenyAllPolicy",
+        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"sqsQueueArn\": \"arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:<YOUR SQS QUEUE>\", \"duration\": \"PT15M\"}"
+      },
+      "targets": {},
+      "startAfter": [
+        "wait2m1"
+      ]
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+  "tags": {
+    "Name": "SimulateSqsImpairment",
+    "Purpose": "resilience-testing"
+  },
+  "logConfiguration": {
+    "logSchemaVersion": 2,
+    "cloudWatchLogsConfiguration": {
+      "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/fis/experiment:*"
+    }
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}
