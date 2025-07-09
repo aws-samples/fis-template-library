@@ -10,7 +10,7 @@ This experiment simulates CPU overload on an Aurora PostgreSQL cluster and then 
 
 ## Hypothesis
 
-High CPU load on an Aurora cluster will cause degraded performance, but a subsequent failover will restore normal operation with minimal disruption to application functionality. The system should automatically recover and will continue processing requests after the failover completes.
+When high CPU load occurs on an Aurora cluster followed by a subsequent failover, the system will restore normal operation with minimal disruption, and the application's functionality will remain largely unaffected. The automatic recovery process will complete within minutes, and the system's request processing capability will maintain continuity at near 100% efficiency after the failover completes.
 
 ## Prerequisites
 
@@ -66,7 +66,6 @@ This template does not include stop conditions by default. You should add CloudW
 - `aurora-cluster-failover-iam-policy.json`: Required IAM permissions
 - `aurora-cluster-failover-ssm-template.json`: SSM document for load testing
 - `fis-iam-trust-relationship.json`: IAM trust policy for FIS service
-- `examples/`: Infrastructure examples and deployment guidance
 
 ## Next steps
 
