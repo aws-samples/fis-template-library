@@ -9,7 +9,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Hypothesis
 
-Under high CPU load conditions, a Multi-AZ MySQL RDS instance will successfully failover from the primary to the standby instance with approximately 25 seconds of downtime. Applications using proper connection handling should automatically reconnect and continue functioning normally after the failover completes.
+When high CPU load is generated on a Multi-AZ MySQL RDS instance followed by a failover event, the system will transition from the primary to the standby instance with approximately 25 seconds of downtime, and applications implementing proper connection handling will automatically reconnect with a success rate of nearly 100%, maintaining normal functionality once the failover process completes.
 
 ## Prerequisites
 
