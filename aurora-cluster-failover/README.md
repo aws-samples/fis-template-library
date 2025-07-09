@@ -66,7 +66,6 @@ This template does not include stop conditions by default. You should add CloudW
 - `aurora-cluster-failover-iam-policy.json`: Required IAM permissions
 - `aurora-cluster-failover-ssm-template.json`: SSM document for load testing
 - `fis-iam-trust-relationship.json`: IAM trust policy for FIS service
-- `examples/`: Infrastructure examples and deployment guidance
 
 ## Next steps
 

@@ -66,10 +66,6 @@ As you adapt this scenario to your needs, we recommend:
 5. Customizing the SSM document parameters to adjust load test concurrency, duration, and target CPU utilization.
 6. Testing the load generation script independently before running the full FIS experiment.
 
-## Infrastructure Examples
-
-See the `examples/` directory for complete infrastructure templates and deployment guidance to help you set up the necessary resources for this experiment.
-
 ## Import Experiment
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
