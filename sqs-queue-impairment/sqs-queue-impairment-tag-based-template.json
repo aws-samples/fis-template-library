@@ -1,14 +1,14 @@
 {
-  "description": "FIS Experiment template to simulate worsening impairment of SQS by applying deny-all policy for increasing durations",
+  "description": "Simulate worsening impairment of SQS queues with specific tag by applying deny-all policy for increasing durations",
   "targets": {},
   "actions": {
     "impairSqs2m": {
       "actionId": "aws:ssm:start-automation-execution",
-      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 2 minutes",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 2 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueImpairment",
-        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"duration\": \"PT2M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT2M\"}"
       },
       "targets": {}
     },
@@ -23,11 +23,11 @@
     },
     "impairSqs5m": {
       "actionId": "aws:ssm:start-automation-execution",
-      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 5 minutes",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 5 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueImpairment",
-        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"duration\": \"PT5M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT5M\"}"
       },
       "targets": {},
       "startAfter": ["wait3m1"]
@@ -43,11 +43,11 @@
     },
     "impairSqs7m": {
       "actionId": "aws:ssm:start-automation-execution",
-      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 7 minutes",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 7 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueImpairment",
-        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"duration\": \"PT7M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT7M\"}"
       },
       "targets": {},
       "startAfter": ["wait3m2"]
@@ -63,11 +63,11 @@
     },
     "impairSqs15m": {
       "actionId": "aws:ssm:start-automation-execution",
-      "description": "Simulate worsening impairment of SQS by applying deny-all policy for 15 minutes",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 15 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueImpairment",
-        "documentParameters": "{\"sqsQueueUrl\": \"https://sqs.<YOUR REGION>.amazonaws.com/<YOUR AWS ACCOUNT>/<YOUR SQS QUEUE>\", \"duration\": \"PT15M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT15M\"}"
       },
       "targets": {},
       "startAfter": ["wait2m1"]
@@ -82,12 +82,6 @@
   "tags": {
     "Name": "SimulateSqsImpairment",
     "Purpose": "resilience-testing"
-  },
-  "logConfiguration": {
-    "logSchemaVersion": 2,
-    "cloudWatchLogsConfiguration": {
-      "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/fis/experiment:*"
-    }
   },
   "experimentOptions": {
     "accountTargeting": "single-account",

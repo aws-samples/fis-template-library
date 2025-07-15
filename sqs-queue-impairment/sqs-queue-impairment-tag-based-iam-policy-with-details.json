@@ -21,15 +21,21 @@
         "ssm:StopAutomationExecution"
       ],
       "Resource": [
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueImpairment",
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+        "arn:aws:ssm:us-west-2:974793076898:document/SqsQueueSimulateImpairment",
+        "arn:aws:ssm:us-west-2:974793076898:automation-definition/SqsQueueSimulateImpairment:*",
+        "arn:aws:ssm:us-west-2:974793076898:automation-execution/*"
       ]
     },
     {
       "Sid": "AllowSQSOperations",
       "Effect": "Allow",
-      "Action": ["sqs:AddPermission", "sqs:RemovePermission"],
-      "Resource": "arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:<YOUR QUEUE NAME>"
+      "Action": [
+        "sqs:AddPermission",
+        "sqs:RemovePermission",
+        "sqs:ListQueues",
+        "sqs:ListQueueTags"
+      ],
+      "Resource": "arn:aws:sqs:us-west-2:974793076898:*"
     }
   ]
 }
