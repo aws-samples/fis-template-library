@@ -7,8 +7,8 @@
       "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 2 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT2M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT2M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
       },
       "targets": {}
     },
@@ -26,8 +26,8 @@
       "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 5 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT5M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT5M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
       },
       "targets": {},
       "startAfter": ["wait3m1"]
@@ -46,8 +46,8 @@
       "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 7 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT7M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT7M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
       },
       "targets": {},
       "startAfter": ["wait3m2"]
@@ -66,8 +66,8 @@
       "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 15 minutes",
       "parameters": {
         "maxDuration": "PT1H",
-        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/SqsQueueSimulateImpairment",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT15M\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT15M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
       },
       "targets": {},
       "startAfter": ["wait2m1"]
@@ -78,7 +78,7 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+  "roleArn": "arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
   "tags": {
     "Name": "SimulateSqsImpairment",
     "Purpose": "resilience-testing"

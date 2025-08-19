@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ListQueues",
+        "sqs:ListQueueTags",
+        "sqs:AddPermission",
+        "sqs:RemovePermission",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes"
+      ],
+      "Resource": "arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:*"
+    }
+  ]
+}
