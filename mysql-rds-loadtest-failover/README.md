@@ -1,0 +1,108 @@
+# AWS Fault Injection Service Experiment: MySQL RDS Load Test and Failover
+
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
+
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+
+## Hypothesis
+
+When high CPU load is generated on a Multi-AZ MySQL RDS instance followed by a failover event, the system will transition from the primary to the standby instance with approximately 25 seconds of downtime, and applications implementing proper connection handling will automatically reconnect with a success rate of nearly 100%, maintaining normal functionality once the failover process completes.
+
+## Prerequisites
+
+Before running this experiment, ensure that:
+
+1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on RDS instances.
+2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation and execute SSM documents.
+3. The MySQL RDS instances you want to target have the `FIS-Ready=True` tag.
+4. **You have an EC2 instance tagged with `FIS-Ready=True` that serves as the load generator**
+   - This instance must have network connectivity to your MySQL RDS instance
+   - The instance must have the SSM Agent installed and running
+   - The instance requires appropriate IAM permissions to execute SSM documents
+   - The instance will execute CPU-intensive database queries against the MySQL RDS instance
+5. The targeted MySQL RDS instances are configured for Multi-AZ deployment.
+6. The IAM role associated with the EC2 instances has the necessary permissions for SSM.
+7. You have deployed the SSM document template (`mysql-rds-loadtest-failover-ssm-template.json`) to your account.
+
+## Architecture Overview
+
+This experiment uses the following components:
+
+- **MySQL RDS Instance**: The target database that will experience CPU load and failover
+- **EC2 Load Generator Instance**: Executes the SSM document to generate database load
+- **SSM Document**: Contains the load testing scripts that create CPU-intensive queries
+- **FIS Experiment**: Orchestrates the load generation and failover sequence
+
+**Critical**: The EC2 instance acts as the load generator and must be able to connect to your MySQL RDS instance. The SSM document will be executed on this instance, not directly on the RDS instance.
+
+## EC2 Instance Setup
+
+Your EC2 instance must meet these requirements:
+
+1. **Network Access**: Security groups must allow outbound connections to MySQL RDS on port 3306
+2. **MySQL Client**: Install `mysql-client` or equivalent for database connectivity
+3. **SSM Agent**: Ensure SSM Agent is installed and the instance appears in Systems Manager
+4. **IAM Role**: Attach an IAM role with `AmazonSSMManagedInstanceCore` policy
+5. **Tagging**: Tag the instance with `FIS-Ready=True`
+
+Test connectivity before running the experiment:
+```bash
+mysql -h your-rds-endpoint -u your-username -p -e "SELECT 1;"
+```
+
+## ⚠️ Database Impact Warning
+
+**IMPORTANT**: This experiment will create test tables in your MySQL database:
+
+### Tables Created:
+- `loadtest` - Load testing table with auto-increment primary key
+- Test database (if `DBName` parameter specifies a non-existing database)
+
+### Impact:
+- Tables will persist after the experiment completes
+- Test data will be inserted during load testing
+- No existing data will be modified or deleted
+- Tables use `IF NOT EXISTS` clauses to avoid conflicts
+
+### Cleanup:
+If you need to remove the test table after the experiment, you can manually drop it:
+```sql
+DROP TABLE IF EXISTS loadtest;
+```
+
+## Stop Conditions
+
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until all actions have been completed on the targeted resources.
+
+## Observability and stop conditions
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
+business metric requiring an immediate end of the fault injection. This 
+template makes no assumptions about your application and the relevant metrics 
+and does not include stop conditions by default.
+
+## Next Steps
+
+As you adapt this scenario to your needs, we recommend:
+
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to your MySQL RDS instance performance.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of high CPU load and failover.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Customizing the SSM document parameters to adjust load test concurrency, duration, and target CPU utilization.
+6. Testing the load generation script independently before running the full FIS experiment.
+
+## Import Experiment
+
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+
+## Monitoring Recommendations
+
+For optimal experiment observability, consider monitoring these key metrics during execution:
+- RDS CPU Utilization (target: sustained high load before failover)
+- RDS Database Connections (monitor connection drops during failover)
+- Application response times and error rates
+- RDS Failover completion time via CloudWatch Events
