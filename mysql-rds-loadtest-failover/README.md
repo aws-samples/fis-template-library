@@ -18,11 +18,40 @@ Before running this experiment, ensure that:
 1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on RDS instances.
 2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation and execute SSM documents.
 3. The MySQL RDS instances you want to target have the `FIS-Ready=True` tag.
-4. The EC2 instances you want to use for load testing have the `FIS-Ready=True` tag.
+4. **You have an EC2 instance tagged with `FIS-Ready=True` that serves as the load generator**
+   - This instance must have network connectivity to your MySQL RDS instance
+   - The instance must have the SSM Agent installed and running
+   - The instance requires appropriate IAM permissions to execute SSM documents
+   - The instance will execute CPU-intensive database queries against the MySQL RDS instance
 5. The targeted MySQL RDS instances are configured for Multi-AZ deployment.
-6. SSM Agent is installed and running on the target EC2 instances.
-7. The IAM role associated with the EC2 instances has the necessary permissions for SSM.
-8. You have deployed the SSM document template (`mysql-rds-loadtest-failover-ssm-template.json`) to your account.
+6. The IAM role associated with the EC2 instances has the necessary permissions for SSM.
+7. You have deployed the SSM document template (`mysql-rds-loadtest-failover-ssm-template.json`) to your account.
+
+## Architecture Overview
+
+This experiment uses the following components:
+
+- **MySQL RDS Instance**: The target database that will experience CPU load and failover
+- **EC2 Load Generator Instance**: Executes the SSM document to generate database load
+- **SSM Document**: Contains the load testing scripts that create CPU-intensive queries
+- **FIS Experiment**: Orchestrates the load generation and failover sequence
+
+**Critical**: The EC2 instance acts as the load generator and must be able to connect to your MySQL RDS instance. The SSM document will be executed on this instance, not directly on the RDS instance.
+
+## EC2 Instance Setup
+
+Your EC2 instance must meet these requirements:
+
+1. **Network Access**: Security groups must allow outbound connections to MySQL RDS on port 3306
+2. **MySQL Client**: Install `mysql-client` or equivalent for database connectivity
+3. **SSM Agent**: Ensure SSM Agent is installed and the instance appears in Systems Manager
+4. **IAM Role**: Attach an IAM role with `AmazonSSMManagedInstanceCore` policy
+5. **Tagging**: Tag the instance with `FIS-Ready=True`
+
+Test connectivity before running the experiment:
+```bash
+mysql -h your-rds-endpoint -u your-username -p -e "SELECT 1;"
+```
 
 ## ⚠️ Database Impact Warning
 

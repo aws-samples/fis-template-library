@@ -17,11 +17,41 @@ When high CPU load occurs on an Aurora cluster followed by a subsequent failover
 Before running this experiment, ensure that:
 
 1. You have an Aurora PostgreSQL cluster tagged with `FIS-Ready=True`
-2. You have an EC2 instance tagged with `FIS-Ready=True` that can connect to the Aurora cluster
+2. **You have an EC2 instance tagged with `FIS-Ready=True` that serves as the load generator**
+   - This instance must have network connectivity to your Aurora cluster
+   - The instance must have the SSM Agent installed and running
+   - The instance requires appropriate IAM permissions to execute SSM documents
+   - The instance will execute CPU-intensive database queries against the Aurora cluster
 3. The Aurora cluster is configured for Multi-AZ deployment with writer and reader instances
 4. You have created the required IAM role with the provided policy document
 5. You have deployed the SSM document for load testing
 6. You have configured appropriate CloudWatch monitoring and alarms
+
+## Architecture Overview
+
+This experiment uses the following components:
+
+- **Aurora PostgreSQL Cluster**: The target database that will experience CPU load and failover
+- **EC2 Load Generator Instance**: Executes the SSM document to generate database load
+- **SSM Document**: Contains the load testing scripts that create CPU-intensive queries
+- **FIS Experiment**: Orchestrates the load generation and failover sequence
+
+**Critical**: The EC2 instance acts as the load generator and must be able to connect to your Aurora cluster. The SSM document will be executed on this instance, not directly on the Aurora cluster.
+
+## EC2 Instance Setup
+
+Your EC2 instance must meet these requirements:
+
+1. **Network Access**: Security groups must allow outbound connections to Aurora on port 5432
+2. **PostgreSQL Client**: Install `postgresql-client` or equivalent for database connectivity
+3. **SSM Agent**: Ensure SSM Agent is installed and the instance appears in Systems Manager
+4. **IAM Role**: Attach an IAM role with `AmazonSSMManagedInstanceCore` policy
+5. **Tagging**: Tag the instance with `FIS-Ready=True`
+
+Test connectivity before running the experiment:
+```bash
+psql -h your-aurora-endpoint -U your-username -d your-database -c "SELECT 1;"
+```
 
 ## ⚠️ Database Impact Warning
 
