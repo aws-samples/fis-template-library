@@ -1,0 +1,64 @@
+{
+  "description": "Aurora cluster CPU overload and failover experiment",
+  "targets": {
+    "AuroraCluster": {
+      "resourceType": "aws:rds:cluster",
+      "resourceTags": {
+        "FIS-Ready": "True"
+      },
+      "selectionMode": "ALL"
+    },
+    "EC2Instance": {
+      "resourceType": "aws:ec2:instance",
+      "resourceTags": {
+        "FIS-Ready": "True"
+      },
+      "selectionMode": "ALL"
+    }
+  },
+  "actions": {
+    "DelayAction": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait 5 minutes to establish baseline metrics",
+      "parameters": {
+        "duration": "PT5M"
+      }
+    },
+    "RunLoadTest": {
+      "actionId": "aws:ssm:send-command",
+      "description": "Execute CPU load test on Aurora cluster",
+      "parameters": {
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/aurora-cluster-loadtest-document",
+        "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"10\"}",
+        "duration": "PT10M"
+      },
+      "targets": {
+        "Instances": "EC2Instance"
+      }
+    },
+    "FailoverCluster": {
+      "actionId": "aws:rds:failover-db-cluster",
+      "description": "Initiate Aurora cluster failover",
+      "parameters": {},
+      "targets": {
+        "Clusters": "AuroraCluster"
+      },
+      "startAfter": ["DelayAction"]
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/FISExperimentRole",
+  "tags": {
+    "Name": "Aurora-Cluster-CPU-Overload-Failover"
+  },
+  "logConfiguration": {
+    "logSchemaVersion": 2,
+    "cloudWatchLogsConfiguration": {
+      "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:FISExperimentLogs"
+    }
+  }
+}

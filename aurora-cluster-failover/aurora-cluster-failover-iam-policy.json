@@ -1,71 +1,41 @@
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "fis:InjectApiInternalError",
-        "fis:InjectApiThrottleError",
-        "fis:InjectApiUnavailableError"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "rds:FailoverDBCluster",
-        "rds:DescribeDBClusters",
-        "rds:DescribeDBInstances"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/FIS-Ready": "True"
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "rds:FailoverDBCluster",
+                "rds:DescribeDBClusters"
+            ],
+            "Resource": [
+                "arn:aws:rds:*:*:cluster:*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
+            "Resource": "*"
         }
-      }
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ssm:SendCommand",
-        "ssm:ListCommandInvocations",
-        "ssm:DescribeInstanceInformation",
-        "ssm:GetCommandInvocation",
-        "ssm:DescribeDocumentParameters"
-      ],
-      "Resource": [
-        "arn:aws:ssm:*:*:document/aurora-cluster-loadtest-document",
-        "arn:aws:ssm:*:*:document/AWS-RunShellScript"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ssm:SendCommand"
-      ],
-      "Resource": "arn:aws:ec2:*:*:instance/*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/FIS-Ready": "True"
-        }
-      }
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstances"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogDelivery",
-        "logs:PutResourcePolicy",
-        "logs:DescribeResourcePolicies",
-        "logs:DescribeLogGroups"
-      ],
-      "Resource": "*"
-    }
-  ]
+    ]
 }

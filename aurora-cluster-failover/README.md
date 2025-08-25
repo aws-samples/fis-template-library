@@ -1,80 +1,46 @@
-# AWS Fault Injection Service Experiment: Aurora Cluster CPU Overload and Failover
+# AWS Fault Injection Service Experiment: Aurora Cluster Failover
 
-This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
+This is an experiment template for use with AWS Fault Injection Service (FIS) and 
+fis-template-library-tooling. This experiment template requires deployment into 
+your AWS account and requires resources in your AWS account to inject faults into.
 
-THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Description
 
-This experiment simulates CPU overload on an Aurora PostgreSQL cluster and then initiates a failover to test the resilience of your database infrastructure under stress conditions.
+Explore the impact of failing over of an Amazon Aurora cluster. 
+
+In this experiment we target an Amazon Aurora Cluster in the current region that have a specific tag attached. 
 
 ## Hypothesis
 
-When high CPU load occurs on an Aurora cluster followed by a subsequent failover, the system will restore normal operation with minimal disruption, and the application's functionality will remain largely unaffected. The automatic recovery process will complete within minutes, and the system's request processing capability will maintain continuity at near 100% efficiency after the failover completes.
+Failover of an Aurora Cluster between the reader and writer instance may cause requests to fail for a brief period of time, but requests will automatically recover, and the application will continue to function as normal after the failover.
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
-1. You have an Aurora PostgreSQL cluster tagged with `FIS-Ready=True`
-2. You have an EC2 instance tagged with `FIS-Ready=True` that can connect to the Aurora cluster
-3. The Aurora cluster is configured for Multi-AZ deployment with writer and reader instances
-4. You have created the required IAM role with the provided policy document
-5. You have deployed the SSM document for load testing
-6. You have configured appropriate CloudWatch monitoring and alarms
-
-## ⚠️ Database Impact Warning
-
-**IMPORTANT**: This experiment will create test tables in your Aurora PostgreSQL database:
-
-### Tables Created:
-- `load_test_users` - User records with status and timestamps
-- `load_test_transactions` - Transaction records with foreign key relationships
-
-### Impact:
-- Tables will persist after the experiment completes
-- Test data will be inserted during load testing
-- No existing data will be modified or deleted
-- Tables use `IF NOT EXISTS` clauses to avoid conflicts
-- Indexes will be created for performance testing
-
-### Cleanup:
-If you need to remove the test tables after the experiment, you can manually drop them:
-```sql
-DROP TABLE IF EXISTS load_test_transactions;
-DROP TABLE IF EXISTS load_test_users;
-```
+1. You have the necessary permissions to execute the FIS experiment and perform the failover operation on the targeted Aurora clusters.
+2. The IAM role specified in the `roleArn` field has the required permissions to perform the failover operation.
+3. The Aurora clusters you want to target have the `FIS-Ready=True` tag.
+4. The targeted Aurora clusters are configured for Multi-AZ deployment with writer and reader instances, and proper replication is set up.
 
 ## How it works
 
-This experiment simulates a high CPU load scenario followed by an Aurora DB cluster failover:
-
-1. **Baseline establishment**: 5-minute delay to establish baseline metrics
-2. **CPU load generation**: SSM document executes CPU-intensive queries on the Aurora cluster
-3. **Failover initiation**: After the delay, promotes an Aurora Replica to be the primary writer
-4. **Impact observation**: Load test continues to observe failover impact on performance
-
-The experiment targets resources with the `FIS-Ready=True` tag for safety and control.
+This template simulate an Aurora DB cluster failover for a DB cluster. It will promotes one of the Aurora Replicas (read-only instances) in the DB cluster to be the primary DB instance (the cluster writer). To use the scenario you must have Amazon Aurora clusters that have the tag `FIS-Ready=True`.
 
 ## Observability and stop conditions
 
-This template does not include stop conditions by default. You should add CloudWatch alarms based on your specific operational metrics to automatically halt the experiment if critical thresholds are breached.
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
+business metric requiring an immediate end of the fault injection. This 
+template makes no assumptions about your application and the relevant metrics 
+and does not include stop conditions by default.
 
-## Files included
+## Next Steps
+As you adapt this scenario to your needs, we recommend reviewing the tag names you use to ensure they fit your specific use case, identifying business metrics tied to the instances you are stopping, creating an Amazon CloudWatch metric and Amazon CloudWatch alarm, and adding a stop condition tied to the alarm.
 
-- `aurora-cluster-failover-template.json`: Main FIS experiment template
-- `aurora-cluster-failover-iam-policy.json`: Required IAM permissions
-- `aurora-cluster-failover-ssm-template.json`: SSM document for load testing
-- `fis-iam-trust-relationship.json`: IAM trust policy for FIS service
-
-## Next steps
-
-1. Review and customize the experiment parameters for your environment
-2. Set up CloudWatch monitoring and create appropriate alarms
-3. Add stop conditions based on your operational metrics
-4. Test the experiment in a non-production environment first
-5. Create a CloudWatch dashboard to visualize experiment effects
-
-## Import experiment
-
-You can import the JSON experiment template into your AWS account via CLI or AWS CDK. For step-by-step instructions, see the [fis-template-library-tooling](https://github.com/aws-samples/fis-template-library-tooling) repository.
+## Import Experiment
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling). 
