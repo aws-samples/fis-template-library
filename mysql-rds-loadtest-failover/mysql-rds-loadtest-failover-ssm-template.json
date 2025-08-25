@@ -54,8 +54,25 @@
       "inputs": {
         "runCommand": [
           "#!/bin/bash",
-          "# Install MySQL client and other dependencies",
-          "sudo yum install -y mysql bc jq"
+          "# Install MySQL client and other dependencies with OS detection",
+          "if [ -f \"/etc/system-release\" ] && grep -i 'Amazon Linux' /etc/system-release; then",
+          "    if ! grep -Fiq 'VERSION_ID=\"2023\"' /etc/os-release; then",
+          "        # Amazon Linux 2 or earlier",
+          "        sudo yum install -y mysql bc jq",
+          "    elif grep -Fiq 'ID=\"amzn\"' /etc/os-release && grep -Fiq 'VERSION_ID=\"2023\"' /etc/os-release; then",
+          "        # Amazon Linux 2023",
+          "        sudo yum install -y mysql bc jq",
+          "    fi",
+          "elif grep -Fiq 'ID=\"centos\"' /etc/os-release || grep -Fiq 'ID=\"rhel\"' /etc/os-release; then",
+          "    # CentOS/RHEL",
+          "    sudo yum install -y mysql bc jq",
+          "elif grep -Fiq 'ID=ubuntu' /etc/os-release || grep -Fiq 'ID=debian' /etc/os-release; then",
+          "    # Ubuntu/Debian",
+          "    sudo apt-get update && sudo apt-get install -y mysql-client bc jq",
+          "else",
+          "    echo \"Unsupported OS. Please install MySQL client, bc, and jq manually.\"",
+          "    exit 1",
+          "fi"
         ]
       }
     },
