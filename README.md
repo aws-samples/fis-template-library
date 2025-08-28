@@ -9,6 +9,7 @@ Browse the experiment directories to find templates for various fault injection 
 - **EC2 Instance Management**: `ec2-instances-terminate/`, `ec2-spot-interruption/`, `ec2-windows-stop-iis/`
 - **Database Resilience**: `aurora-cluster-failover/`, `sap-ebs-pause-database-data/`
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
+- **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
 
 Each experiment directory contains:
 - Complete FIS experiment template (JSON)
