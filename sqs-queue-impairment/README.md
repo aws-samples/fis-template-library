@@ -1,10 +1,3 @@
-TTD -
-
-1. create another queue and make sure it works for multiple queues
-2. make sure it works when there is a policy there already and leaves it as it was
-2. fire message generator and make sure it is working as expecting
-3. randomise the sleep for the impairment interval?
-
 # AWS Fault Injection Service Experiment: SQS Queue Impairment
 
 This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.

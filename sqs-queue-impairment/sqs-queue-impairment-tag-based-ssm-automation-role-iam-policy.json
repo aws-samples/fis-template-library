@@ -11,7 +11,12 @@
         "sqs:GetQueueAttributes",
         "sqs:SetQueueAttributes"
       ],
-      "Resource": "arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:*"
+      "Resource": "arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
     }
   ]
 }
