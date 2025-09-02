@@ -1,0 +1,90 @@
+{
+  "description": "Simulate worsening impairment of SQS queues with specific tag by applying deny-all policy for increasing durations",
+  "targets": {},
+  "actions": {
+    "impairSqs2m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 2 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT2M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    },
+    "wait3m1": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait for 3 minutes",
+      "parameters": {
+        "duration": "PT3M"
+      },
+      "targets": {},
+      "startAfter": ["impairSqs2m"]
+    },
+    "impairSqs5m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 5 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT5M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {},
+      "startAfter": ["wait3m1"]
+    },
+    "wait3m2": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait for 3 minutes",
+      "parameters": {
+        "duration": "PT3M"
+      },
+      "targets": {},
+      "startAfter": ["impairSqs5m"]
+    },
+    "impairSqs7m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 7 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT7M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {},
+      "startAfter": ["wait3m2"]
+    },
+    "wait2m1": {
+      "actionId": "aws:fis:wait",
+      "description": "Wait for 2 minutes",
+      "parameters": {
+        "duration": "PT2M"
+      },
+      "targets": {},
+      "startAfter": ["impairSqs7m"]
+    },
+    "impairSqs15m": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate worsening impairment of SQS queues by applying deny-all policy for 15 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT15M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {},
+      "startAfter": ["wait2m1"]
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "SimulateSqsImpairment",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}

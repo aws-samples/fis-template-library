@@ -1,0 +1,194 @@
+description: "Apply a deny-all policy to SQS queues with specific tag to simulate impairment using SQS:AddPermission and SQS:RemovePermission"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify SQS queues to impair"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify SQS queues to impair"
+    default: "True"
+  duration:
+    type: String
+    description: "Duration of the impairment in ISO8601 format"
+    default: "PT10M"
+  region:
+    type: String
+    description: "AWS Region of the SQS queues"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: getTargetQueues
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: get_queues
+      Script: |
+        import boto3
+
+        def get_queues(events, context):
+            region = events['region']
+            tag_key = events['tagKey']
+            tag_value = events['tagValue']
+            
+            sqs = boto3.client('sqs', region_name=region)
+            target_queues = []
+            
+            # Find queues by tag
+            response = sqs.list_queues()
+            if 'QueueUrls' not in response:
+                return []
+                
+            for queue_url in response['QueueUrls']:
+                try:
+                    tags_response = sqs.list_queue_tags(QueueUrl=queue_url)
+                    tags = tags_response.get('Tags', {})
+                    
+                    if tags.get(tag_key) == tag_value:
+                        target_queues.append(queue_url)
+                except Exception as e:
+                    print(f"Error getting tags for queue {queue_url}: {str(e)}")
+                    continue
+                    
+            return target_queues
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: targetQueues
+        Selector: $.Payload
+        Type: StringList
+    description: "Find all SQS queues with the specified tag or use the provided queue URL"
+
+  - name: applyDenyAllPolicyToQueues
+    action: aws:executeScript
+    onFailure: "step:removeDenyAllPolicyFromQueues"
+    onCancel: "step:removeDenyAllPolicyFromQueues"
+    inputs:
+      Runtime: python3.11
+      Handler: apply_deny_policy
+      Script: |
+        import boto3
+        import json
+
+        def apply_deny_policy(events, context):
+            region = events['region']
+            target_queues = events['targetQueues']
+            
+            sqs = boto3.client('sqs', region_name=region)
+            results = []
+            
+            for queue_url in target_queues:
+                try:
+                    # Get existing policy
+                    response = sqs.get_queue_attributes(
+                        QueueUrl=queue_url,
+                        AttributeNames=['Policy']
+                    )
+                    
+                    existing_policy = {}
+                    if 'Policy' in response.get('Attributes', {}):
+                        existing_policy = json.loads(response['Attributes']['Policy'])
+                    else:
+                        existing_policy = {
+                            "Version": "2012-10-17",
+                            "Statement": []
+                        }
+                    
+                    # Add deny statement
+                    deny_statement = {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action":  [
+                          "sqs:DeleteMessage",
+                          "sqs:ChangeMessageVisibility",
+                          "sqs:PurgeQueue",
+                          "sqs:ReceiveMessage",
+                          "sqs:SendMessage"
+                        ],
+                        "Resource": "*",
+                        "Sid": "FISTemporaryDeny"
+                    }
+                    
+                    # Remove any existing statement with the same Sid to avoid duplicates
+                    existing_policy['Statement'] = [s for s in existing_policy.get('Statement', []) 
+                                                  if s.get('Sid') != 'FISTemporaryDeny']
+                    
+                    existing_policy['Statement'].append(deny_statement)
+                    sqs.set_queue_attributes(
+                        QueueUrl=queue_url,
+                        Attributes={
+                            'Policy': json.dumps(existing_policy)
+                        }
+                    )
+
+                    results.append(f"Successfully applied deny policy to {queue_url}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to apply SQS policy to {queue_url}: {e}") from e
+            
+            return {
+                'affectedQueues': target_queues,
+                'results': results
+            }
+      InputPayload:
+        region: "{{ region }}"
+        targetQueues: "{{ getTargetQueues.targetQueues }}"
+    outputs:
+      - Name: affectedQueues
+        Selector: $.Payload.affectedQueues
+        Type: StringList
+      - Name: results
+        Selector: $.Payload.results
+        Type: StringList
+    description: "Apply deny-all policy to all target SQS queues"
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:removeDenyAllPolicyFromQueues"
+    onCancel: "step:removeDenyAllPolicyFromQueues"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Wait for the specified duration while the SQS queues are impaired"
+
+  - name: removeDenyAllPolicyFromQueues
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: remove_deny_policy
+      Script: |
+        import boto3
+
+        def remove_deny_policy(events, context):
+            region = events['region']
+            affected_queues = events['affectedQueues']
+            
+            sqs = boto3.client('sqs', region_name=region)
+            results = []
+            
+            for queue_url in affected_queues:
+                try:
+                    sqs.remove_permission(
+                        QueueUrl=queue_url,
+                        Label='FISTemporaryDeny'
+                    )
+                    results.append(f"Successfully removed deny policy from {queue_url}")
+                except Exception as e:
+                    results.append(f"Failed to remove deny policy from {queue_url}: {str(e)}")
+            
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        affectedQueues: "{{ applyDenyAllPolicyToQueues.affectedQueues }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Remove the deny permission from all affected SQS queues to restore normal operation"
+    isEnd: true

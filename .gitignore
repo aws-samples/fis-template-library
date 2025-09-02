@@ -5,6 +5,7 @@ node_modules
 .aws-sam
 .vscode
 samconfig.toml
+.DS_Store
 
 # CDK asset staging directory
 .cdk.staging
