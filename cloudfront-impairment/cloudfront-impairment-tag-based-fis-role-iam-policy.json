@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowFISExperimentLogging",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogDelivery",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSSMDocumentExecution",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:StartAutomationExecution",
+        "ssm:GetAutomationExecution",
+        "ssm:StopAutomationExecution"
+      ],
+      "Resource": [
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/<AUTOMATION DOCUMENT NAME>",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/<AUTOMATION DOCUMENT NAME>:*",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+      ]
+    },
+    {
+      "Sid": "AllowPassRole",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE>"]
+    }
+  ]
+}

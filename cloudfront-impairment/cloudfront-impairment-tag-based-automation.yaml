@@ -1,0 +1,325 @@
+description: "Apply a deny-all policy to S3 origins in CloudFront distributions with specific tag to simulate impairment"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify CloudFront distributions to impair"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify CloudFront distributions to impair"
+    default: "True"
+  duration:
+    type: String
+    description: "Duration of the impairment in ISO8601 format"
+    default: "PT10M"
+  region:
+    type: String
+    
+    description: "AWS Region of the CloudFront distributions"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: getTargetBuckets
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: get_buckets
+      Script: |
+        import boto3
+        import re
+
+        def get_buckets(events, context):
+            region = events['region']
+            tag_key = events['tagKey']
+            tag_value = events['tagValue']
+            
+            cloudfront = boto3.client('cloudfront')
+            target_buckets = []
+            
+            # Find CloudFront distributions with the tag
+            paginator = cloudfront.get_paginator('list_distributions')
+            
+            for page in paginator.paginate():
+                if 'Items' not in page['DistributionList']:
+                    continue
+                    
+                for distribution in page['DistributionList']['Items']:
+                    distribution_id = distribution['Id']
+                    
+                    try:
+                        # Get account ID from STS
+                        sts = boto3.client('sts')
+                        account_id = sts.get_caller_identity()['Account']
+                        
+                        tags_response = cloudfront.list_tags_for_resource(
+                            Resource=f"arn:aws:cloudfront::{account_id}:distribution/{distribution_id}"
+                        )
+                        
+                        tags = {tag['Key']: tag['Value'] for tag in tags_response.get('Tags', {}).get('Items', [])}
+                        
+                        if tags.get(tag_key) == tag_value:
+                            # Get distribution config to find S3 origins
+                            config_response = cloudfront.get_distribution_config(Id=distribution_id)
+                            config = config_response['DistributionConfig']
+                            
+                            # Find origin groups and get primary origins only
+                            origin_groups = config.get('OriginGroups', {}).get('Items', [])
+                            primary_origin_ids = []
+                            
+                            for origin_group in origin_groups:
+                                members = origin_group.get('Members', {}).get('Items', [])
+                                if members:
+                                    # First member is primary origin
+                                    primary_origin_ids.append(members[0]['OriginId'])
+                            
+                            # Extract S3 bucket names from primary origins only
+                            for origin in config['Origins']['Items']:
+                                if origin['Id'] in primary_origin_ids:
+                                    domain_name = origin['DomainName']
+                                    if '.s3.' in domain_name or '.s3-' in domain_name:
+                                        bucket_name = domain_name.split('.')[0]
+                                        if bucket_name not in [b['bucket'] for b in target_buckets]:
+                                            target_buckets.append({
+                                                'bucket': bucket_name,
+                                                'distribution_id': distribution_id
+                                            })
+                                        
+                    except Exception as e:
+                        print(f"Error processing distribution {distribution_id}: {str(e)}")
+                        continue
+                        
+            return target_buckets
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: targetBuckets
+        Selector: $.Payload
+        Type: MapList
+    description: "Find all S3 buckets used as origins in tagged CloudFront distributions"
+
+  - name: applyDenyAllPolicyToBuckets
+    action: aws:executeScript
+    onFailure: "step:removeDenyAllPolicyFromBuckets"
+    onCancel: "step:removeDenyAllPolicyFromBuckets"
+    inputs:
+      Runtime: python3.11
+      Handler: apply_deny_policy
+      Script: |
+        import boto3
+        import json
+
+        def apply_deny_policy(events, context):
+            region = events['region']
+            target_buckets = events['targetBuckets']
+            
+            s3 = boto3.client('s3', region_name=region)
+            results = []
+            
+            for bucket_info in target_buckets:
+                bucket_name = bucket_info['bucket']
+                
+                try:
+                    # Get existing policy
+                    existing_policy = {}
+                    try:
+                        response = s3.get_bucket_policy(Bucket=bucket_name)
+                        existing_policy = json.loads(response['Policy'])
+                    except Exception:
+                        existing_policy = {
+                            "Version": "2012-10-17",
+                            "Statement": []
+                        }
+                    
+                    # Add deny statement
+                    deny_statement = {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:GetObject",
+                        "Resource": f"arn:aws:s3:::{bucket_name}/*",
+                        "Sid": "FISTemporaryDeny"
+                    }
+                    
+                    # Remove any existing statement with the same Sid to avoid duplicates
+                    existing_policy['Statement'] = [s for s in existing_policy.get('Statement', []) 
+                                                  if s.get('Sid') != 'FISTemporaryDeny']
+                    
+                    existing_policy['Statement'].append(deny_statement)
+                    s3.put_bucket_policy(
+                        Bucket=bucket_name,
+                        Policy=json.dumps(existing_policy)
+                    )
+
+                    results.append(f"Successfully applied deny policy to {bucket_name}")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to apply S3 policy to {bucket_name}: {e}") from e
+            
+            return {
+                'affectedBuckets': [b['bucket'] for b in target_buckets],
+                'results': results
+            }
+      InputPayload:
+        region: "{{ region }}"
+        targetBuckets: "{{ getTargetBuckets.targetBuckets }}"
+    outputs:
+      - Name: affectedBuckets
+        Selector: $.Payload.affectedBuckets
+        Type: StringList
+      - Name: results
+        Selector: $.Payload.results
+        Type: StringList
+    description: "Apply deny-all policy to all target S3 buckets"
+
+  - name: invalidateCloudFrontCache
+    action: aws:executeScript
+    onFailure: "step:removeDenyAllPolicyFromBuckets"
+    onCancel: "step:removeDenyAllPolicyFromBuckets"
+    inputs:
+      Runtime: python3.11
+      Handler: invalidate_cache
+      Script: |
+        import boto3
+        import time
+
+        def invalidate_cache(events, context):
+            target_buckets = events['targetBuckets']
+            
+            cloudfront = boto3.client('cloudfront')
+            results = []
+            
+            # Get distribution IDs from bucket info
+            distribution_ids = list(set([bucket['distribution_id'] for bucket in target_buckets]))
+            
+            for distribution_id in distribution_ids:
+                try:
+                    response = cloudfront.create_invalidation(
+                        DistributionId=distribution_id,
+                        InvalidationBatch={
+                            'Paths': {
+                                'Quantity': 1,
+                                'Items': ['/*']
+                            },
+                            'CallerReference': f'fis-impairment-{int(time.time())}'
+                        }
+                    )
+                    results.append(f"Created invalidation {response['Invalidation']['Id']} for distribution {distribution_id}")
+                except Exception as e:
+                    results.append(f"Failed to invalidate distribution {distribution_id}: {str(e)}")
+            
+            return results
+      InputPayload:
+        targetBuckets: "{{ getTargetBuckets.targetBuckets }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Invalidate CloudFront cache to force origin requests"
+
+  - name: waitForDuration
+    action: "aws:sleep"
+    onFailure: "step:removeDenyAllPolicyFromBuckets"
+    onCancel: "step:removeDenyAllPolicyFromBuckets"
+    inputs:
+      Duration: "{{ duration }}"
+    description: "Wait for the specified duration while the S3 buckets are impaired"
+
+  - name: removeDenyAllPolicyFromBuckets
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: remove_deny_policy
+      Script: |
+        import boto3
+        import json
+
+        def remove_deny_policy(events, context):
+            region = events['region']
+            affected_buckets = events['affectedBuckets']
+            
+            s3 = boto3.client('s3', region_name=region)
+            results = []
+            
+            for bucket_name in affected_buckets:
+                try:
+                    # Get current policy
+                    response = s3.get_bucket_policy(Bucket=bucket_name)
+                    current_policy = json.loads(response['Policy'])
+                    
+                    # Remove the deny statement
+                    current_policy['Statement'] = [s for s in current_policy.get('Statement', []) 
+                                                 if s.get('Sid') != 'FISTemporaryDeny']
+                    
+                    if current_policy['Statement']:
+                        # Update policy if statements remain
+                        s3.put_bucket_policy(
+                            Bucket=bucket_name,
+                            Policy=json.dumps(current_policy)
+                        )
+                    else:
+                        # Delete policy if no statements remain
+                        s3.delete_bucket_policy(Bucket=bucket_name)
+                    
+                    results.append(f"Successfully removed deny policy from {bucket_name}")
+                except Exception as e:
+                    results.append(f"Failed to remove deny policy from {bucket_name}: {str(e)}")
+            
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        affectedBuckets: "{{ applyDenyAllPolicyToBuckets.affectedBuckets }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Remove the deny policy from all affected S3 buckets to restore normal operation"
+
+  - name: invalidateCloudFrontCacheRestore
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: invalidate_cache_restore
+      Script: |
+        import boto3
+        import time
+
+        def invalidate_cache_restore(events, context):
+            target_buckets = events['targetBuckets']
+            
+            cloudfront = boto3.client('cloudfront')
+            results = []
+            
+            # Get distribution IDs from bucket info
+            distribution_ids = list(set([bucket['distribution_id'] for bucket in target_buckets]))
+            
+            for distribution_id in distribution_ids:
+                try:
+                    response = cloudfront.create_invalidation(
+                        DistributionId=distribution_id,
+                        InvalidationBatch={
+                            'Paths': {
+                                'Quantity': 1,
+                                'Items': ['/*']
+                            },
+                            'CallerReference': f'fis-restore-{int(time.time())}'
+                        }
+                    )
+                    results.append(f"Created restore invalidation {response['Invalidation']['Id']} for distribution {distribution_id}")
+                except Exception as e:
+                    results.append(f"Failed to invalidate distribution {distribution_id} on restore: {str(e)}")
+            
+            return results
+      InputPayload:
+        targetBuckets: "{{ getTargetBuckets.targetBuckets }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Invalidate CloudFront cache after restoring S3 access to ensure normal operation"
+    isEnd: true

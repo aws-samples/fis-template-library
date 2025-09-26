@@ -1,0 +1,30 @@
+{
+  "description": "Simulate CloudFront distribution impairment with specific tag by disabling for 10 minutes",
+  "targets": {},
+  "actions": {
+    "impairCloudFront": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Simulate CloudFront distribution impairment by disabling for 10 minutes",
+      "parameters": {
+        "maxDuration": "PT1H",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT10M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "SimulateCloudFrontImpairment",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}

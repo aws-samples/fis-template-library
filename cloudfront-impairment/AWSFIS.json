@@ -1,0 +1,4 @@
+{
+  "service": "cloudfront",
+  "resource": "distribution"
+}
