@@ -1,0 +1,54 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowFISExperimentLogging",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogDelivery",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSSMDocumentExecution",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:StartAutomationExecution",
+        "ssm:GetAutomationExecution",
+        "ssm:StopAutomationExecution"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:document/ElastiCache-Redis-Primary-Node-Reboot",
+        "arn:aws:ssm:*:*:automation-definition/ElastiCache-Redis-Primary-Node-Reboot:*",
+        "arn:aws:ssm:*:*:automation-execution/*"
+      ]
+    },
+    {
+      "Sid": "AllowElastiCacheOperations",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:ListTagsForResource",
+        "elasticache:RebootCacheCluster"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSTSOperations",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowPassRole",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": ["arn:aws:iam::*:role/*"]
+    }
+  ]
+}

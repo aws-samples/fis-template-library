@@ -1,0 +1,30 @@
+{
+  "description": "Simulate Redis connection failure to test client circuit breaker behavior",
+  "targets": {},
+  "actions": {
+    "disableRedisConnections": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Disable Redis connections for 5 minutes to test resilience",
+      "parameters": {
+        "maxDuration": "PT30M",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT5M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "RedisConnectionFailureTest",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}
