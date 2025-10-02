@@ -1,4 +1,0 @@
-{
-  "service": "cloudfront",
-  "resource": "distribution"
-}
