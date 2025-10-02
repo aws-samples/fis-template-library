@@ -1,119 +1,78 @@
-# ElastiCache Redis Primary Node Reboot
+# AWS Fault Injection Service Experiment: ElastiCache Redis Primary Node Reboot
 
-This experiment reboots the primary Redis node to test application resilience and recovery mechanisms.
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
-## What It Does
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-1. **Identifies Primary Node**: Dynamically finds the current primary node using `NodeGroups` → `NodeGroupMembers` → `CurrentRole`
-2. **Reboots Primary**: Executes `reboot_cache_cluster` on the primary node
-3. **Monitors Recovery**: Tracks node status from "Rebooting cache cluster nodes" to "Available"
-4. **Measures Timeline**: Reports exact recovery time
+## Example Hypothesis
 
-## Expected Behavior
+When the Redis primary node is rebooted, applications should detect the brief connection disruption and reconnect automatically within 30 seconds. Connection pooling should handle the temporary unavailability gracefully, and no data should be lost during the reboot. Application performance should return to normal within 60 seconds of the node becoming available again.
 
-- **Duration**: 1-3 minutes for small instances (t3.micro)
-- **Node Status**: Changes from "Available" → "Rebooting cache cluster nodes" → "Available"
-- **No Failover**: Brief reboot doesn't trigger automatic failover
-- **Application Impact**: Brief connection disruption during reboot
+### What does this enable me to verify?
+
+* Appropriate Redis connection monitoring and observability is in place (were you able to detect the reboot?)
+* Alarms are configured correctly for node availability changes (were the right people notified?)
+* Your application handles brief Redis connection disruptions gracefully
+* Connection pooling and retry logic work correctly during node reboots
+* Recovery controls and reconnection mechanisms work as expected
 
 ## Prerequisites
 
-1. **Redis Cluster**: Multi-AZ with `AutomaticFailover=enabled`
-2. **Cluster Tag**: Must have `FIS-Ready=True` tag
-3. **IAM Roles**: Both FIS and SSM execution roles configured
+Before running this experiment, ensure that:
 
-## Files
+1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided.
+2. You have created the SSM Automation Document from the sample provided (elasticache-redis-primary-node-reboot-automation.yaml)
+3. You have created the FIS Experiment Template from the sample provided (elasticache-redis-primary-node-reboot-experiment-template.json)
+4. The ElastiCache Redis cluster(s) you want to target have the "FIS-Ready":"True" tag and value
+5. Your Redis cluster has Multi-AZ enabled with `AutomaticFailover=enabled`
+6. You have appropriate monitoring and observability in place to track the impact of the experiment.
 
-- `elasticache-redis-primary-node-reboot-automation.yaml` - SSM automation document (2 steps)
-- `elasticache-redis-primary-node-reboot-experiment-template.json` - FIS experiment template
-- `elasticache-redis-primary-node-reboot-fis-role-iam-policy.json` - FIS role permissions
-- `elasticache-node-primary-node-reboot-ssm-role-iam-policy.json` - SSM role permissions
-- `fis-iam-trust-relationship.json` - FIS role trust policy
-- `ssm-iam-trust-relationship.json` - SSM role trust policy
+## How it works
 
-## Setup
+This experiment reboots the Redis primary node to test application resilience during brief connection disruptions. The experiment follows this sequence:
 
-### 1. Create IAM Roles
+1. **Dynamic Discovery**: Scans all ElastiCache replication groups to find clusters tagged with "FIS-Ready":"True"
+2. **Primary Identification**: Dynamically finds the current primary node using NodeGroups and CurrentRole
+3. **Node Reboot**: Executes `reboot_cache_cluster` on the primary node
+4. **Recovery Monitoring**: Tracks node status from "Rebooting cache cluster nodes" to "Available"
+
+The reboot is implemented using an SSM Automation Document invoked by FIS. The SSM Automation Document identifies the primary node and reboots it, then monitors the recovery process until the node returns to available status.
+
+To verify the experiment is working properly, you can monitor the node status and test connectivity:
+
 ```bash
-# Create SSM role
-aws iam create-role --role-name ElastiCache-SSM-Automation-Role \
-  --assume-role-policy-document file://ssm-iam-trust-relationship.json
+# Monitor Redis connectivity during reboot
+watch -n 5 'redis-cli -h <redis-endpoint> ping'
 
-aws iam put-role-policy --role-name ElastiCache-SSM-Automation-Role \
-  --policy-name ElastiCacheAutomationPolicy \
-  --policy-document file://elasticache-node-primary-node-reboot-ssm-role-iam-policy.json
+# Check node status
+aws elasticache describe-replication-groups --replication-group-id <YOUR-CLUSTER-ID> --query 'ReplicationGroups[0].NodeGroups[0].NodeGroupMembers[?CurrentRole==`primary`].CacheNodeStatus'
 
-# Create FIS role
-aws iam create-role --role-name ElastiCache-FIS-Role \
-  --assume-role-policy-document file://fis-iam-trust-relationship.json
-
-aws iam put-role-policy --role-name ElastiCache-FIS-Role \
-  --policy-name ElastiCacheFISPolicy \
-  --policy-document file://elasticache-redis-primary-node-reboot-fis-role-iam-policy.json
+# Monitor application health
+curl -I https://<your-app>/health
 ```
 
-### 2. Deploy SSM Document
-```bash
-aws ssm create-document \
-  --name "ElastiCache-Redis-Primary-Node-Reboot" \
-  --document-type "Automation" \
-  --document-format "YAML" \
-  --content file://elasticache-redis-primary-node-reboot-automation.yaml
-```
+During the experiment, you should see the node status change from "Available" to "Rebooting cache cluster nodes" and back to "Available" within 1-3 minutes.
 
-### 3. Tag Redis Cluster
-```bash
-aws elasticache add-tags-to-resource \
-  --resource-name "arn:aws:elasticache:region:account:replicationgroup:cluster-id" \
-  --tags Key=FIS-Ready,Value=True
-```
+## Stop Conditions
 
-### 4. Create FIS Experiment
-```bash
-# Update account ID in template first
-aws fis create-experiment-template \
-  --cli-input-json file://elasticache-redis-primary-node-reboot-experiment-template.json
-```
+The experiment does not have any specific stop conditions defined. The reboot completes automatically when the node returns to "Available" status.
 
-## Usage
+## Observability and stop conditions
 
-### Via FIS (Recommended)
-```bash
-aws fis start-experiment --experiment-template-id <template-id>
-```
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
-### Direct SSM Execution
-```bash
-aws ssm start-automation-execution \
-  --document-name "ElastiCache-Redis-Primary-Node-Reboot" \
-  --parameters "tagKey=FIS-Ready,tagValue=True,region=us-east-1,AutomationAssumeRole=arn:aws:iam::ACCOUNT:role/ElastiCache-SSM-Automation-Role"
-```
+## Next Steps
 
-## Automation Steps
+As you adapt this scenario to your needs, we recommend:
 
-1. **triggerNodeFailover**: Identifies and reboots primary Redis node
-2. **monitorPrimaryNodeRecovery**: Monitors node status until "Available"
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to your Redis operations, such as connection counts and application response times.
+3. Creating Amazon CloudWatch metrics and alarms to monitor Redis node availability and connection health.
+4. Adding stop conditions tied to critical business metrics to automatically halt the experiment if needed.
+5. Implementing appropriate connection retry logic in your application to handle brief node unavailability.
+6. Testing your application's Redis connection pooling and recovery mechanisms.
+7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
 
-## Test Results
+## Import Experiment
 
-- ✅ **Primary Detection**: Correctly identifies current primary node
-- ✅ **Reboot Execution**: Successfully reboots primary node
-- ✅ **Recovery Monitoring**: Tracks status changes with timestamps
-- ✅ **FIS Integration**: Works through complete FIS → SSM workflow
-
-## Limitations
-
-- **No True Failover**: Reboot is too brief to trigger automatic failover
-- **Brief Outage**: Only tests short connection disruptions
-- **Single Node**: Only affects the primary node, replicas remain available
-
-## For True Failover Testing
-
-Consider using connection-level failures instead:
-- Security group isolation
-- Network ACL blocking
-- Manual failover via `modify-replication-group`
-
-## Current Status
-
-✅ **Working** - Successfully reboots primary node and monitors recovery
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).

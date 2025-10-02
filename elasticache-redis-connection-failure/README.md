@@ -1,64 +1,79 @@
-# Redis Connection Failure Resilience Testing
+# AWS Fault Injection Service Experiment: ElastiCache Redis Connection Failure
 
-This experiment simulates Redis connection failures to test client-side circuit breaker behavior and application resilience when Redis becomes unavailable.
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
+
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Example Hypothesis
 
-When Redis connections are disrupted, applications should gracefully handle the failure through circuit breaker mechanisms within 30 seconds. Client retry storms should be prevented, and applications should continue operating in degraded mode. Once Redis connectivity is restored, normal operations should resume within 60 seconds.
+When Redis connections are disrupted, applications should gracefully handle the failure through circuit breaker mechanisms within 30 seconds. Client retry storms should be prevented, and applications should continue operating in degraded mode without cascading failures. Once Redis connectivity is restored, normal operations should resume within 60 seconds.
 
 ### What does this enable me to verify?
 
+* Appropriate Redis connectivity monitoring and observability is in place (were you able to detect the connection failure?)
+* Alarms are configured correctly for connectivity issues (were the right people notified?)
+* Your applications handle Redis unavailability gracefully without cascading failures
 * Redis client circuit breaker functionality works correctly
-* Applications handle Redis unavailability gracefully without cascading failures
-* Client-side retry logic doesn't create amplification effects
-* Monitoring and alerting detect Redis connectivity issues
-* Recovery mechanisms work when Redis becomes available again
-* Dependent services (like console tools) can operate independently
-
-## How it works
-
-This experiment simulates Redis connection failures by modifying ElastiCache security groups to block connections for a specified duration:
-
-1. **Connection Disruption**: Removes security group rules to block Redis access
-2. **Wait**: Maintains disruption for specified duration to test resilience
-3. **Restoration**: Restores security group rules to resume normal connectivity
+* Client-side retry logic doesn't create amplification effects or retry storms
+* Recovery controls work as expected when Redis connectivity is restored
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
-1. You have the roles created for FIS and SSM Automation to use
-2. Your ElastiCache Redis clusters have the "FIS-Ready":"True" tag
-3. **Your applications implement proper Redis client circuit breakers**
-4. You have monitoring for Redis connectivity and application health
-5. You have appropriate observability in place to track the impact
+1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided.
+2. You have created the SSM Automation Document from the sample provided (redis-connection-failure-automation.yaml)
+3. You have created the FIS Experiment Template from the sample provided (redis-connection-failure-experiment-template.json)
+4. The ElastiCache Redis cluster(s) you want to target have the "FIS-Ready":"True" tag and value
+5. Your applications implement proper Redis client circuit breakers and retry logic
+6. You have appropriate monitoring and observability in place to track the impact of the experiment.
 
-## Experiment Files
+## How it works
 
-* `redis-connection-failure-automation.yaml` - SSM Automation Document
-* `redis-connection-failure-experiment-template.json` - FIS Experiment Template  
-* `redis-connection-failure-fis-role-iam-policy.json` - IAM policy for FIS role
-* `redis-connection-failure-ssm-role-iam-policy.json` - IAM policy for SSM role
-* `fis-iam-trust-relationship.json` - Trust policy for FIS role
-* `ssm-iam-trust-relationship.json` - Trust policy for SSM role
+This experiment simulates Redis connection failures by modifying ElastiCache security groups to block connections for a specified duration. The experiment follows this sequence:
 
-## Testing Verification
+1. **Dynamic Discovery**: Scans all ElastiCache replication groups to find clusters tagged with "FIS-Ready":"True"
+2. **Connection Disruption**: Removes security group rules to block Redis access from applications
+3. **Sustained Failure**: Maintains connection disruption for specified duration to test resilience
+4. **Restoration**: Restores security group rules to resume normal connectivity
 
-To verify the experiment works correctly:
+The connection failure is implemented using an SSM Automation Document invoked by FIS. The SSM Automation Document modifies security group rules to block access to Redis, then restores connectivity after the specified duration.
+
+To verify the experiment is working properly, you can monitor Redis connectivity and application behavior:
 
 ```bash
 # Monitor Redis connectivity
-redis-cli -h <redis-endpoint> ping
+watch -n 5 'redis-cli -h <redis-endpoint> ping'
 
 # Check application health endpoints
 curl -I https://<your-app>/health
 
-# Monitor circuit breaker metrics
-# (depends on your monitoring setup)
+# Monitor security group rules
+aws ec2 describe-security-groups --group-ids <security-group-id> --query 'SecurityGroups[0].IpPermissions'
 ```
 
-During the experiment, you should observe:
-- Circuit breakers activating when Redis becomes unavailable
-- Applications continuing to serve requests (possibly with degraded functionality)
-- No retry storms or cascading failures
-- Proper alerting and monitoring activation
+During the experiment, you should observe connection timeouts when attempting to reach Redis and applications activating circuit breakers or degraded mode operations.
+
+## Stop Conditions
+
+The experiment does not have any specific stop conditions defined. It will continue to run until all actions are completed or until manually stopped.
+
+## Observability and stop conditions
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+
+## Next Steps
+
+As you adapt this scenario to your needs, we recommend:
+
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to your Redis connectivity, such as cache hit rates and application error rates.
+3. Creating Amazon CloudWatch metrics and alarms to monitor Redis connectivity and circuit breaker activation.
+4. Adding stop conditions tied to critical business metrics to automatically halt the experiment if needed.
+5. Implementing appropriate circuit breakers in your application to handle Redis unavailability gracefully.
+6. Testing your application's behavior under various connection failure scenarios and durations.
+7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
+
+## Import Experiment
+
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
