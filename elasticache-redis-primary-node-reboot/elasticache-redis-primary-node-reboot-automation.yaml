@@ -1,0 +1,175 @@
+description: "Simulate ElastiCache Redis primary node reboot to test application resilience"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify ElastiCache clusters to target"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify ElastiCache clusters to target"
+    default: "True"
+  region:
+    type: String
+    description: "AWS Region of the ElastiCache clusters"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: triggerNodeFailover
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: trigger_failover
+      Script: |
+        import boto3
+
+        def trigger_failover(events, context):
+            region = events["region"]
+            tag_key = events["tagKey"]
+            tag_value = events["tagValue"]
+            
+            elasticache = boto3.client("elasticache", region_name=region)
+            results = []
+            
+            # Get replication groups
+            response = elasticache.describe_replication_groups()
+            
+            for rg in response["ReplicationGroups"]:
+                if rg["Status"] == "available" and rg.get("AutomaticFailover") == "enabled":
+                    rg_id = rg["ReplicationGroupId"]
+                    
+                    try:
+                        # Check tags
+                        account_id = boto3.client("sts").get_caller_identity()["Account"]
+                        arn = "arn:aws:elasticache:{}:{}:replicationgroup:{}".format(region, account_id, rg_id)
+                        tags_response = elasticache.list_tags_for_resource(ResourceName=arn)
+                        tags = {tag["Key"]: tag["Value"] for tag in tags_response.get("TagList", [])}
+                        
+                        if tags.get(tag_key) == tag_value:
+                            # Find primary cluster
+                            primary_cluster_id = None
+                            for node_group in rg["NodeGroups"]:
+                                for member in node_group["NodeGroupMembers"]:
+                                    if member["CurrentRole"] == "primary":
+                                        primary_cluster_id = member["CacheClusterId"]
+                                        break
+                                if primary_cluster_id:
+                                    break
+                            
+                            if primary_cluster_id:
+                                # Reboot primary node
+                                elasticache.reboot_cache_cluster(
+                                    CacheClusterId=primary_cluster_id,
+                                    CacheNodeIdsToReboot=["0001"]
+                                )
+                                results.append("SUCCESS: Triggered failover for {} (primary: {})".format(rg_id, primary_cluster_id))
+                            else:
+                                results.append("ERROR: No primary found for {}".format(rg_id))
+                                
+                    except Exception as e:
+                        results.append("ERROR: Failed to process {}: {}".format(rg_id, str(e)))
+            
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Trigger node failover by rebooting primary nodes"
+
+  - name: monitorPrimaryNodeRecovery
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: monitor_node
+      Script: |
+        import boto3
+        import time
+
+        def monitor_node(events, context):
+            region = events["region"]
+            tag_key = events["tagKey"]
+            tag_value = events["tagValue"]
+            
+            elasticache = boto3.client("elasticache", region_name=region)
+            results = []
+            start_time = time.time()
+            
+            # Find the primary node that was rebooted
+            response = elasticache.describe_replication_groups()
+            primary_cluster_id = None
+            
+            for rg in response["ReplicationGroups"]:
+                if rg["Status"] == "available" and rg.get("AutomaticFailover") == "enabled":
+                    rg_id = rg["ReplicationGroupId"]
+                    
+                    try:
+                        # Check tags
+                        account_id = boto3.client("sts").get_caller_identity()["Account"]
+                        arn = "arn:aws:elasticache:{}:{}:replicationgroup:{}".format(region, account_id, rg_id)
+                        tags_response = elasticache.list_tags_for_resource(ResourceName=arn)
+                        tags = {tag["Key"]: tag["Value"] for tag in tags_response.get("TagList", [])}
+                        
+                        if tags.get(tag_key) == tag_value:
+                            # Find primary cluster
+                            for node_group in rg["NodeGroups"]:
+                                for member in node_group["NodeGroupMembers"]:
+                                    if member["CurrentRole"] == "primary":
+                                        primary_cluster_id = member["CacheClusterId"]
+                                        break
+                                if primary_cluster_id:
+                                    break
+                    except Exception as e:
+                        continue
+            
+            if not primary_cluster_id:
+                return ["ERROR: Could not find primary node to monitor"]
+            
+            # Monitor the primary node status
+            max_wait_time = 600  # 10 minutes
+            check_interval = 10  # Check every 10 seconds
+            
+            for attempt in range(max_wait_time // check_interval):
+                try:
+                    cluster_response = elasticache.describe_cache_clusters(
+                        CacheClusterId=primary_cluster_id,
+                        ShowCacheNodeInfo=True
+                    )
+                    
+                    cluster = cluster_response["CacheClusters"][0]
+                    cluster_status = cluster["CacheClusterStatus"]
+                    
+                    if cluster_status == "available":
+                        recovery_time = time.time() - start_time
+                        results.append("SUCCESS: Primary node {} recovered to Available in {:.1f} seconds".format(primary_cluster_id, recovery_time))
+                        break
+                    else:
+                        elapsed = time.time() - start_time
+                        results.append("MONITORING: Primary node {} status: {} after {:.1f}s".format(primary_cluster_id, cluster_status, elapsed))
+                        time.sleep(check_interval)
+                        
+                except Exception as e:
+                    results.append("ERROR: Failed to check primary node {}: {}".format(primary_cluster_id, str(e)))
+                    break
+            else:
+                results.append("TIMEOUT: Primary node {} did not recover within {} seconds".format(primary_cluster_id, max_wait_time))
+            
+            return results
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload
+        Type: StringList
+    description: "Monitor primary node recovery until Available status"
+    isEnd: true

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Test ElastiCache Redis failover using tag-based discovery",
+  "assumeRole": "arn:aws:iam::{{ global:ACCOUNT_ID }}:role/ElastiCache-SSM-Automation-Role",
+  "parameters": {
+    "tagKey": {
+      "type": "String",
+      "description": "Tag key to identify ElastiCache clusters to target",
+      "default": "FIS-Ready"
+    },
+    "tagValue": {
+      "type": "String",
+      "description": "Tag value to identify ElastiCache clusters to target",
+      "default": "True"
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "triggerFailover",
+      "action": "aws:executeScript",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "trigger_failover",
+        "Script": "import boto3\ndef trigger_failover(events, context):\n    region = events[\"region\"]\n    tag_key = events[\"tagKey\"]\n    tag_value = events[\"tagValue\"]\n    elasticache = boto3.client(\"elasticache\", region_name=region)\n    response = elasticache.describe_replication_groups()\n    for rg in response[\"ReplicationGroups\"]:\n        if rg[\"Status\"] == \"available\" and rg.get(\"AutomaticFailover\") == \"enabled\":\n            rg_id = rg[\"ReplicationGroupId\"]\n            try:\n                account_id = boto3.client(\"sts\").get_caller_identity()[\"Account\"]\n                arn = \"arn:aws:elasticache:{}:{}:replicationgroup:{}\".format(region, account_id, rg_id)\n                tags_response = elasticache.list_tags_for_resource(ResourceName=arn)\n                tags = {tag[\"Key\"]: tag[\"Value\"] for tag in tags_response.get(\"TagList\", [])}\n                if tags.get(tag_key) == tag_value:\n                    elasticache.test_failover(ReplicationGroupId=rg_id, NodeGroupId=\"0001\")\n                    return {\"ReplicationGroupId\": rg_id, \"Status\": \"Failover initiated\"}\n            except Exception as e:\n                continue\n    raise Exception(\"No cluster found with tag {}={}\".format(tag_key, tag_value))",
+        "InputPayload": {
+          "region": "{{ global:REGION }}",
+          "tagKey": "{{ tagKey }}",
+          "tagValue": "{{ tagValue }}"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Result",
+          "Selector": "$.Payload",
+          "Type": "StringMap"
+        }
+      ]
+    }
+  ]
+}
