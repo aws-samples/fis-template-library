@@ -1,0 +1,30 @@
+{
+  "description": "Simulate Redis memory stress to test application resilience under resource contention",
+  "targets": {},
+  "actions": {
+    "applyMemoryStress": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Apply memory stress to Redis clusters for 10 minutes",
+      "parameters": {
+        "maxDuration": "PT45M",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR ACCOUNT>:document/<YOUR AUTOMATION DOCUMENT NAME>",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"duration\": \"PT10M\", \"memoryFillPercentage\": \"80\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR SSM AUTOMATION IAM ROLE NAME>\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR ACCOUNT>:role/<YOUR FIS IAM ROLE NAME>",
+  "tags": {
+    "Name": "RedisMemoryStressTest",
+    "Purpose": "resilience-testing"
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "skip"
+  }
+}

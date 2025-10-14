@@ -1,4 +1,7 @@
 {
-  "service": "cloudfront",
-  "resource": "distribution"
+    "AWSFIS": {
+        "template": {
+            "version": "1.0"
+        }
+    }
 }

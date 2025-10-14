@@ -1,0 +1,85 @@
+description: "Simulate Redis memory stress by filling cache with test data"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key to identify ElastiCache clusters to target"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value to identify ElastiCache clusters to target"
+    default: "True"
+  duration:
+    type: String
+    description: "Duration of the memory stress in ISO8601 format"
+    default: "PT10M"
+  memoryFillPercentage:
+    type: String
+    description: "Percentage of available memory to fill (50-90)"
+    default: "80"
+  region:
+    type: String
+    description: "AWS Region of the ElastiCache clusters"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+files:
+  redis-stress-package.zip:
+    sourceType: "S3"
+    sourceInfo:
+      path: "s3://redis-stress-automation-1759268336/redis-stress-package.zip"
+      checksums:
+        sha256: "83dd67038ac63a8b6642b930dfeb2f586f7fad7a7346c6f78496140649d6905f"
+
+mainSteps:
+  - name: getTargetClusters
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: main.get_target_clusters
+      Attachment: redis-stress-package.zip
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+    outputs:
+      - Name: targetClusters
+        Selector: $.Payload
+        Type: MapList
+    description: "Find ElastiCache Redis clusters with specified tags"
+
+  - name: applyMemoryStress
+    action: aws:executeScript
+    onFailure: "step:cleanupMemoryStress"
+    onCancel: "step:cleanupMemoryStress"
+    inputs:
+      Runtime: python3.11
+      Handler: main.apply_memory_stress
+      Attachment: redis-stress-package.zip
+      InputPayload:
+        targetClusters: "{{ getTargetClusters.targetClusters }}"
+        durationMinutes: 15
+    outputs:
+      - Name: results
+        Selector: $.Payload.results
+        Type: StringList
+    description: "Apply memory stress using redis-cli commands from experiments.md"
+
+  - name: cleanupMemoryStress
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: main.cleanup_memory_stress
+      Attachment: redis-stress-package.zip
+      InputPayload:
+        targetClusters: "{{ getTargetClusters.targetClusters }}"
+    outputs:
+      - Name: results
+        Selector: $.Payload.results
+        Type: StringList
+    description: "Clean up all test data from Redis clusters"
+    isEnd: true
