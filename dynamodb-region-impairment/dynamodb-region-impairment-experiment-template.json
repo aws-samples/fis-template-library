@@ -1,0 +1,43 @@
+{
+  "description": "Block DynamoDB access in a specific region to test global table failover and application resilience",
+  "targets": {
+    "dynamodbTables": {
+      "resourceType": "aws:dynamodb:global-table",
+      "resourceTags": {
+        "FIS-Ready": "True"
+      },
+      "selectionMode": "ALL"
+    }
+  },
+  "actions": {
+    "pauseReplication": {
+      "actionId": "aws:dynamodb:global-table-pause-replication",
+      "description": "Pause DynamoDB global table replication in <YOUR REGION>",
+      "parameters": {
+        "duration": "PT12M"
+      },
+      "targets": {
+        "Tables": "dynamodbTables"
+      }
+    },
+    "blockDynamoDBAccess": {
+      "actionId": "aws:ssm:start-automation-execution",
+      "description": "Block DynamoDB access in target region for 10 minutes",
+      "parameters": {
+        "maxDuration": "PT15M",
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DynamoDB-Region-Impairment",
+        "documentParameters": "{\"tableName\": \"<YOUR TABLE NAME>\", \"targetRegion\": \"<YOUR REGION>\", \"duration\": \"PT10M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/SSM-DynamoDB-Automation-Role\"}"
+      },
+      "targets": {}
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/FIS-DynamoDB-Role",
+  "experimentOptions": {
+    "emptyTargetResolutionMode": "skip"
+  }
+}
