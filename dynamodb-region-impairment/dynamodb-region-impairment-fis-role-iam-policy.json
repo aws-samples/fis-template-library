@@ -6,12 +6,13 @@
             "Action": [
                 "dynamodb:PauseReplication",
                 "dynamodb:ResumeReplication",
+                "dynamodb:PutResourcePolicy",
+                "dynamodb:DeleteResourcePolicy",
+                "dynamodb:GetResourcePolicy",
                 "dynamodb:DescribeTable",
                 "dynamodb:ListTagsOfResource",
                 "dynamodb:ListTables",
-                "dynamodb:PutResourcePolicy",
-                "dynamodb:DeleteResourcePolicy",
-                "dynamodb:GetResourcePolicy"
+                "tag:GetResources"
             ],
             "Resource": "*"
         },
@@ -30,13 +31,6 @@
                 "iam:PassRole"
             ],
             "Resource": "arn:aws:iam::*:role/*SSM*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "tag:GetResources"
-            ],
-            "Resource": "*"
         }
     ]
 }
