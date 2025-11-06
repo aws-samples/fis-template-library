@@ -1,0 +1,36 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:PauseReplication",
+                "dynamodb:ResumeReplication",
+                "dynamodb:PutResourcePolicy",
+                "dynamodb:DeleteResourcePolicy",
+                "dynamodb:GetResourcePolicy",
+                "dynamodb:DescribeTable",
+                "dynamodb:ListTagsOfResource",
+                "dynamodb:ListTables",
+                "tag:GetResources"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ssm:StartAutomationExecution",
+                "ssm:GetAutomationExecution",
+                "ssm:StopAutomationExecution"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:PassRole"
+            ],
+            "Resource": "arn:aws:iam::*:role/*SSM*"
+        }
+    ]
+}
