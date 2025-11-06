@@ -1,0 +1,58 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAcl",
+        "ec2:CreateNetworkAclEntry",
+        "ec2:CreateTags",
+        "ec2:DeleteNetworkAcl",
+        "ec2:DescribeNetworkAcls",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs",
+        "ec2:ReplaceNetworkAclAssociation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAclEntry"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/managedByFIS": "true"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DeleteNetworkAcl"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/managedByFIS": "true"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PauseReplication",
+        "dynamodb:ResumeReplication",
+        "dynamodb:PutResourcePolicy",
+        "dynamodb:DeleteResourcePolicy",
+        "dynamodb:GetResourcePolicy",
+        "dynamodb:DescribeTable",
+        "dynamodb:ListTagsOfResource",
+        "dynamodb:ListTables",
+        "tag:GetResources"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

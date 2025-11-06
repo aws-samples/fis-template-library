@@ -1,0 +1,51 @@
+{
+  "description": "Block DynamoDB traffic at the network level and pause global table replication to simulate complete regional DynamoDB failure",
+  "targets": {
+    "subnets": {
+      "resourceType": "aws:ec2:subnet",
+      "resourceTags": {
+        "FIS-Ready": "True"
+      },
+      "selectionMode": "ALL"
+    },
+    "dynamodbTables": {
+      "resourceType": "aws:dynamodb:global-table",
+      "resourceTags": {
+        "FIS-Ready": "True"
+      },
+      "selectionMode": "ALL"
+    }
+  },
+  "actions": {
+    "blockDynamoDBTraffic": {
+      "actionId": "aws:network:disrupt-connectivity",
+      "description": "Block DynamoDB traffic from target subnets",
+      "parameters": {
+        "scope": "dynamodb",
+        "duration": "PT10M"
+      },
+      "targets": {
+        "Subnets": "subnets"
+      }
+    },
+    "pauseReplication": {
+      "actionId": "aws:dynamodb:global-table-pause-replication",
+      "description": "Pause DynamoDB global table replication",
+      "parameters": {
+        "duration": "PT10M"
+      },
+      "targets": {
+        "Tables": "dynamodbTables"
+      }
+    }
+  },
+  "stopConditions": [
+    {
+      "source": "none"
+    }
+  ],
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/FIS-DynamoDB-Traffic-Blackhole-Role",
+  "experimentOptions": {
+    "emptyTargetResolutionMode": "skip"
+  }
+}
