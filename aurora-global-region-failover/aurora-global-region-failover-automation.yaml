@@ -1,0 +1,247 @@
+description: "Perform Aurora Global Database regional failover to test disaster recovery procedures"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  globalClusterIdentifier:
+    type: String
+    description: "Aurora Global Database cluster identifier"
+    default: ""
+  failoverType:
+    type: String
+    description: "Type of failover: 'switchover' for planned operations or 'failover' for emergency with data loss"
+    default: "switchover"
+    allowedValues:
+      - "switchover"
+      - "failover"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: waitForFISAction
+    action: aws:sleep
+    inputs:
+      Duration: PT10S
+  
+  - name: findSecondaryCluster
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: find_secondary_cluster
+      Script: |
+        import boto3
+        import json
+
+        def find_secondary_cluster(events, context):
+            global_cluster_id = events['globalClusterIdentifier']
+            
+            # Create RDS client
+            rds = boto3.client('rds')
+            
+            try:
+                # Get global cluster details
+                response = rds.describe_global_clusters(
+                    GlobalClusterIdentifier=global_cluster_id
+                )
+                
+                if not response['GlobalClusters']:
+                    raise Exception(f"Global cluster {global_cluster_id} not found")
+                
+                global_cluster = response['GlobalClusters'][0]
+                
+                # Find primary and secondary clusters
+                primary_cluster = None
+                secondary_clusters = []
+                
+                for member in global_cluster['GlobalClusterMembers']:
+                    if member['IsWriter']:
+                        primary_cluster = member['DBClusterArn']
+                    else:
+                        secondary_clusters.append(member['DBClusterArn'])
+                
+                if not primary_cluster:
+                    raise Exception("No primary cluster found in global cluster")
+                
+                if not secondary_clusters:
+                    raise Exception("No secondary clusters found in global cluster")
+                
+                # Use first secondary cluster as target
+                target_cluster_arn = secondary_clusters[0]
+                
+                print(f"Global cluster status: {global_cluster['Status']}")
+                print(f"Current primary: {primary_cluster}")
+                print(f"Target secondary: {target_cluster_arn}")
+                
+                return {
+                    "statusCode": 200,
+                    "globalClusterStatus": global_cluster['Status'],
+                    "primaryCluster": primary_cluster,
+                    "targetCluster": target_cluster_arn,
+                    "body": "Secondary cluster identified successfully"
+                }
+                
+            except Exception as e:
+                print(f"Error finding secondary cluster: {str(e)}")
+                raise e
+      InputPayload:
+        globalClusterIdentifier: "{{ globalClusterIdentifier }}"
+    outputs:
+      - Name: globalClusterStatus
+        Selector: $.Payload.globalClusterStatus
+        Type: String
+      - Name: primaryCluster
+        Selector: $.Payload.primaryCluster
+        Type: String
+      - Name: targetCluster
+        Selector: $.Payload.targetCluster
+        Type: String
+
+  - name: performGlobalFailover
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: perform_failover
+      Script: |
+        import boto3
+        import time
+
+        def perform_failover(events, context):
+            global_cluster_id = events['globalClusterIdentifier']
+            target_cluster_arn = events['targetCluster']
+            failover_type = events['failoverType']
+            
+            # Create RDS client
+            rds = boto3.client('rds')
+            
+            try:
+                print(f"Starting {failover_type} of global cluster {global_cluster_id} to {target_cluster_arn}")
+                
+                # Perform the failover with appropriate parameters based on type
+                if failover_type == "switchover":
+                    response = rds.failover_global_cluster(
+                        GlobalClusterIdentifier=global_cluster_id,
+                        TargetDbClusterIdentifier=target_cluster_arn,
+                        Switchover=True
+                    )
+                else:  # failover
+                    response = rds.failover_global_cluster(
+                        GlobalClusterIdentifier=global_cluster_id,
+                        TargetDbClusterIdentifier=target_cluster_arn,
+                        AllowDataLoss=True
+                    )
+                
+                print(f"{failover_type.capitalize()} initiated successfully")
+                
+                # Wait for failover to complete
+                max_wait_time = 600  # 10 minutes
+                wait_interval = 30   # 30 seconds
+                elapsed_time = 0
+                
+                while elapsed_time < max_wait_time:
+                    time.sleep(wait_interval)
+                    elapsed_time += wait_interval
+                    
+                    # Check global cluster status
+                    cluster_response = rds.describe_global_clusters(
+                        GlobalClusterIdentifier=global_cluster_id
+                    )
+                    
+                    if cluster_response['GlobalClusters']:
+                        global_cluster = cluster_response['GlobalClusters'][0]
+                        status = global_cluster['Status']
+                        
+                        print(f"Global cluster status after {elapsed_time}s: {status}")
+                        
+                        if status == 'available':
+                            # Check if target cluster is now the writer
+                            for member in global_cluster['GlobalClusterMembers']:
+                                if target_cluster_arn in member['DBClusterArn'] and member['IsWriter']:
+                                    print(f"Failover completed successfully. {target_cluster_arn} is now the primary")
+                                    return {
+                                        "statusCode": 200,
+                                        "failoverTime": elapsed_time,
+                                        "newPrimaryCluster": member['DBClusterArn'],
+                                        "body": f"Failover completed in {elapsed_time} seconds"
+                                    }
+                        elif status in ['failing-over', 'modifying', 'switching-over']:
+                            continue  # Still in progress
+                        else:
+                            raise Exception(f"Unexpected global cluster status: {status}")
+                
+                raise Exception(f"Failover did not complete within {max_wait_time} seconds")
+                
+            except Exception as e:
+                print(f"Error performing failover: {str(e)}")
+                raise e
+      InputPayload:
+        globalClusterIdentifier: "{{ globalClusterIdentifier }}"
+        targetCluster: "{{ findSecondaryCluster.targetCluster }}"
+        failoverType: "{{ failoverType }}"
+    outputs:
+      - Name: failoverTime
+        Selector: $.Payload.failoverTime
+        Type: Integer
+      - Name: newPrimaryCluster
+        Selector: $.Payload.newPrimaryCluster
+        Type: String
+
+  - name: validateFailover
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: validate_failover
+      Script: |
+        import boto3
+
+        def validate_failover(events, context):
+            global_cluster_id = events['globalClusterIdentifier']
+            target_cluster_arn = events['targetCluster']
+            
+            # Create RDS client
+            rds = boto3.client('rds')
+            
+            try:
+                # Get final global cluster state
+                response = rds.describe_global_clusters(
+                    GlobalClusterIdentifier=global_cluster_id
+                )
+                
+                global_cluster = response['GlobalClusters'][0]
+                
+                # Validate the failover results
+                writer_found = False
+                target_is_writer = False
+                
+                for member in global_cluster['GlobalClusterMembers']:
+                    if member['IsWriter']:
+                        writer_found = True
+                        if target_cluster_arn in member['DBClusterArn']:
+                            target_is_writer = True
+                            print(f"SUCCESS: {target_cluster_arn} is now the primary writer")
+                        else:
+                            print(f"WARNING: Different cluster is the writer: {member['DBClusterArn']}")
+                
+                if not writer_found:
+                    raise Exception("No writer cluster found in global cluster")
+                
+                if not target_is_writer:
+                    raise Exception(f"Target cluster {target_cluster_arn} is not the writer")
+                
+                return {
+                    "statusCode": 200,
+                    "validationResult": "SUCCESS",
+                    "globalClusterStatus": global_cluster['Status'],
+                    "body": "Failover validation completed successfully"
+                }
+                
+            except Exception as e:
+                print(f"Error validating failover: {str(e)}")
+                raise e
+      InputPayload:
+        globalClusterIdentifier: "{{ globalClusterIdentifier }}"
+        targetCluster: "{{ findSecondaryCluster.targetCluster }}"
+    outputs:
+      - Name: validationResult
+        Selector: $.Payload.validationResult
+        Type: String

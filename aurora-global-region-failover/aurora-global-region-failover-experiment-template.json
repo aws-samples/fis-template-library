@@ -1,0 +1,27 @@
+{
+    "description": "Aurora Global Database regional failover experiment using SSM automation to test disaster recovery procedures and measure RTO/RPO",
+    "targets": {},
+    "actions": {
+        "aurora-global-failover": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<REGION>:<ACCOUNT>:document/aurora-global-region-failover-automation",
+                "documentParameters": "{\"globalClusterIdentifier\": \"<GLOBAL-CLUSTER-ID>\", \"failoverType\": \"switchover\", \"AutomationAssumeRole\": \"arn:aws:iam::<ACCOUNT>:role/<SSM-AUTOMATION-ROLE>\"}",
+                "maxDuration": "PT10M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<ACCOUNT>:role/<FIS-ROLE>",
+    "tags": {
+        "Name": "aurora-global-region-failover"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}
