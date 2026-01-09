@@ -1,0 +1,37 @@
+{
+    "description": "direct-connect-virtual-interface-disconnect",
+    "targets": {
+        "DirectConnectVirtualInterfaces-Target-1": {
+            "resourceType": "aws:directconnect:virtual-interface",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "selectionMode": "COUNT(1)"
+        }
+    },
+    "actions": {
+        "direct-connect-virtual-interface-down": {
+            "actionId": "aws:directconnect:virtual-interface-disconnect",
+            "parameters": {
+                "duration": "PT10M"
+            },
+            "targets": {
+                "VirtualInterfaces": "DirectConnectVirtualInterfaces-Target-1"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR_AWS_ACCOUNT>:role/<YOUR_ROLE_NAME>",
+    "tags": {
+        "ExperimentType": "DirectConnectFailover",
+        "Environment": "Test"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

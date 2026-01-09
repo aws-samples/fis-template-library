@@ -1,0 +1,50 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "directconnect:DescribeVirtualInterfaces",
+                "directconnect:StartBgpFailoverTest",
+                "directconnect:ListVirtualInterfaceTestHistory",
+                "directconnect:StopBgpFailoverTest"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "tag:GetResources"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:DescribeAlarms"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
