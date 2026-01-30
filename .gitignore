@@ -6,6 +6,7 @@ node_modules
 .vscode
 samconfig.toml
 .DS_Store
+.kiro
 
 # CDK asset staging directory
 .cdk.staging
