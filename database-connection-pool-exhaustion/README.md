@@ -109,9 +109,12 @@ The experiment requires the following parameters:
 ### Database Configuration
 - **DatabaseEngine**: `postgres`, `mysql`, or `sqlserver` (default: `postgres`)
 - **DatabaseEndpoint**: Database DNS hostname or endpoint
-- **DatabasePort**: Database port
+- **DatabasePort**: Database port (default: 5432 for PostgreSQL, use 3306 for MySQL, 1433 for SQL Server)
 - **DatabaseName**: Database name to connect to
-- **DatabaseUser**: Database username
+  - PostgreSQL: `postgres` (default system database)
+  - MySQL: `mysql` (default system database)
+  - SQL Server: `master` (default system database)
+- **DatabaseUser**: Database username (default: `postgres`)
 - **DatabasePasswordSecretArn**: ARN of Secrets Manager secret containing password
   - **Note** Since we don't know the ARN of your secret ahead of time, the [sample ssm automation role ](aurora-postgres-connection-pool-exhaustion-ssm-automation-role-iam-policy.json) is given read access to all secrets, you should probably scope this down accordingly.
 

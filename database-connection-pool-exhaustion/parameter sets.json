@@ -1,0 +1,5 @@
+{"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.xyz", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-00", "VpcId": "vpc-047", "DatabaseSecurityGroupId": "sg-0b0", "InstanceType": "t3.small"}
+
+
+
+{"DatabaseEngine": "sqlserver", "DatabaseEndpoint": "database-1.xyz", "DatabasePort": 1433, "DatabaseName": "master", "DatabaseUser": "admin", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-00", "VpcId": "vpc-047", "DatabaseSecurityGroupId": "sg-0b0", "InstanceType": "t3.small"}

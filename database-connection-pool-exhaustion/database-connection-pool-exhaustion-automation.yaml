@@ -23,7 +23,7 @@ parameters:
   
   DatabaseName:
     type: String
-    description: 'Database name to connect to'
+    description: 'Database name to connect to (postgres: postgres, mysql: mysql, sqlserver: master)'
     default: 'postgres'
   
   DatabaseUser:
