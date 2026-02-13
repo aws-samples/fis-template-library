@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deploy Database Connection Pool Exhaustion FIS Experiment
+Deploy Database Connection Limit Exhaustion FIS Experiment
 
 This script creates all required AWS resources in the correct order:
 1. IAM roles and policies
@@ -212,7 +212,7 @@ class ExperimentDeployer:
         print(f"Processing SSM Document: {self.ssm_document_name}")
         print(f"{'='*60}")
         
-        content = self.load_yaml_file('database-connection-pool-exhaustion-automation.yaml')
+        content = self.load_yaml_file('database-connection-limit-exhaustion-automation.yaml')
         content = self.replace_placeholders(content)
         
         try:
@@ -259,7 +259,7 @@ class ExperimentDeployer:
         print(f"Processing FIS Experiment Template")
         print(f"{'='*60}")
         
-        template = self.load_json_file('database-connection-pool-exhaustion-experiment-template.json')
+        template = self.load_json_file('database-connection-limit-exhaustion-experiment-template.json')
         template = self.replace_placeholders(template)
         
         # Update role ARN
@@ -287,15 +287,20 @@ class ExperimentDeployer:
                 
                 # Update existing template
                 try:
-                    response = self.fis_client.update_experiment_template(
-                        id=existing_template,
-                        description=template['description'],
-                        stopConditions=template['stopConditions'],
-                        targets=template.get('targets', {}),
-                        actions=template['actions'],
-                        roleArn=template['roleArn'],
-                        logConfiguration=template.get('logConfiguration', {})
-                    )
+                    update_params = {
+                        'id': existing_template,
+                        'description': template['description'],
+                        'stopConditions': template['stopConditions'],
+                        'targets': template.get('targets', {}),
+                        'actions': template['actions'],
+                        'roleArn': template['roleArn']
+                    }
+                    
+                    # Only include logConfiguration if it exists and is not empty
+                    if template.get('logConfiguration'):
+                        update_params['logConfiguration'] = template['logConfiguration']
+                    
+                    response = self.fis_client.update_experiment_template(**update_params)
                     print(f"✓ Successfully updated FIS experiment template: {existing_template}")
                     return existing_template
                 except ClientError as e:
@@ -310,17 +315,22 @@ class ExperimentDeployer:
             pass
         
         # Create new template
-        response = self.fis_client.create_experiment_template(
-            clientToken=f"deploy-{int(time.time())}",
-            description=template['description'],
-            stopConditions=template['stopConditions'],
-            targets=template.get('targets', {}),
-            actions=template['actions'],
-            roleArn=template['roleArn'],
-            tags=template['tags'],
-            logConfiguration=template.get('logConfiguration', {}),
-            experimentOptions=template.get('experimentOptions', {})
-        )
+        create_params = {
+            'clientToken': f"deploy-{int(time.time())}",
+            'description': template['description'],
+            'stopConditions': template['stopConditions'],
+            'targets': template.get('targets', {}),
+            'actions': template['actions'],
+            'roleArn': template['roleArn'],
+            'tags': template['tags'],
+            'experimentOptions': template.get('experimentOptions', {})
+        }
+        
+        # Only include logConfiguration if it exists and is not empty
+        if template.get('logConfiguration'):
+            create_params['logConfiguration'] = template['logConfiguration']
+        
+        response = self.fis_client.create_experiment_template(**create_params)
         
         template_id = response['experimentTemplate']['id']
         print(f"✓ Created FIS experiment template: {template_id}")
@@ -329,7 +339,7 @@ class ExperimentDeployer:
     def deploy(self):
         """Deploy all resources in correct order"""
         print("\n" + "="*60)
-        print("Database Connection Pool Exhaustion - Deployment")
+        print("Database Connection Limit Exhaustion - Deployment")
         print("="*60)
         print(f"Region: {self.region}")
         print(f"Account: {self.account_id}")
@@ -342,14 +352,14 @@ class ExperimentDeployer:
             self.create_or_update_role(
                 self.fis_role_name,
                 'fis-iam-trust-relationship.json',
-                'database-connection-pool-exhaustion-fis-role-iam-policy.json',
-                'Role for FIS to execute connection pool exhaustion experiments'
+                'database-connection-limit-exhaustion-fis-role-iam-policy.json',
+                'Role for FIS to execute connection limit exhaustion experiments'
             )
             
             self.create_or_update_role(
                 self.ssm_role_name,
                 'ssm-iam-trust-relationship.json',
-                'database-connection-pool-exhaustion-ssm-automation-role-iam-policy.json',
+                'database-connection-limit-exhaustion-ssm-automation-role-iam-policy.json',
                 'Role for SSM automation to manage EC2 instances and execute commands'
             )
             
@@ -403,7 +413,7 @@ class ExperimentDeployer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Deploy Database Connection Pool Exhaustion FIS Experiment',
+        description='Deploy Database Connection Limit Exhaustion FIS Experiment',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

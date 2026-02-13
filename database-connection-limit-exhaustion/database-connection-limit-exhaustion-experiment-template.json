@@ -1,10 +1,10 @@
 {
-    "description": "Database Connection Pool Exhaustion - Creates ephemeral load generator to exhaust database connections",
+    "description": "Database Connection Limit Exhaustion - Creates ephemeral load generator to exhaust database connections",
     "targets": {},
     "actions": {
         "ExhaustConnectionPool": {
             "actionId": "aws:ssm:start-automation-execution",
-            "description": "Exhaust database connection pool",
+            "description": "Exhaust database connection limit",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ConnectionPoolExhaustion-Automation",
                 "documentParameters": "{\"DatabaseEngine\":\"postgres\",\"DatabaseEndpoint\":\"<YOUR DATABASE ENDPOINT>\",\"DatabasePort\":\"5432\",\"DatabaseName\":\"postgres\",\"DatabaseUser\":\"postgres\",\"DatabasePasswordSecretArn\":\"<YOUR SECRET ARN>\",\"MaxConnections\":\"1000\",\"ExperimentDuration\":\"PT30M\",\"RampTime\":\"PT15M\",\"RampSteps\":\"15\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"DatabaseSecurityGroupId\":\"<YOUR DATABASE SECURITY GROUP ID>\",\"InstanceType\":\"t3.small\"}",
@@ -19,7 +19,7 @@
     ],
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/ConnectionPoolExhaustion-FIS-Role",
     "tags": {
-        "Name": "Database-Connection-Pool-Exhaustion",
+        "Name": "Database-connection-limit-Exhaustion",
         "ExperimentType": "ConnectionPoolExhaustion",
         "DatabaseEngine": "postgres"
     },

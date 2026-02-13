@@ -1,5 +1,5 @@
 schemaVersion: '0.3'
-description: 'Create ephemeral load generator to exhaust database connection pool'
+description: 'Create ephemeral load generator to exhaust database connection limit'
 assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/ConnectionPoolExhaustion-SSM-Automation-Role'
 
 parameters:
@@ -85,7 +85,7 @@ mainSteps:
       Service: ec2
       Api: CreateSecurityGroup
       GroupName: 'FIS-ConnectionPool-LoadGen-{{ automation:EXECUTION_ID }}'
-      Description: 'Temporary security group for FIS connection pool exhaustion experiment'
+      Description: 'Temporary security group for FIS connection limit exhaustion experiment'
       VpcId: '{{ VpcId }}'
       TagSpecifications:
         - ResourceType: 'security-group'
@@ -278,7 +278,7 @@ mainSteps:
             #!/bin/bash
             set -e
             
-            # Create Python script for connection pool exhaustion
+            # Create Python script for connection limit exhaustion
             cat > /tmp/exhaust_pool.py << 'PYTHON_EOF'
             import sys
             import time
@@ -416,7 +416,7 @@ mainSteps:
                 experiment_duration = parse_iso8601_duration(experiment_duration_iso)
                 ramp_time = parse_iso8601_duration(ramp_time_iso)
                 
-                print("=== Connection Pool Exhaustion Test ===")
+                print("=== Connection Limit Exhaustion Test ===")
                 print(f"Engine: {engine}")
                 print(f"Endpoint: {endpoint}:{port}")
                 print(f"Database: {dbname}")
@@ -542,7 +542,7 @@ mainSteps:
                 
                 if remaining > 0:
                     print(f"Waiting for experiment to complete ({remaining:.0f}s remaining)...")
-                    print("Connection pool should now be exhausted")
+                    print("Connection limit should now be exhausted")
                     time.sleep(remaining)
                 else:
                     print("Experiment duration reached")

@@ -6,14 +6,14 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Example Hypothesis
 
-When the Redis primary node fails over to a replica, applications should detect the failover and reconnect to the new primary within 30 seconds. Connection pooling should handle the DNS endpoint changes gracefully, and no data should be lost during the transition. Application performance should return to normal within 60 seconds of failover completion.
+When the Redis primary node fails over to a replica, applications should detect the failover and reconnect to the new primary within 30 seconds. Connection limiting should handle the DNS endpoint changes gracefully, and no data should be lost during the transition. Application performance should return to normal within 60 seconds of failover completion.
 
 ### What does this enable me to verify?
 
 * Appropriate Redis connection monitoring and observability is in place (were you able to detect the failover?)
 * Alarms are configured correctly for primary node changes (were the right people notified?)
 * Your application handles Redis primary node changes gracefully
-* Connection pooling and DNS resolution work correctly during failover
+* Connection limiting and DNS resolution work correctly during failover
 * Recovery controls and reconnection logic work as expected
 
 ## Prerequisites
@@ -69,7 +69,7 @@ As you adapt this scenario to your needs, we recommend:
 3. Creating Amazon CloudWatch metrics and alarms to monitor Redis failover impact.
 4. Adding stop conditions tied to critical business metrics to automatically halt the experiment if needed.
 5. Implementing appropriate connection retry logic in your application to handle primary node changes.
-6. Testing your application's Redis connection pooling and DNS resolution during failover scenarios.
+6. Testing your application's Redis connection limiting and DNS resolution during failover scenarios.
 7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
 
 ## Import Experiment

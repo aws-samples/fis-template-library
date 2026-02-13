@@ -1,4 +1,4 @@
-# AWS Fault Injection Service Experiment: Database Connection Pool Exhaustion
+# AWS Fault Injection Service Experiment: Database Connection Limit Exhaustion
 
 This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
@@ -9,13 +9,13 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Example Hypotheses
 
-When the {service1} database connection pool is approaching it's limit, users of {workload} should be able to complete the {service1} user journey within the SLA of 2 seconds and other critical user journeys relating to {workload} {service2} and {service3} should continue unaffected. The {service1} circuit breaker should remain closed allowing additional connections to the database. The steady state of {n} transactions per second should be maintained. A leading alarm should be raised and the DevOps team notified within {y} minutes. The database status report should run automatically providing the DevOps team with insight into database connection usage. 
+When the {service1} database connection value is approaching it's limit, users of {workload} should be able to complete the {service1} user journey within the SLA of 2 seconds and other critical user journeys relating to {workload} {service2} and {service3} should continue unaffected. The {service1} circuit breaker should remain closed allowing additional connections to the database. The steady state of {n} transactions per second should be maintained. A leading alarm should be raised and the DevOps team notified within {y} minutes. The database status report should run automatically providing the DevOps team with insight into database connection usage. 
 
-When the {service1} database connection pool is exhausted, the {workload} {service1} circuit breaker should open resulting in users of {workload} being unable to complete the {service1} user journey. The {workload} UI should degrade gracefully and users should not be able to interact with the {service1} section of UI, thus preventing new connections to the {service1} database being created. An alarm should be raised and the DevOps team notified within {y} minutes. Other critical user journeys relating to {workload} {service2} and {service3} should continue unaffected. Once the {service1} database connection pool is drained, the {workload} {service1} circuit breaker should close with {z} minutes. Users should be able to commence interacting with the {service1} section of the UI and the steady of {n} transactions per second should resume.
+When the {service1} database connection limit is exhausted, the {workload} {service1} circuit breaker should open resulting in users of {workload} being unable to complete the {service1} user journey. The {workload} UI should degrade gracefully and users should not be able to interact with the {service1} section of UI, thus preventing new connections to the {service1} database being created. An alarm should be raised and the DevOps team notified within {y} minutes. Other critical user journeys relating to {workload} {service2} and {service3} should continue unaffected. Once the {service1} database connections are drained, the {workload} {service1} circuit breaker should close with {z} minutes. Users should be able to commence interacting with the {service1} section of the UI and the steady of {n} transactions per second should resume.
 
 ### What does this enable me to verify?
 
-* Appropriate customer experience metrics and observability of your database is in place (were you able to detect there was an impending issue as the database connection pool filled and once the database connection pool was full?)
+* Appropriate customer experience metrics and observability of your database is in place (were you able to detect there was an impending issue as the database connection limit approached and once the database connection limit was full?)
 * Alarms are configured correctly (were the right people notified at the right time and/or automations triggered?)
 * Your app gracefully degrades and customers aren't submitting transactions which you know will fail
 * Your circuit breaker (if any) works as expected
@@ -23,11 +23,11 @@ When the {service1} database connection pool is exhausted, the {workload} {servi
 
 ## Description
 
-This experiment tests your application's resilience to database connection pool exhaustion by:
+This experiment tests your application's resilience to database connection limit exhaustion by:
 
 1. **Dynamically creating** an ephemeral EC2 instance as a load generator
 2. **Bootstrapping** the instance with the appropriate database client (PostgreSQL, MySQL, or SQL Server)
-3. **Opening and holding** connections to exhaust the database connection pool
+3. **Opening and holding** connections to exhaust the database connection limit
 4. **Cleaning up** by releasing connections and terminating the load generator instance
 
 The experiment is **parameterized by database engine**, making it reusable across:
@@ -92,7 +92,7 @@ python deploy.py --region us-east-1 --account-id 123456789012
 Or 
 
 1. **Experiment template**:
-   - Import the FIS experiment template (`database-connection-pool-exhaustion-experiment-template.json`) into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+   - Import the FIS experiment template (`database-connection-limit-exhaustion-experiment-template.json`) into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
 
 2. **IAM Roles**: Create the following IAM roles in your account using the sample policies provided:
    - FIS execution role with permissions to start SSM automation
@@ -100,7 +100,7 @@ Or
    - EC2 instance profile with SSM managed instance permissions
 
 3. **SSM Document**:
-   - Deploy the SSM automation document (`database-connection-pool-exhaustion-automation.yaml`) to your account
+   - Deploy the SSM automation document (`database-connection-limit-exhaustion-automation.yaml`) to your account
 
 ## Parameters
 
@@ -116,7 +116,7 @@ The experiment requires the following parameters:
   - SQL Server: `master` (default system database)
 - **DatabaseUser**: Database username (default: `postgres`)
 - **DatabasePasswordSecretArn**: ARN of Secrets Manager secret containing password
-  - **Note** Since we don't know the ARN of your secret ahead of time, the [sample ssm automation role ](aurora-postgres-connection-pool-exhaustion-ssm-automation-role-iam-policy.json) is given read access to all secrets, you should probably scope this down accordingly.
+  - **Note** Since we don't know the ARN of your secret ahead of time, the [sample ssm automation role ](aurora-postgres-connection-limit-exhaustion-ssm-automation-role-iam-policy.json) is given read access to all secrets, you should probably scope this down accordingly.
 
 ### Connection Settings
 - **MaxConnections**: Number of connections to open (default: 1000)
@@ -136,7 +136,7 @@ The experiment requires the following parameters:
 - Once the FIS Experiment template is deployed in your account, you will need to update the template by editing the Document parameters in the console or via the API to set appropriate parameters for your desired database target and environment
 - To update via the console:
   1. Open the FIS Console
-  2. Select the experiment template "Database-Connection-Pool-Exhaustion"
+  2. Select the experiment template "Database-connection-limit-Exhaustion"
   3. Select **Actions / Update Experiment Template**
   4. Select the **ExhaustConnectionPool** Action
   5. Update the Document parameters e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx-yyyy-zzzz", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-1234-abcdef", "VpcId": "vpc-1234567abcd", "DatabaseSecurityGroupId": "sg-1234567abcd", "InstanceType": "t3.small"}
@@ -211,7 +211,7 @@ As you adapt this scenario to your needs, we recommend:
    SHOW STATUS LIKE 'Threads_connected';
    ```
 4. **Implement Safeguards**: Ensure your application has:
-   - Connection pooling with max pool size limits
+   - Connection limiting with max pool size limits
    - Connection timeout configurations
    - Retry logic with exponential backoff
    - Circuit breakers for database calls
