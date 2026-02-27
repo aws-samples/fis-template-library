@@ -89,7 +89,7 @@ You can build all the experiment resources by executing the provided deploy.py s
 ```
 python deploy.py --region us-east-1 --account-id 123456789012
 ```
-Or 
+**Or** 
 
 1. **Experiment template**:
    - Import the FIS experiment template (`database-connection-limit-exhaustion-experiment-template.json`) into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
@@ -133,13 +133,13 @@ The experiment requires the following parameters:
 - **LatestAmiId**: Amazon Linux 2023 AMI ID (uses SSM parameter by default)
 
 ## Executing the Experiment
-- Once the FIS Experiment template is deployed in your account, you will need to update the template by editing the Document parameters in the console or via the API to set appropriate parameters for your desired database target and environment
+- Once the FIS Experiment template is deployed in your account, you will need to **update the experiment template** by editing it in the console or via the API to set appropriate parameters for your desired database target and environment
 - To update via the console:
   1. Open the FIS Console
   2. Select the experiment template "Database-connection-limit-Exhaustion"
   3. Select **Actions / Update Experiment Template**
   4. Select the **ExhaustConnectionLimit** Action
-  5. Update the Document parameters e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx-yyyy-zzzz", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-1234-abcdef", "VpcId": "vpc-1234567abcd", "DatabaseSecurityGroupId": "sg-1234567abcd", "InstanceType": "t3.small"}
+  5. Update the **Document parameters** to match your target e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx-yyyy-zzzz", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-1234-abcdef", "VpcId": "vpc-1234567abcd", "DatabaseSecurityGroupId": "sg-1234567abcd", "InstanceType": "t3.small"}
   6. **Note** there is no target defined in the FIS experiment template since this is managed through the SSM Automation document and the Document parameters you just entered
   7. Select **Save** and then **Update experiment template**
   8. You can now **Start experiment**
