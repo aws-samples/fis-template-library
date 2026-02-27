@@ -10,7 +10,7 @@
                 "ssm:StopAutomationExecution"
             ],
             "Resource": [
-                "arn:aws:ssm:*:*:automation-definition/ConnectionPoolExhaustion-Automation:*",
+                "arn:aws:ssm:*:*:automation-definition/ConnectionLimitExhaustion-Automation:*",
                 "arn:aws:ssm:*:*:automation-execution/*"
             ]
         },
@@ -18,7 +18,7 @@
             "Sid": "AllowPassRoleToSSM",
             "Effect": "Allow",
             "Action": "iam:PassRole",
-            "Resource": "arn:aws:iam::*:role/ConnectionPoolExhaustion-SSM-Automation-Role",
+            "Resource": "arn:aws:iam::*:role/ConnectionLimitExhaustion-SSM-Automation-Role",
             "Condition": {
                 "StringEquals": {
                     "iam:PassedToService": "ssm.amazonaws.com"

@@ -1,6 +1,6 @@
 schemaVersion: '0.3'
 description: 'Create ephemeral load generator to exhaust database connection limit'
-assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/ConnectionPoolExhaustion-SSM-Automation-Role'
+assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/ConnectionLimitExhaustion-SSM-Automation-Role'
 
 parameters:
   DatabaseEngine:
@@ -84,16 +84,16 @@ mainSteps:
     inputs:
       Service: ec2
       Api: CreateSecurityGroup
-      GroupName: 'FIS-ConnectionPool-LoadGen-{{ automation:EXECUTION_ID }}'
+      GroupName: 'FIS-ConnectionLimit-LoadGen-{{ automation:EXECUTION_ID }}'
       Description: 'Temporary security group for FIS connection limit exhaustion experiment'
       VpcId: '{{ VpcId }}'
       TagSpecifications:
         - ResourceType: 'security-group'
           Tags:
             - Key: 'Name'
-              Value: 'FIS-ConnectionPool-LoadGenerator'
+              Value: 'FIS-ConnectionLimit-LoadGenerator'
             - Key: 'FIS-Experiment'
-              Value: 'ConnectionPoolExhaustion'
+              Value: 'ConnectionLimitExhaustion'
             - Key: 'AutoCleanup'
               Value: 'true'
             - Key: 'ManagedBy'
@@ -189,9 +189,9 @@ mainSteps:
         - ResourceType: 'instance'
           Tags:
             - Key: 'Name'
-              Value: 'FIS-ConnectionPool-LoadGenerator'
+              Value: 'FIS-ConnectionLimit-LoadGenerator'
             - Key: 'FIS-Experiment'
-              Value: 'ConnectionPoolExhaustion'
+              Value: 'ConnectionLimitExhaustion'
             - Key: 'AutoCleanup'
               Value: 'true'
             - Key: 'ManagedBy'
@@ -240,8 +240,8 @@ mainSteps:
                 echo "PostgreSQL client installed"
                 
             elif [ "$ENGINE" = "mysql" ]; then
-                # Install MySQL client and Python MySQL library
-                dnf install -y mysql python3-pip
+                # Install MariaDB client (MySQL-compatible) and Python MySQL library
+                dnf install -y mariadb105 python3-pip
                 pip3 install mysql-connector-python
                 echo "MySQL client installed"
                 
@@ -264,7 +264,7 @@ mainSteps:
             
             echo "Installation complete"
 
-  - name: ExhaustConnectionPool
+  - name: ExhaustConnectionLimit
     action: 'aws:runCommand'
     onFailure: 'step:TerminateInstance'
     inputs:

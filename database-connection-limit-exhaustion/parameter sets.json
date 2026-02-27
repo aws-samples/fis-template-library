@@ -3,3 +3,6 @@
 
 
 {"DatabaseEngine": "sqlserver", "DatabaseEndpoint": "database-1.xyz", "DatabasePort": 1433, "DatabaseName": "master", "DatabaseUser": "admin", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-00", "VpcId": "vpc-047", "DatabaseSecurityGroupId": "sg-0b0", "InstanceType": "t3.small"}
+
+
+{"DatabaseEngine": "mysql", "DatabaseEndpoint": "database-2.xyz", "DatabasePort": 3306, "DatabaseName": "mysql", "DatabaseUser": "admin", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-09", "VpcId": "vpc-047", "DatabaseSecurityGroupId": "sg-0b09", "InstanceType": "t3.small"}

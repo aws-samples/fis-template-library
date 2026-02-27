@@ -138,7 +138,7 @@ The experiment requires the following parameters:
   1. Open the FIS Console
   2. Select the experiment template "Database-connection-limit-Exhaustion"
   3. Select **Actions / Update Experiment Template**
-  4. Select the **ExhaustConnectionPool** Action
+  4. Select the **ExhaustConnectionLimit** Action
   5. Update the Document parameters e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx-yyyy-zzzz", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-1234-abcdef", "VpcId": "vpc-1234567abcd", "DatabaseSecurityGroupId": "sg-1234567abcd", "InstanceType": "t3.small"}
   6. **Note** there is no target defined in the FIS experiment template since this is managed through the SSM Automation document and the Document parameters you just entered
   7. Select **Save** and then **Update experiment template**
@@ -147,11 +147,11 @@ The experiment requires the following parameters:
 ## How It Works
 
 ### Phase 1: Infrastructure Creation (2-3 minutes)
-1. Creates a temporary security group in your VPC with name `FIS-ConnectionPool-LoadGen-<execution-id>`
+1. Creates a temporary security group in your VPC with name `FIS-ConnectionLimit-LoadGen-<execution-id>`
 2. Adds egress rule allowing traffic from load generator to database port
 3. Adds ingress rule to database security group allowing traffic from load generator
 4. Launches an EC2 instance in your specified subnet with the new security group
-5. Instance is tagged with `FIS-Experiment=ConnectionPoolExhaustion` and `AutoCleanup=true`
+5. Instance is tagged with `FIS-Experiment=ConnectionLimitExhaustion` and `AutoCleanup=true`
 6. Waits for SSM Agent to report online status
 
 ### Phase 2: Bootstrap (1-2 minutes)

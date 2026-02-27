@@ -41,11 +41,11 @@ class ExperimentDeployer:
         self.base_path = Path(__file__).parent
         
         # Resource names
-        self.fis_role_name = 'ConnectionPoolExhaustion-FIS-Role'
-        self.ssm_role_name = 'ConnectionPoolExhaustion-SSM-Automation-Role'
+        self.fis_role_name = 'ConnectionLimitExhaustion-FIS-Role'
+        self.ssm_role_name = 'ConnectionLimitExhaustion-SSM-Automation-Role'
         self.instance_profile_name = 'SSM-Managed-Instance-Profile'
         self.instance_role_name = 'SSM-Managed-Instance-Profile-Role'
-        self.ssm_document_name = 'ConnectionPoolExhaustion-Automation'
+        self.ssm_document_name = 'ConnectionLimitExhaustion-Automation'
         
     def load_json_file(self, filename):
         """Load and parse JSON file"""
