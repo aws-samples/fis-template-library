@@ -9,9 +9,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Example Hypotheses
 
-When the {service1} database connection value is approaching it's limit, users of {workload} should be able to complete the {service1} user journey within the SLA of 2 seconds and other critical user journeys relating to {workload} {service2} and {service3} should continue unaffected. The {service1} circuit breaker should remain closed allowing additional connections to the database. The steady state of {n} transactions per second should be maintained. A leading alarm should be raised and the DevOps team notified within {y} minutes. The database status report should run automatically providing the DevOps team with insight into database connection usage. 
+When the {service1} database connection value is approaching it's limit, users of {workload} should be able to complete the {service1} user journey within the SLA of 2 seconds and other critical user journeys relating to {workload}; {service2} and {service3} should continue unaffected. The {service1} circuit breaker should remain closed allowing additional connections to the database. The steady state of {n} transactions per second should be maintained. A leading alarm should be raised and the DevOps team notified within {y} minutes. The database status report should run automatically providing the DevOps team with insight into database connection usage. 
 
-When the {service1} database connection limit is exhausted, the {workload} {service1} circuit breaker should open resulting in users of {workload} being unable to complete the {service1} user journey. The {workload} UI should degrade gracefully and users should not be able to interact with the {service1} section of UI, thus preventing new connections to the {service1} database being created. An alarm should be raised and the DevOps team notified within {y} minutes. Other critical user journeys relating to {workload} {service2} and {service3} should continue unaffected. Once the {service1} database connections are drained, the {workload} {service1} circuit breaker should close with {z} minutes. Users should be able to commence interacting with the {service1} section of the UI and the steady of {n} transactions per second should resume.
+When the {service1} database connection limit is exhausted, the {workload} {service1} circuit breaker should open resulting in users of {workload} being unable to complete the {service1} user journey. The {workload} UI should degrade gracefully and users should not be able to interact with the {service1} section of UI, thus preventing new connections to the {service1} database being created. An alarm should be raised and the DevOps team notified within {y} minutes. Other critical user journeys relating to {workload}; {service2} and {service3} should continue unaffected. Once the {service1} database connections are drained, the {workload} {service1} circuit breaker should close with {z} minutes. Users should be able to commence interacting with the {service1} section of the UI and the steady of {n} transactions per second should resume.
 
 ### What does this enable me to verify?
 
@@ -30,12 +30,16 @@ This experiment tests your application's resilience to database connection limit
 3. **Opening and holding** connections to exhaust the database connection limit
 4. **Cleaning up** by releasing connections and terminating the load generator instance
 
-The experiment is **parameterized by database engine**, making it reusable across:
+The experiment is **parameterized by database engine**, making it reusable across engines in RDS:
 - Aurora PostgreSQL
 - Aurora MySQL
 - RDS PostgreSQL
 - RDS MySQL
 - RDS SQL Server
+
+When you run this experiment you will see the connection count metric for your RDS instance increment:
+
+![RDS console snippet showing increasing connection count](./images/connections.png "RDS console showing connection count increasing")
 
 ## Architecture Overview
 
@@ -110,7 +114,7 @@ The experiment requires the following parameters:
 - **DatabaseEngine**: `postgres`, `mysql`, or `sqlserver` (default: `postgres`)
 - **DatabaseEndpoint**: Database DNS hostname or endpoint
 - **DatabasePort**: Database port (default: 5432 for PostgreSQL, use 3306 for MySQL, 1433 for SQL Server)
-- **DatabaseName**: Database name to connect to
+- **DatabaseName**: Database name to connect to e.g.
   - PostgreSQL: `postgres` (default system database)
   - MySQL: `mysql` (default system database)
   - SQL Server: `master` (default system database)
@@ -121,7 +125,7 @@ The experiment requires the following parameters:
 ### Connection Settings
 - **MaxConnections**: Number of connections to open (default: 1000)
 - **ExperimentDuration**: Total experiment duration in ISO8601 format (default: PT10M = 10 minutes, e.g., PT1H = 1 hour, PT30M = 30 minutes)
-  - **Note** this is not the same as the FIS Experiment Template Max Duration (default 3 hours for this experiment template) which functions as overarching timeout.
+  - **Note** this is not the same as the FIS Experiment Template Max Duration (default 3 hours for this experiment template) which functions as on overarching timeout.
 - **RampTime**: Time to gradually ramp up to MaxConnections in ISO8601 format (default: PT1M = 1 minute, e.g., PT30S = 30 seconds, PT2M = 2 minutes, PT0S = immediate)
 - **RampSteps**: Number of steps to reach MaxConnections (default: 10, e.g., 2=50% then 100%, 20=5% increments)
 
@@ -129,8 +133,7 @@ The experiment requires the following parameters:
 - **SubnetId**: Subnet ID where load generator will be launched
 - **VpcId**: VPC ID where the load generator will be launched (used to create security group)
 - **DatabaseSecurityGroupId**: Security group ID of the target database (automation will add temporary ingress rule)
-- **InstanceType**: EC2 instance type (default: t3.small)
-- **LatestAmiId**: Amazon Linux 2023 AMI ID (uses SSM parameter by default)
+- **InstanceType**: EC2 instance type for Load Generator (default: t3.small - consider larger for very high connections or sustained experiments)
 
 ## Executing the Experiment
 - Once the FIS Experiment template is deployed in your account, you will need to **update the experiment template** by editing it in the console or via the API to set appropriate parameters for your desired database target and environment
@@ -140,7 +143,7 @@ The experiment requires the following parameters:
   3. Select **Actions / Update Experiment Template**
   4. Select the **ExhaustConnectionLimit** Action
   5. Update the **Document parameters** to match your target e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx-yyyy-zzzz", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-1234-abcdef", "VpcId": "vpc-1234567abcd", "DatabaseSecurityGroupId": "sg-1234567abcd", "InstanceType": "t3.small"}
-  6. **Note** there is no target defined in the FIS experiment template since this is managed through the SSM Automation document and the Document parameters you just entered
+  6. **Note** there is no target defined in the FIS experiment template since this is managed through the SSM Automation document and the Document parameters you just entered, so **do not amend the target section of the template**
   7. Select **Save** and then **Update experiment template**
   8. You can now **Start experiment**
 
@@ -158,7 +161,7 @@ The experiment requires the following parameters:
 4. Installs appropriate database client based on `DatabaseEngine` parameter
 
 ### Phase 3: Connection Exhaustion (Duration: ExperimentDuration)
-5. Retrieves database password from Secrets Manager
+5. Retrieves RDS password from Secrets Manager
 6. Validates and adjusts `RampTimeSeconds` if it exceeds `ExperimentDuration`
 7. Gradually opens connections over `RampTimeSeconds` in `RampSteps` increments:
    - Each step opens `MaxConnections / RampSteps` connections
