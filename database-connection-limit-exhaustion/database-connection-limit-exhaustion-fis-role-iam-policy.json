@@ -10,9 +10,9 @@
                 "ssm:StopAutomationExecution"
             ],
             "Resource": [
-                "arn:aws:ssm:*:*:automation-definition/ConnectionLimitExhaustion-Automation:*",
-                "arn:aws:ssm:*:*:automation-execution/*",
-                "arn:aws:ssm:*:*:document/ConnectionLimitExhaustion-Automation"
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ConnectionLimitExhaustion-Automation:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ConnectionLimitExhaustion-Automation"
             ]
         },
         {

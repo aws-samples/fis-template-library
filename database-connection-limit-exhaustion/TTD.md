@@ -1,8 +1,0 @@
-- Test with different database engines
-  - tested with Aurora PostgreSQL
-  - tested with Microsoft SQL Server
-  - ...
-- check SSM Automation cleans up successfully if experiment is stopped part way through
-- figure out if python print statements can be show in AUtomation action logs in SSM
-- test with very high connection numbers to see how many the default instance type can push out
-- ensure IAM permissions are least privilege

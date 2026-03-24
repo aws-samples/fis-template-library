@@ -19,7 +19,7 @@
     ],
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/ConnectionLimitExhaustion-FIS-Role",
     "tags": {
-        "Name": "Database-connection-limit-Exhaustion",
+        "Name": "Database-connection-limit-exhaustion",
         "ExperimentType": "ConnectionLimitExhaustion",
         "DatabaseEngine": "postgres"
     },

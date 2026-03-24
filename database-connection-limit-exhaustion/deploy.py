@@ -122,20 +122,18 @@ class ExperimentDeployer:
         print(f"\n{'='*60}")
         print(f"Processing EC2 Instance Profile: {self.instance_profile_name}")
         print(f"{'='*60}")
-        
-        # Create role for instance profile
-        trust_policy = {
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "ec2.amazonaws.com"},
-                "Action": "sts:AssumeRole"
-            }]
-        }
-        
+
+        trust_policy = self.load_json_file('ec2-iam-trust-relationship.json')
+
         try:
             self.iam_client.get_role(RoleName=self.instance_role_name)
             print(f"✓ Role '{self.instance_role_name}' already exists")
+
+            self.iam_client.update_assume_role_policy(
+                RoleName=self.instance_role_name,
+                PolicyDocument=json.dumps(trust_policy)
+            )
+            print(f"✓ Updated trust policy for '{self.instance_role_name}'")
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchEntity':
                 self.iam_client.create_role(
@@ -336,6 +334,127 @@ class ExperimentDeployer:
         print(f"✓ Created FIS experiment template: {template_id}")
         return template_id
     
+    def delete(self):
+        """Delete all resources created by this script"""
+        print("\n" + "="*60)
+        print("Database Connection Limit Exhaustion - Delete Resources")
+        print("="*60)
+        print(f"Region: {self.region}")
+        print(f"Account: {self.account_id}")
+        print("="*60)
+
+        errors = []
+
+        # Step 1: Delete FIS experiment template
+        print("\n[Step 1/4] Deleting FIS Experiment Template...")
+        try:
+            response = self.fis_client.list_experiment_templates()
+            template_id = None
+            for tmpl in response.get('experimentTemplates', []):
+                if tmpl.get('tags', {}).get('Name') == 'Database-connection-limit-exhaustion':
+                    template_id = tmpl['id']
+                    break
+            if template_id:
+                self.fis_client.delete_experiment_template(id=template_id)
+                print(f"✓ Deleted FIS template: {template_id}")
+            else:
+                print("  FIS template not found, skipping")
+        except ClientError as e:
+            msg = f"Failed to delete FIS template: {e}"
+            print(f"✗ {msg}")
+            errors.append(msg)
+
+        # Step 2: Delete SSM document
+        print("\n[Step 2/4] Deleting SSM Automation Document...")
+        try:
+            self.ssm_client.delete_document(Name=self.ssm_document_name)
+            print(f"✓ Deleted SSM document: {self.ssm_document_name}")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidDocument':
+                print("  SSM document not found, skipping")
+            else:
+                msg = f"Failed to delete SSM document: {e}"
+                print(f"✗ {msg}")
+                errors.append(msg)
+
+        # Step 3: Delete IAM roles and their policies
+        print("\n[Step 3/4] Deleting IAM Roles...")
+        for role_name in [self.fis_role_name, self.ssm_role_name]:
+            try:
+                # Delete inline policies first
+                policies = self.iam_client.list_role_policies(RoleName=role_name)
+                for policy_name in policies['PolicyNames']:
+                    self.iam_client.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+                    print(f"  ✓ Deleted inline policy '{policy_name}' from '{role_name}'")
+                # Detach managed policies
+                attached = self.iam_client.list_attached_role_policies(RoleName=role_name)
+                for policy in attached['AttachedPolicies']:
+                    self.iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy['PolicyArn'])
+                    print(f"  ✓ Detached managed policy '{policy['PolicyName']}' from '{role_name}'")
+                self.iam_client.delete_role(RoleName=role_name)
+                print(f"✓ Deleted role: {role_name}")
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchEntity':
+                    print(f"  Role '{role_name}' not found, skipping")
+                else:
+                    msg = f"Failed to delete role '{role_name}': {e}"
+                    print(f"✗ {msg}")
+                    errors.append(msg)
+
+        # Step 4: Delete instance profile and its role
+        print("\n[Step 4/4] Deleting EC2 Instance Profile...")
+        try:
+            # Remove role from profile before deleting
+            try:
+                self.iam_client.remove_role_from_instance_profile(
+                    InstanceProfileName=self.instance_profile_name,
+                    RoleName=self.instance_role_name
+                )
+                print(f"  ✓ Removed role from instance profile")
+            except ClientError as e:
+                if e.response['Error']['Code'] not in ('NoSuchEntity', 'LimitExceeded'):
+                    raise
+            self.iam_client.delete_instance_profile(InstanceProfileName=self.instance_profile_name)
+            print(f"✓ Deleted instance profile: {self.instance_profile_name}")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                print("  Instance profile not found, skipping")
+            else:
+                msg = f"Failed to delete instance profile: {e}"
+                print(f"✗ {msg}")
+                errors.append(msg)
+
+        try:
+            # Delete inline policies then the role
+            policies = self.iam_client.list_role_policies(RoleName=self.instance_role_name)
+            for policy_name in policies['PolicyNames']:
+                self.iam_client.delete_role_policy(RoleName=self.instance_role_name, PolicyName=policy_name)
+                print(f"  ✓ Deleted inline policy '{policy_name}' from '{self.instance_role_name}'")
+            attached = self.iam_client.list_attached_role_policies(RoleName=self.instance_role_name)
+            for policy in attached['AttachedPolicies']:
+                self.iam_client.detach_role_policy(RoleName=self.instance_role_name, PolicyArn=policy['PolicyArn'])
+                print(f"  ✓ Detached managed policy '{policy['PolicyName']}' from '{self.instance_role_name}'")
+            self.iam_client.delete_role(RoleName=self.instance_role_name)
+            print(f"✓ Deleted role: {self.instance_role_name}")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity':
+                print(f"  Role '{self.instance_role_name}' not found, skipping")
+            else:
+                msg = f"Failed to delete role '{self.instance_role_name}': {e}"
+                print(f"✗ {msg}")
+                errors.append(msg)
+
+        print("\n" + "="*60)
+        if errors:
+            print(f"✗ DELETE COMPLETED WITH {len(errors)} ERROR(S)")
+            for err in errors:
+                print(f"  • {err}")
+        else:
+            print("✓ DELETE SUCCESSFUL")
+        print("="*60 + "\n")
+
+        return len(errors) == 0
+
     def deploy(self):
         """Deploy all resources in correct order"""
         print("\n" + "="*60)
@@ -390,16 +509,6 @@ class ExperimentDeployer:
             print(f"  • Instance Profile: {self.instance_profile_name}")
             print(f"  • SSM Document: {self.ssm_document_name}")
             print(f"  • FIS Template: {template_id}")
-            
-            print("\nNext Steps:")
-            print("  1. Create a database password in Secrets Manager")
-            print("  2. Update the FIS template parameters with your:")
-            print("     - Database engine (postgres/mysql/sqlserver)")
-            print("     - Database endpoint")
-            print("     - Subnet ID")
-            print("     - Security group ID")
-            print("     - Secrets Manager ARN")
-            print("  3. Run the experiment from the FIS console")
             print("\n" + "="*60 + "\n")
             
             return True
@@ -425,6 +534,12 @@ The script is idempotent and safe to run multiple times.
     )
     
     parser.add_argument(
+        '--delete-resources',
+        action='store_true',
+        help='Delete all resources created by this script'
+    )
+
+    parser.add_argument(
         '--region',
         required=True,
         help='AWS region (e.g., us-east-1)'
@@ -444,7 +559,7 @@ The script is idempotent and safe to run multiple times.
         sys.exit(1)
     
     deployer = ExperimentDeployer(args.region, args.account_id)
-    success = deployer.deploy()
+    success = deployer.delete() if args.delete_resources else deployer.deploy()
     
     sys.exit(0 if success else 1)
 

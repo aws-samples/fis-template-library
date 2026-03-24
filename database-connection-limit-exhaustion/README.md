@@ -101,7 +101,7 @@ python deploy.py --region us-east-1 --account-id 123456789012
 2. **IAM Roles**: Create the following IAM roles in your account using the sample policies provided:
    - FIS execution role with permissions to start SSM automation
    - SSM automation role with permissions to launch EC2 instances and execute commands
-   - EC2 instance profile with SSM managed instance permissions
+   - EC2 instance profile with the AmazonSSMManagedInstanceCore managed policy attached
 
 3. **SSM Document**:
    - Deploy the SSM automation document (`database-connection-limit-exhaustion-automation.yaml`) to your account
@@ -139,7 +139,7 @@ The experiment requires the following parameters:
 - Once the FIS Experiment template is deployed in your account, you will need to **update the experiment template** by editing it in the console or via the API to set appropriate parameters for your desired database target and environment
 - To update via the console:
   1. Open the FIS Console
-  2. Select the experiment template "Database-connection-limit-Exhaustion"
+  2. Select the experiment template "Database-connection-limit-exhaustion"
   3. Select **Actions / Update Experiment Template**
   4. Select the **ExhaustConnectionLimit** Action
   5. Update the **Document parameters** to match your target e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": 5432, "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx-yyyy-zzzz", "MaxConnections": "1000", "ExperimentDuration": "PT30M", "RampTime": "PT10M", "RampSteps": "15", "SubnetId": "subnet-1234-abcdef", "VpcId": "vpc-1234567abcd", "DatabaseSecurityGroupId": "sg-1234567abcd", "InstanceType": "t3.small"}
