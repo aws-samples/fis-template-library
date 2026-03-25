@@ -6,14 +6,14 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Example Hypothesis
 
-When the Redis primary node is rebooted, applications should detect the brief connection disruption and reconnect automatically within 30 seconds. Connection limiting should handle the temporary unavailability gracefully, and no data should be lost during the reboot. Application performance should return to normal within 60 seconds of the node becoming available again.
+When the Redis primary node is rebooted, applications should detect the brief connection disruption and reconnect automatically within 30 seconds. Connection pooling should handle the temporary unavailability gracefully, and no data should be lost during the reboot. Application performance should return to normal within 60 seconds of the node becoming available again.
 
 ### What does this enable me to verify?
 
 * Appropriate Redis connection monitoring and observability is in place (were you able to detect the reboot?)
 * Alarms are configured correctly for node availability changes (were the right people notified?)
 * Your application handles brief Redis connection disruptions gracefully
-* Connection limiting and retry logic work correctly during node reboots
+* Connection pooling and retry logic work correctly during node reboots
 * Recovery controls and reconnection mechanisms work as expected
 
 ## Prerequisites
@@ -70,7 +70,7 @@ As you adapt this scenario to your needs, we recommend:
 3. Creating Amazon CloudWatch metrics and alarms to monitor Redis node availability and connection health.
 4. Adding stop conditions tied to critical business metrics to automatically halt the experiment if needed.
 5. Implementing appropriate connection retry logic in your application to handle brief node unavailability.
-6. Testing your application's Redis connection limiting and recovery mechanisms.
+6. Testing your application's Redis connection pooling and recovery mechanisms.
 7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
 
 ## Import Experiment

@@ -10,7 +10,12 @@ This script creates all required AWS resources in the correct order:
 The script is idempotent - safe to run multiple times to apply updates.
 
 Usage:
-    python deploy.py --region us-east-1 --account-id 123456789012
+
+To build resources:
+    python deploy.py --region your-region --account-id 123456789012
+
+To delete resources:
+    python deploy.py --region your-region --account-id 123456789012 --delete-resources
 
 Requirements:
     - AWS CLI configured with appropriate credentials
