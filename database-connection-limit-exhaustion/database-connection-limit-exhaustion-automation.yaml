@@ -81,6 +81,7 @@ mainSteps:
   - name: CreateSecurityGroup
     action: 'aws:executeAwsApi'
     onFailure: 'Abort'
+    onCancel: 'Abort'
     inputs:
       Service: ec2
       Api: CreateSecurityGroup
@@ -106,6 +107,7 @@ mainSteps:
   - name: AuthorizeOutboundToDatabase
     action: 'aws:executeScript'
     onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
     inputs:
       Runtime: python3.11
       Handler: authorize_egress
@@ -141,6 +143,7 @@ mainSteps:
   - name: AuthorizeInboundFromLoadGenerator
     action: 'aws:executeScript'
     onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
     inputs:
       Runtime: python3.11
       Handler: authorize_ingress
@@ -176,6 +179,7 @@ mainSteps:
   - name: LaunchLoadGenerator
     action: 'aws:runInstances'
     onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
     inputs:
       ImageId: '{{ LatestAmiId }}'
       InstanceType: '{{ InstanceType }}'
@@ -205,6 +209,7 @@ mainSteps:
     action: 'aws:waitForAwsResourceProperty'
     timeoutSeconds: 300
     onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
     inputs:
       Service: ssm
       Api: DescribeInstanceInformation
@@ -219,6 +224,7 @@ mainSteps:
   - name: InstallDatabaseClient
     action: 'aws:runCommand'
     onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
@@ -267,6 +273,7 @@ mainSteps:
   - name: ExhaustConnectionLimit
     action: 'aws:runCommand'
     onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
@@ -593,6 +600,7 @@ mainSteps:
     action: 'aws:waitForAwsResourceProperty'
     timeoutSeconds: 300
     onFailure: 'Continue'
+    onCancel: 'Abort'
     inputs:
       Service: ec2
       Api: DescribeInstances
@@ -605,6 +613,7 @@ mainSteps:
   - name: RevokeInboundFromLoadGenerator
     action: 'aws:executeScript'
     onFailure: 'Continue'
+    onCancel: 'Abort'
     inputs:
       Runtime: python3.11
       Handler: revoke_ingress
@@ -641,6 +650,7 @@ mainSteps:
   - name: CleanupSecurityGroup
     action: 'aws:executeAwsApi'
     onFailure: 'Continue'
+    onCancel: 'Abort'
     inputs:
       Service: ec2
       Api: DeleteSecurityGroup
