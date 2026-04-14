@@ -11,7 +11,7 @@ When the SQS service is experiencing an impairment in a region which impacts my 
 ### What does this enable me to verify?
 
 * Appropriate customer experience metrics and observability of SQS is in place (were you able to detect there was a problem?)
-* Alarms are configured correctly (were the right people notified and/or automations triggered?)
+* Alarms are configured correctly (were the right people notified at the right time and/or automations triggered?)
 * Your app gracefully degrades and customers aren't submitting transactions which you know will fail
 * Your circuit breaker (if any) works as expected
 * Recovery controls (if any) work as expected

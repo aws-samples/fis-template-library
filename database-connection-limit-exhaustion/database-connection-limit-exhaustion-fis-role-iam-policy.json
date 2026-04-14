@@ -1,0 +1,41 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowSSMAutomationExecution",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:StartAutomationExecution",
+                "ssm:GetAutomationExecution",
+                "ssm:StopAutomationExecution"
+            ],
+            "Resource": [
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ConnectionLimitExhaustion-Automation:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ConnectionLimitExhaustion-Automation"
+            ]
+        },
+        {
+            "Sid": "AllowPassRoleToSSM",
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": "arn:aws:iam::*:role/ConnectionLimitExhaustion-SSM-Automation-Role",
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": "ssm.amazonaws.com"
+                }
+            }
+        },
+        {
+            "Sid": "AllowCloudWatchLogs",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogDelivery",
+                "logs:PutResourcePolicy",
+                "logs:DescribeResourcePolicies",
+                "logs:DescribeLogGroups"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

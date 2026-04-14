@@ -1,0 +1,661 @@
+schemaVersion: '0.3'
+description: 'Create ephemeral load generator to exhaust database connection limit'
+assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/ConnectionLimitExhaustion-SSM-Automation-Role'
+
+parameters:
+  DatabaseEngine:
+    type: String
+    description: 'Database engine type'
+    default: 'postgres'
+    allowedValues:
+      - postgres
+      - mysql
+      - sqlserver
+  
+  DatabaseEndpoint:
+    type: String
+    description: 'Database endpoint hostname'
+  
+  DatabasePort:
+    type: String
+    description: 'Database port number'
+    default: '5432'
+  
+  DatabaseName:
+    type: String
+    description: 'Database name to connect to (postgres: postgres, mysql: mysql, sqlserver: master)'
+    default: 'postgres'
+  
+  DatabaseUser:
+    type: String
+    description: 'Database username'
+    default: 'postgres'
+  
+  DatabasePasswordSecretArn:
+    type: String
+    description: 'ARN of Secrets Manager secret containing database password'
+  
+  MaxConnections:
+    type: String
+    description: 'Number of connections to open'
+    default: '100'
+  
+  ExperimentDuration:
+    type: String
+    description: 'Total experiment duration in ISO8601 format (e.g., PT10M for 10 minutes, PT1H for 1 hour)'
+    default: 'PT10M'
+  
+  RampTime:
+    type: String
+    description: 'Time to ramp up to MaxConnections in ISO8601 format (e.g., PT1M for 1 minute, PT30S for 30 seconds, PT0S for immediate)'
+    default: 'PT1M'
+  
+  RampSteps:
+    type: String
+    description: 'Number of steps to reach MaxConnections (e.g., 2=50% then 100%, 10=10% increments)'
+    default: '10'
+  
+  SubnetId:
+    type: String
+    description: 'Subnet ID for load generator instance'
+  
+  VpcId:
+    type: String
+    description: 'VPC ID where the load generator will be launched'
+  
+  DatabaseSecurityGroupId:
+    type: String
+    description: 'Security group ID of the target database (for creating ingress rule)'
+  
+  InstanceType:
+    type: String
+    description: 'EC2 instance type'
+    default: 't3.small'
+  
+  LatestAmiId:
+    type: String
+    description: 'Amazon Linux 2023 AMI ID'
+    default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+
+mainSteps:
+  - name: CreateSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: CreateSecurityGroup
+      GroupName: 'FIS-ConnectionLimit-LoadGen-{{ automation:EXECUTION_ID }}'
+      Description: 'Temporary security group for FIS connection limit exhaustion experiment'
+      VpcId: '{{ VpcId }}'
+      TagSpecifications:
+        - ResourceType: 'security-group'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-ConnectionLimit-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'ConnectionLimitExhaustion'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: SecurityGroupId
+        Selector: '$.GroupId'
+        Type: String
+
+  - name: AuthorizeOutboundToDatabase
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_egress
+      Script: |
+        import boto3
+        
+        def authorize_egress(events, context):
+            ec2 = boto3.client('ec2')
+            
+            security_group_id = events['SecurityGroupId']
+            database_sg_id = events['DatabaseSecurityGroupId']
+            port = int(events['DatabasePort'])
+            
+            response = ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': database_sg_id,
+                        'Description': 'Allow outbound to database'
+                    }]
+                }]
+            )
+            
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        SecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: AuthorizeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_ingress
+      Script: |
+        import boto3
+        
+        def authorize_ingress(events, context):
+            ec2 = boto3.client('ec2')
+            
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+            
+            response = ec2.authorize_security_group_ingress(
+                GroupId=database_sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': load_gen_sg_id,
+                        'Description': 'Allow inbound from FIS load generator'
+                    }]
+                }]
+            )
+            
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: LaunchLoadGenerator
+    action: 'aws:runInstances'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      ImageId: '{{ LatestAmiId }}'
+      InstanceType: '{{ InstanceType }}'
+      MinInstanceCount: 1
+      MaxInstanceCount: 1
+      SubnetId: '{{ SubnetId }}'
+      SecurityGroupIds:
+        - '{{ CreateSecurityGroup.SecurityGroupId }}'
+      IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      TagSpecifications:
+        - ResourceType: 'instance'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-ConnectionLimit-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'ConnectionLimitExhaustion'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: InstanceId
+        Selector: '$.InstanceIds[0]'
+        Type: String
+
+  - name: WaitForSSMAgent
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.InstanceInformationList[0].PingStatus'
+      DesiredValues:
+        - Online
+
+  - name: InstallDatabaseClient
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+            
+            ENGINE="{{ DatabaseEngine }}"
+            
+            echo "Installing database client for engine: $ENGINE"
+            
+            if [ "$ENGINE" = "postgres" ]; then
+                # Install PostgreSQL client and Python PostgreSQL library
+                dnf install -y postgresql15 python3-pip
+                pip3 install psycopg2-binary
+                echo "PostgreSQL client installed"
+                
+            elif [ "$ENGINE" = "mysql" ]; then
+                # Install MariaDB client (MySQL-compatible) and Python MySQL library
+                dnf install -y mariadb105 python3-pip
+                pip3 install mysql-connector-python
+                echo "MySQL client installed"
+                
+            elif [ "$ENGINE" = "sqlserver" ]; then
+                # Install SQL Server tools and Python SQL Server library
+                curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
+                ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
+                pip3 install pyodbc
+                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+                source ~/.bashrc
+                echo "SQL Server tools installed"
+            else
+                echo "Unsupported database engine: $ENGINE"
+                exit 1
+            fi
+            
+            # Install AWS CLI and boto3 for Secrets Manager access
+            dnf install -y aws-cli
+            pip3 install boto3
+            
+            echo "Installation complete"
+
+  - name: ExhaustConnectionLimit
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 3600
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+            
+            # Create Python script for connection limit exhaustion
+            cat > /tmp/exhaust_pool.py << 'PYTHON_EOF'
+            import sys
+            import time
+            import json
+            import threading
+            import boto3
+            from datetime import datetime
+
+            # Parse ISO8601 duration to seconds
+            def parse_iso8601_duration(duration):
+                seconds = 0
+                duration = duration.replace('PT', '')
+                
+                if 'H' in duration:
+                    hours, duration = duration.split('H')
+                    seconds += int(hours) * 3600
+                
+                if 'M' in duration:
+                    minutes, duration = duration.split('M')
+                    seconds += int(minutes) * 60
+                
+                if 'S' in duration:
+                    secs = duration.replace('S', '')
+                    if secs:
+                        seconds += int(secs)
+                
+                return seconds
+
+            # Connection worker thread
+            def connection_worker(thread_id, engine, endpoint, port, dbname, user, password, hold_time):
+                try:
+                    if engine == 'postgres':
+                        import psycopg2
+                        conn = psycopg2.connect(
+                            host=endpoint,
+                            port=port,
+                            database=dbname,
+                            user=user,
+                            password=password,
+                            connect_timeout=10
+                        )
+                        cursor = conn.cursor()
+                        
+                        # Keepalive loop
+                        end_time = time.time() + hold_time
+                        while time.time() < end_time:
+                            try:
+                                cursor.execute("SELECT 1")
+                                cursor.fetchone()
+                            except:
+                                break
+                            
+                            remaining = end_time - time.time()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(30, remaining))
+                        
+                        cursor.close()
+                        conn.close()
+                        
+                    elif engine == 'mysql':
+                        import mysql.connector
+                        conn = mysql.connector.connect(
+                            host=endpoint,
+                            port=port,
+                            database=dbname,
+                            user=user,
+                            password=password,
+                            connection_timeout=10
+                        )
+                        cursor = conn.cursor()
+                        
+                        # Keepalive loop
+                        end_time = time.time() + hold_time
+                        while time.time() < end_time:
+                            try:
+                                cursor.execute("SELECT 1")
+                                cursor.fetchone()
+                            except:
+                                break
+                            
+                            remaining = end_time - time.time()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(30, remaining))
+                        
+                        cursor.close()
+                        conn.close()
+                        
+                    elif engine == 'sqlserver':
+                        import pyodbc
+                        conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes'
+                        conn = pyodbc.connect(conn_str, timeout=10)
+                        cursor = conn.cursor()
+                        
+                        # Keepalive loop
+                        end_time = time.time() + hold_time
+                        while time.time() < end_time:
+                            try:
+                                cursor.execute("SELECT 1")
+                                cursor.fetchone()
+                            except:
+                                break
+                            
+                            remaining = end_time - time.time()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(30, remaining))
+                        
+                        cursor.close()
+                        conn.close()
+                    
+                    return True
+                    
+                except Exception as e:
+                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
+                    return False
+
+            # Main execution
+            def main():
+                # Get parameters from command line
+                engine = sys.argv[1]
+                endpoint = sys.argv[2]
+                port = int(sys.argv[3])
+                dbname = sys.argv[4]
+                user = sys.argv[5]
+                secret_arn = sys.argv[6]
+                max_conn = int(sys.argv[7])
+                experiment_duration_iso = sys.argv[8]
+                ramp_time_iso = sys.argv[9]
+                ramp_steps = int(sys.argv[10])
+                region = sys.argv[11]  # AWS region for Secrets Manager
+                
+                # Convert durations
+                experiment_duration = parse_iso8601_duration(experiment_duration_iso)
+                ramp_time = parse_iso8601_duration(ramp_time_iso)
+                
+                print("=== Connection Limit Exhaustion Test ===")
+                print(f"Engine: {engine}")
+                print(f"Endpoint: {endpoint}:{port}")
+                print(f"Database: {dbname}")
+                print(f"User: {user}")
+                print(f"Max Connections: {max_conn}")
+                print(f"Experiment Duration: {experiment_duration}s")
+                print(f"Requested Ramp Time: {ramp_time}s")
+                print(f"Ramp Steps: {ramp_steps}")
+                print("========================================")
+                
+                # Validate and adjust ramp time
+                if ramp_time > experiment_duration:
+                    print(f"WARNING: Ramp time ({ramp_time}s) exceeds experiment duration ({experiment_duration}s)")
+                    print("Adjusting ramp time to match experiment duration")
+                    ramp_time = experiment_duration
+                
+                print(f"Effective Ramp Time: {ramp_time}s")
+                print("========================================")
+                
+                # Retrieve password from Secrets Manager
+                print("Retrieving database password from Secrets Manager...")
+                try:
+                    sm = boto3.client('secretsmanager', region_name=region)
+                    response = sm.get_secret_value(SecretId=secret_arn)
+                    secret = json.loads(response['SecretString'])
+                    password = secret.get('password', response['SecretString'])
+                except Exception as e:
+                    print(f"ERROR: Failed to retrieve password: {str(e)}")
+                    sys.exit(1)
+                
+                print("Password retrieved successfully")
+                
+                # Record start time
+                start_time = time.time()
+                threads = []
+                
+                if ramp_time == 0:
+                    # Immediate mode
+                    print(f"Opening {max_conn} connections immediately...")
+                    hold_time = experiment_duration
+                    
+                    for i in range(max_conn):
+                        if (i + 1) % 10 == 0:
+                            print(f"Progress: {i + 1}/{max_conn} connections opened")
+                        
+                        thread = threading.Thread(
+                            target=connection_worker,
+                            args=(i + 1, engine, endpoint, port, dbname, user, password, hold_time)
+                        )
+                        thread.start()
+                        threads.append(thread)
+                        time.sleep(0.1)
+                    
+                    print(f"All {max_conn} connections initiated (holding for {hold_time}s)")
+                    
+                else:
+                    # Ramp-up mode
+                    print(f"Ramping up connections over {ramp_time} seconds in {ramp_steps} steps...")
+                    
+                    if ramp_steps < 1:
+                        print("ERROR: RampSteps must be at least 1")
+                        sys.exit(1)
+                    
+                    if ramp_steps > max_conn:
+                        print(f"WARNING: RampSteps ({ramp_steps}) exceeds MaxConnections ({max_conn}), adjusting to {max_conn}")
+                        ramp_steps = max_conn
+                    
+                    step_duration = ramp_time / ramp_steps
+                    conn_per_step = max_conn // ramp_steps
+                    remainder = max_conn % ramp_steps
+                    
+                    print(f"Strategy: ~{conn_per_step} connections every {step_duration:.1f}s")
+                    
+                    total_opened = 0
+                    
+                    for step in range(1, ramp_steps + 1):
+                        # Calculate connections for this step
+                        if step == ramp_steps:
+                            conns_this_step = conn_per_step + remainder
+                        else:
+                            conns_this_step = conn_per_step
+                        
+                        # Calculate hold time for this step
+                        elapsed = time.time() - start_time
+                        remaining = experiment_duration - elapsed
+                        hold_time = max(0, remaining)
+                        
+                        print(f"Step {step}/{ramp_steps}: Opening {conns_this_step} connections (hold for {hold_time:.0f}s)...")
+                        
+                        for i in range(conns_this_step):
+                            total_opened += 1
+                            thread = threading.Thread(
+                                target=connection_worker,
+                                args=(total_opened, engine, endpoint, port, dbname, user, password, hold_time)
+                            )
+                            thread.start()
+                            threads.append(thread)
+                            time.sleep(0.05)
+                        
+                        percentage = (total_opened * 100) // max_conn
+                        print(f"  → {total_opened}/{max_conn} connections opened ({percentage}%)")
+                        
+                        if step < ramp_steps:
+                            time.sleep(step_duration)
+                    
+                    print(f"Ramp-up complete: {total_opened} connections opened")
+                
+                # Wait a moment for connections to establish
+                time.sleep(5)
+                
+                # Count active threads
+                active_count = sum(1 for t in threads if t.is_alive())
+                failed_count = len(threads) - active_count
+                
+                print("=== Connection Status ===")
+                print(f"Active connections: {active_count}")
+                print(f"Failed connections: {failed_count}")
+                print("=========================")
+                
+                # Wait for experiment to complete
+                elapsed = time.time() - start_time
+                remaining = experiment_duration - elapsed
+                
+                if remaining > 0:
+                    print(f"Waiting for experiment to complete ({remaining:.0f}s remaining)...")
+                    print("Connection limit should now be exhausted")
+                    time.sleep(remaining)
+                else:
+                    print("Experiment duration reached")
+                
+                # Cleanup: wait for all threads to complete
+                print("Releasing connections...")
+                for thread in threads:
+                    thread.join(timeout=1)
+                
+                print("=== Test Complete ===")
+                print("All connections released")
+                print("======================")
+                
+                # Return summary
+                result = {
+                    "SuccessfulConnections": active_count,
+                    "FailedConnections": failed_count,
+                    "TotalAttempts": max_conn
+                }
+                print(json.dumps(result))
+
+            if __name__ == '__main__':
+                main()
+            PYTHON_EOF
+            
+            # Execute Python script with parameters
+            python3 /tmp/exhaust_pool.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ MaxConnections }}" \
+              "{{ ExperimentDuration }}" \
+              "{{ RampTime }}" \
+              "{{ RampSteps }}" \
+              "{{ global:REGION }}"
+
+  - name: TerminateInstance
+    action: 'aws:changeInstanceState'
+    inputs:
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      DesiredState: terminated
+
+  - name: WaitForInstanceTermination
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - terminated
+
+  - name: RevokeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Runtime: python3.11
+      Handler: revoke_ingress
+      Script: |
+        import boto3
+        
+        def revoke_ingress(events, context):
+            ec2 = boto3.client('ec2')
+            
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+            
+            try:
+                response = ec2.revoke_security_group_ingress(
+                    GroupId=database_sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': port,
+                        'ToPort': port,
+                        'UserIdGroupPairs': [{
+                            'GroupId': load_gen_sg_id
+                        }]
+                    }]
+                )
+                return {'StatusCode': 200, 'Response': response}
+            except Exception as e:
+                return {'StatusCode': 500, 'Error': str(e)}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: CleanupSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: DeleteSecurityGroup
+      GroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+
+outputs:
+  - LaunchLoadGenerator.InstanceId
+  - CreateSecurityGroup.SecurityGroupId

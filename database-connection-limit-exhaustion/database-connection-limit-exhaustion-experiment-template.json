@@ -1,0 +1,30 @@
+{
+    "description": "Database Connection Limit Exhaustion - Creates ephemeral load generator to exhaust database connections",
+    "targets": {},
+    "actions": {
+        "ExhaustConnectionLimit": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Exhaust database connection limit",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ConnectionLimitExhaustion-Automation",
+                "documentParameters": "{\"DatabaseEngine\":\"postgres\",\"DatabaseEndpoint\":\"<YOUR DATABASE ENDPOINT>\",\"DatabasePort\":\"5432\",\"DatabaseName\":\"postgres\",\"DatabaseUser\":\"postgres\",\"DatabasePasswordSecretArn\":\"<YOUR SECRET ARN>\",\"MaxConnections\":\"1000\",\"ExperimentDuration\":\"PT30M\",\"RampTime\":\"PT15M\",\"RampSteps\":\"15\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"DatabaseSecurityGroupId\":\"<YOUR DATABASE SECURITY GROUP ID>\",\"InstanceType\":\"t3.small\"}",
+                "maxDuration": "PT180M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/ConnectionLimitExhaustion-FIS-Role",
+    "tags": {
+        "Name": "Database-connection-limit-exhaustion",
+        "ExperimentType": "ConnectionLimitExhaustion",
+        "DatabaseEngine": "postgres"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}
