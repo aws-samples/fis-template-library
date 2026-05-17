@@ -1,0 +1,46 @@
+description: "Trigger ElastiCache automatic failover via TestFailover API to validate primary-replica role swap"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  ReplicationGroupId:
+    type: String
+    description: "Replication group ID to trigger failover on"
+    allowedPattern: "^[a-z][a-z0-9\\-]{0,39}$"
+  NodeGroupId:
+    type: String
+    description: "Node group (shard) ID to failover. Use '0001' for cluster-mode-disabled. For cluster-mode-enabled, specify the target shard ID (e.g. '0001', '0002')."
+    default: "0001"
+    allowedPattern: "^[0-9]{4}$"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM Role ARN for SSM Automation to assume"
+    allowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+
+mainSteps:
+  - name: TestFailover
+    action: aws:executeAwsApi
+    description: "Trigger automatic failover by promoting a replica to primary"
+    onFailure: "Abort"
+    inputs:
+      Service: elasticache
+      Api: TestFailover
+      ReplicationGroupId: "{{ ReplicationGroupId }}"
+      NodeGroupId: "{{ NodeGroupId }}"
+    outputs:
+      - Name: ReplicationGroupId
+        Selector: $.ReplicationGroup.ReplicationGroupId
+        Type: String
+
+  - name: WaitForReplicationGroupAvailable
+    action: aws:waitForAwsResourceProperty
+    description: "Wait until the replication group returns to available status after role swap"
+    timeoutSeconds: 600
+    onFailure: "Abort"
+    inputs:
+      Service: elasticache
+      Api: DescribeReplicationGroups
+      ReplicationGroupId: "{{ ReplicationGroupId }}"
+      PropertySelector: "$.ReplicationGroups[0].Status"
+      DesiredValues:
+        - "available"
+    isEnd: true

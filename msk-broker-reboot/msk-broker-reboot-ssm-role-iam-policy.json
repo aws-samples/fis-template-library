@@ -1,0 +1,21 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowMskBrokerReboot",
+            "Effect": "Allow",
+            "Action": [
+                "kafka:RebootBroker"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowMskDescribe",
+            "Effect": "Allow",
+            "Action": [
+                "kafka:DescribeCluster"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

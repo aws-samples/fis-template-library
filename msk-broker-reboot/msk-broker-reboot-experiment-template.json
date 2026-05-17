@@ -1,0 +1,30 @@
+{
+    "description": "Reboot an Amazon MSK broker to validate Kafka producer and consumer resilience to broker failures",
+    "targets": {},
+    "actions": {
+        "rebootMskBroker": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Reboot the specified MSK broker and wait for the cluster to return to ACTIVE",
+            "parameters": {
+                "maxDuration": "PT20M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/MSK-Broker-Reboot",
+                "documentParameters": "{\"ClusterArn\": \"<YOUR MSK CLUSTER ARN>\", \"BrokerId\": \"1\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\"}"
+            },
+            "targets": {}
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "MSKBrokerRebootTest",
+        "Purpose": "resilience-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

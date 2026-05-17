@@ -1,0 +1,21 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowElastiCacheTestFailover",
+            "Effect": "Allow",
+            "Action": [
+                "elasticache:TestFailover"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowElastiCacheDescribe",
+            "Effect": "Allow",
+            "Action": [
+                "elasticache:DescribeReplicationGroups"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

@@ -1,0 +1,45 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowFISExperimentLogging",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogDelivery",
+                "logs:PutResourcePolicy",
+                "logs:DescribeResourcePolicies",
+                "logs:DescribeLogGroups"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowElastiCacheAZPowerInterruption",
+            "Effect": "Allow",
+            "Action": [
+                "elasticache:InterruptClusterAzPower"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowElastiCacheDescribe",
+            "Effect": "Allow",
+            "Action": [
+                "elasticache:DescribeReplicationGroups"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowTagResolution",
+            "Effect": "Allow",
+            "Action": [
+                "tag:GetResources"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

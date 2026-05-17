@@ -1,0 +1,30 @@
+{
+    "description": "Reboot the ElastiCache primary node by CacheClusterId to test connection pool resilience and cache warming behavior",
+    "targets": {},
+    "actions": {
+        "rebootPrimaryNode": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Reboot the specified ElastiCache primary node and wait for recovery",
+            "parameters": {
+                "maxDuration": "PT15M",
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ElastiCache-Primary-Node-Reboot",
+                "documentParameters": "{\"CacheClusterId\": \"<YOUR CACHE CLUSTER ID>\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\"}"
+            },
+            "targets": {}
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "ElastiCachePrimaryNodeRebootTest",
+        "Purpose": "resilience-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

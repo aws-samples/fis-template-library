@@ -1,0 +1,41 @@
+{
+    "description": "Interrupt ElastiCache replication group AZ power to validate cache layer AZ resilience and automatic failover",
+    "targets": {
+        "elasticache-replication-groups": {
+            "resourceType": "aws:elasticache:replicationgroup",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "parameters": {
+                "availabilityZoneIdentifier": "<YOUR AVAILABILITY ZONE>"
+            },
+            "selectionMode": "ALL"
+        }
+    },
+    "actions": {
+        "interrupt-az-power": {
+            "actionId": "aws:elasticache:replicationgroup-interrupt-az-power",
+            "description": "Interrupt power to ElastiCache nodes in the target AZ",
+            "parameters": {
+                "duration": "PT10M"
+            },
+            "targets": {
+                "ReplicationGroups": "elasticache-replication-groups"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "ElastiCacheAZPowerInterruptionTest",
+        "Purpose": "resilience-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}

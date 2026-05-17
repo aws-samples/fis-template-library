@@ -1,0 +1,42 @@
+description: "Reboot ElastiCache primary node to test client connection pool resilience"
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  CacheClusterId:
+    type: String
+    description: "CacheClusterId of the primary node to reboot (e.g. my-cluster-0001-001)"
+    allowedPattern: "^[a-z][a-z0-9\\-]{0,49}$"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM Role ARN for SSM Automation to assume"
+    allowedPattern: "^arn:aws:iam::[0-9]{12}:role/.+$"
+
+mainSteps:
+  - name: RebootPrimaryNode
+    action: aws:executeAwsApi
+    description: "Issue RebootCacheCluster on the specified primary node"
+    onFailure: "Abort"
+    inputs:
+      Service: elasticache
+      Api: RebootCacheCluster
+      CacheClusterId: "{{ CacheClusterId }}"
+      CacheNodeIdsToReboot:
+        - "0001"
+    outputs:
+      - Name: CacheClusterId
+        Selector: $.CacheCluster.CacheClusterId
+        Type: String
+
+  - name: WaitForNodeAvailable
+    action: aws:waitForAwsResourceProperty
+    description: "Wait until the rebooted node returns to available status"
+    timeoutSeconds: 600
+    onFailure: "Abort"
+    inputs:
+      Service: elasticache
+      Api: DescribeCacheClusters
+      CacheClusterId: "{{ CacheClusterId }}"
+      PropertySelector: "$.CacheClusters[0].CacheClusterStatus"
+      DesiredValues:
+        - "available"
+    isEnd: true
