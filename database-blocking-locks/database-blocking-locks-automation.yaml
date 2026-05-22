@@ -300,6 +300,73 @@ mainSteps:
             import boto3
 
 
+            # ---------------------------------------------------------------------
+            # Pure SQL-rendering helpers (module-level, no DB driver imports).
+            #
+            # These helpers are the **single source of truth** for the synthetic
+            # target-table name, the Synthetic_Mode vs Real_Mode test, and all
+            # dynamic SQL identifier rendering used by the Real_Mode code paths.
+            #
+            # The bodies of these helpers are mirrored byte-for-byte (modulo
+            # leading whitespace forced by this YAML heredoc's indentation) in
+            # ``database-blocking-locks/tests/sql_helpers.py`` so that the
+            # ``hypothesis`` property tests can exercise them without requiring
+            # ``boto3``, ``psycopg2``, ``mysql.connector``, or ``pyodbc``.
+            #
+            # If you change a helper's body here, update ``tests/sql_helpers.py``
+            # in the same commit (and vice versa).
+            # ---------------------------------------------------------------------
+
+            DEFAULT_SYNTHETIC_TABLE = "fis_blocking_locks_target"
+
+
+            def is_real_mode(target_table_name: str) -> bool:
+                return target_table_name != DEFAULT_SYNTHETIC_TABLE
+
+
+            def quote_identifier(engine: str, name: str) -> str:
+                if engine == "postgres":
+                    return '"' + name.replace('"', '""') + '"'
+                if engine == "mysql":
+                    return "`" + name.replace("`", "``") + "`"
+                if engine == "sqlserver":
+                    return "[" + name.replace("]", "]]") + "]"
+                raise ValueError("unsupported engine: %r" % engine)
+
+
+            def parse_qualified_table_name(engine: str, name: str) -> Tuple[Optional[str], str]:
+                if engine == "sqlserver":
+                    if "." in name:
+                        schema, table = name.split(".", 1)
+                        return (schema, table)
+                    return ("dbo", name)
+                return (None, name)
+
+
+            def build_quoted_table_ref(engine: str, schema: Optional[str], table: str) -> str:
+                if engine == "sqlserver":
+                    return (quote_identifier("sqlserver", schema) + "."
+                            + quote_identifier("sqlserver", table))
+                return quote_identifier(engine, table)
+
+
+            def build_pk_where_clause(engine: str, pk_columns: List[str]) -> str:
+                marker = "?" if engine == "sqlserver" else "%s"
+                quoted = [quote_identifier(engine, c) for c in pk_columns]
+                return " AND ".join("%s = %s" % (col, marker) for col in quoted)
+
+
+            def build_lock_query(engine: str, qualified_table_ref: str,
+                                 pk_columns: List[str]) -> str:
+                quoted_cols = ", ".join(quote_identifier(engine, c) for c in pk_columns)
+                where_clause = build_pk_where_clause(engine, pk_columns)
+                if engine == "sqlserver":
+                    return ("SELECT " + quoted_cols + " FROM " + qualified_table_ref
+                            + " WITH (UPDLOCK, HOLDLOCK) WHERE " + where_clause)
+                return ("SELECT " + quoted_cols + " FROM " + qualified_table_ref
+                        + " WHERE " + where_clause + " FOR UPDATE")
+
+
             class BlockingLocksHarness:
                 """Single-Blocker / N-Waiter row-lock contention harness.
 
@@ -311,7 +378,7 @@ mainSteps:
                 the target table only if this run created it.
                 """
 
-                TABLE_NAME = "fis_blocking_locks_target"
+                TABLE_NAME = DEFAULT_SYNTHETIC_TABLE
 
                 def __init__(
                     self,
@@ -325,7 +392,16 @@ mainSteps:
                     experiment_duration_s: int,
                     ramp_time_s: int,
                     ramp_steps: int,
+                    target_table_name: str = DEFAULT_SYNTHETIC_TABLE,
                 ) -> None:
+                    # NOTE: ``target_table_name`` is given a default of
+                    # DEFAULT_SYNTHETIC_TABLE here so that the mode-dispatch
+                    # refactor introduced by task 2.1 can land before the
+                    # constructor wiring change in task 5.3 (which makes the
+                    # parameter required and threads it through ``main()``).
+                    # Behaviour with the default is identical to the previous
+                    # implementation: ``is_real_mode`` returns False and the
+                    # synthetic-mode code path runs.
                     self.engine = engine
                     self.endpoint = endpoint
                     self.port = port
@@ -336,6 +412,7 @@ mainSteps:
                     self.experiment_duration_s = experiment_duration_s
                     self.ramp_time_s = ramp_time_s
                     self.ramp_steps = ramp_steps
+                    self.target_table_name = target_table_name
 
                     self._created_table = False
                     self._waiter_threads: List[threading.Thread] = []
@@ -656,23 +733,446 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                # ----- Blocker --------------------------------------------------------
+                # ----- Real_Mode introspection helpers -------------------------------
+                #
+                # These methods are only invoked from ``_run_real_mode``. They open
+                # no connections; the caller passes in a control connection and is
+                # responsible for closing it. Each method exits the process via
+                # ``sys.exit`` with the design-specified exit code on failure; no
+                # DDL or DML is ever executed against the user-supplied table.
 
-                def _acquire_blocker_lock(self, conn) -> None:
+                # Wall-clock budget for ``_validate_target_table``'s combined
+                # existence-and-non-empty probes (Requirement 2.6).
+                _REAL_MODE_VALIDATION_DEADLINE_S = 10.0
+
+                @staticmethod
+                def _is_relation_missing_error(engine: str, exc: BaseException) -> bool:
+                    """Heuristically detect 'relation does not exist' errors per engine."""
+                    msg = str(exc).lower()
+                    if engine == "postgres":
+                        # psycopg2 UndefinedTable: "relation \"x\" does not exist"
+                        return "does not exist" in msg
+                    if engine == "mysql":
+                        # mysql-connector ER_NO_SUCH_TABLE 1146: "Table 'x' doesn't exist"
+                        return "doesn't exist" in msg or "does not exist" in msg
+                    if engine == "sqlserver":
+                        # pyodbc SQL state 42S02 / msg 208: "Invalid object name"
+                        return "invalid object name" in msg
+                    return False
+
+                @staticmethod
+                def _is_permission_denied_error(engine: str, exc: BaseException) -> bool:
+                    """Heuristically detect 'permission denied / access denied' per engine."""
+                    msg = str(exc).lower()
+                    if engine == "postgres":
+                        # psycopg2 InsufficientPrivilege: "permission denied for table x"
+                        return "permission denied" in msg
+                    if engine == "mysql":
+                        # mysql-connector ER_TABLEACCESS_DENIED_ERROR 1142:
+                        # "SELECT command denied to user 'x'@'h' for table 'y'"
+                        return ("command denied" in msg
+                                or "access denied" in msg
+                                or "permission denied" in msg)
+                    if engine == "sqlserver":
+                        # pyodbc msg 229: "The SELECT permission was denied on the
+                        # object 'x', database 'y', schema 'z'"
+                        return ("permission was denied" in msg
+                                or "permission denied" in msg)
+                    return False
+
+                def _validate_target_table(
+                    self, conn, qualified_table_ref: str,
+                ) -> None:
+                    """Probe that the user-supplied table exists, is reachable, and is non-empty.
+
+                    Issues two SELECTs against the table and inspects the results
+                    plus any raised driver exception. Exits the process on failure
+                    with the design-specified code:
+
+                    * 20 — relation does not exist (existence probe failed and the
+                      engine-specific exception text matches the missing-relation
+                      pattern)
+                    * 21 — non-empty probe returned no rows
+                    * 22 — combined elapsed time of both probes exceeded
+                      ``_REAL_MODE_VALIDATION_DEADLINE_S`` seconds (Requirement 2.6)
+                    * 24 — permission denied, or any other unexpected driver error
+                      while probing the table
+
+                    ``qualified_table_ref`` MUST already be quoted via
+                    ``build_quoted_table_ref``; this method splices it directly
+                    into the FROM clause of the probe SQL. The user-controlled
+                    table name is never inserted into SQL except through that
+                    quoting path.
+                    """
+                    deadline_s = self._REAL_MODE_VALIDATION_DEADLINE_S
+                    start = time.monotonic()
+
+                    # 1. Existence + SELECT-permission probe. ``WHERE 1=0`` returns
+                    #    an empty result set on every engine if the table exists
+                    #    and the caller has SELECT on it; otherwise the driver
+                    #    raises an engine-specific exception.
                     cursor = conn.cursor()
                     try:
-                        if self.engine in ("postgres", "mysql"):
+                        try:
                             cursor.execute(
-                                "SELECT id FROM " + self.TABLE_NAME +
-                                " WHERE id = 1 FOR UPDATE"
+                                "SELECT 1 FROM " + qualified_table_ref
+                                + " WHERE 1=0"
                             )
-                        elif self.engine == "sqlserver":
-                            cursor.execute(
-                                "SELECT id FROM dbo." + self.TABLE_NAME +
-                                " WITH (UPDLOCK, HOLDLOCK) WHERE id = 1"
+                            cursor.fetchall()
+                        except Exception as exc:  # noqa: BLE001
+                            if self._is_relation_missing_error(self.engine, exc):
+                                sys.stderr.write(
+                                    "ERROR: Target table %s does not exist in "
+                                    "database %s on %s:%d (engine=%s). "
+                                    "Underlying error: %s: %s\n"
+                                    % (qualified_table_ref, self.dbname,
+                                       self.endpoint, self.port, self.engine,
+                                       type(exc).__name__, str(exc))
+                                )
+                                sys.exit(20)
+                            if self._is_permission_denied_error(
+                                self.engine, exc,
+                            ):
+                                sys.stderr.write(
+                                    "ERROR: SELECT permission denied on target "
+                                    "table %s (engine=%s). Underlying error: "
+                                    "%s: %s\n"
+                                    % (qualified_table_ref, self.engine,
+                                       type(exc).__name__, str(exc))
+                                )
+                                sys.exit(24)
+                            sys.stderr.write(
+                                "ERROR: Failed to probe existence of target "
+                                "table %s (engine=%s). Underlying error: %s: "
+                                "%s\n"
+                                % (qualified_table_ref, self.engine,
+                                   type(exc).__name__, str(exc))
                             )
-                        # Consume the row so the server has nothing outstanding.
-                        cursor.fetchall()
+                            sys.exit(24)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    # 2. Non-empty probe.
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            if self.engine == "sqlserver":
+                                cursor.execute(
+                                    "SELECT TOP 1 1 FROM " + qualified_table_ref
+                                )
+                            else:
+                                cursor.execute(
+                                    "SELECT 1 FROM " + qualified_table_ref
+                                    + " LIMIT 1"
+                                )
+                            row = cursor.fetchone()
+                        except Exception as exc:  # noqa: BLE001
+                            if self._is_permission_denied_error(
+                                self.engine, exc,
+                            ):
+                                sys.stderr.write(
+                                    "ERROR: SELECT permission denied on target "
+                                    "table %s (engine=%s). Underlying error: "
+                                    "%s: %s\n"
+                                    % (qualified_table_ref, self.engine,
+                                       type(exc).__name__, str(exc))
+                                )
+                                sys.exit(24)
+                            sys.stderr.write(
+                                "ERROR: Failed to probe target table %s for "
+                                "rows (engine=%s). Underlying error: %s: %s\n"
+                                % (qualified_table_ref, self.engine,
+                                   type(exc).__name__, str(exc))
+                            )
+                            sys.exit(24)
+                        if row is None:
+                            sys.stderr.write(
+                                "ERROR: Target table %s contains zero rows; "
+                                "cannot select a row to lock (engine=%s).\n"
+                                % (qualified_table_ref, self.engine)
+                            )
+                            sys.exit(21)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    # 3. Deadline check (Requirement 2.6). Both probes must
+                    #    complete inside the budget; we evaluate the elapsed
+                    #    wall-clock once after both have finished so a single
+                    #    slow probe still trips the deadline.
+                    elapsed = time.monotonic() - start
+                    if elapsed > deadline_s:
+                        sys.stderr.write(
+                            "ERROR: Real_Mode pre-flight checks exceeded %.1fs "
+                            "deadline against %s (engine=%s). Elapsed: %.2fs.\n"
+                            % (deadline_s, qualified_table_ref, self.engine,
+                               elapsed)
+                        )
+                        sys.exit(22)
+
+                def _introspect_primary_key(
+                    self, conn, schema: Optional[str], table: str,
+                ) -> List[str]:
+                    """Discover ordered primary-key column names for the target table.
+
+                    The table name (and schema, on SQL Server) is passed to the
+                    metadata query via parameter binding only, never via string
+                    concatenation. The query selects from the engine-appropriate
+                    metadata views:
+
+                    * ``information_schema.table_constraints`` joined with
+                      ``information_schema.key_column_usage`` for postgres and
+                      mysql (mysql additionally scopes by ``DATABASE()``)
+                    * ``sys.indexes`` + ``sys.index_columns`` + ``sys.columns``
+                      for sqlserver, with the table identified by
+                      ``OBJECT_ID(?)`` so both schema-qualified and unqualified
+                      names resolve correctly
+
+                    Returns the ordered list of column names in PK ordinal
+                    position. Exits the process with code 23 if the table has no
+                    primary key constraint, or 24 if the metadata query fails
+                    (typically because the database user lacks SELECT on the
+                    metadata views).
+                    """
+                    engine = self.engine
+                    if engine == "postgres":
+                        sql = (
+                            "SELECT kcu.column_name, kcu.ordinal_position "
+                            "FROM information_schema.table_constraints tc "
+                            "JOIN information_schema.key_column_usage kcu "
+                            "  ON tc.constraint_name = kcu.constraint_name "
+                            " AND tc.table_schema = kcu.table_schema "
+                            " AND tc.table_name = kcu.table_name "
+                            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                            "  AND tc.table_name = %s "
+                            "ORDER BY kcu.ordinal_position"
+                        )
+                        params = (table,)
+                        metadata_views = (
+                            "information_schema.table_constraints, "
+                            "information_schema.key_column_usage"
+                        )
+                    elif engine == "mysql":
+                        sql = (
+                            "SELECT kcu.column_name, kcu.ordinal_position "
+                            "FROM information_schema.table_constraints tc "
+                            "JOIN information_schema.key_column_usage kcu "
+                            "  ON tc.constraint_schema = kcu.constraint_schema "
+                            " AND tc.constraint_name = kcu.constraint_name "
+                            " AND tc.table_schema = kcu.table_schema "
+                            " AND tc.table_name = kcu.table_name "
+                            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                            "  AND tc.table_schema = DATABASE() "
+                            "  AND tc.table_name = %s "
+                            "ORDER BY kcu.ordinal_position"
+                        )
+                        params = (table,)
+                        metadata_views = (
+                            "information_schema.table_constraints, "
+                            "information_schema.key_column_usage"
+                        )
+                    elif engine == "sqlserver":
+                        sql = (
+                            "SELECT c.name AS column_name, ic.key_ordinal "
+                            "FROM sys.indexes i "
+                            "JOIN sys.index_columns ic "
+                            "  ON i.object_id = ic.object_id "
+                            " AND i.index_id = ic.index_id "
+                            "JOIN sys.columns c "
+                            "  ON ic.object_id = c.object_id "
+                            " AND ic.column_id = c.column_id "
+                            "WHERE i.is_primary_key = 1 "
+                            "  AND i.object_id = OBJECT_ID(?) "
+                            "ORDER BY ic.key_ordinal"
+                        )
+                        # OBJECT_ID resolves both 'dbo.orders' and bare 'orders'
+                        # (the latter against the caller's default schema).
+                        if schema:
+                            params = (schema + "." + table,)
+                        else:
+                            params = (table,)
+                        metadata_views = (
+                            "sys.indexes, sys.index_columns, sys.columns"
+                        )
+                    else:
+                        sys.stderr.write(
+                            "ERROR: Unsupported DatabaseEngine %r for Real_Mode "
+                            "introspection.\n" % (engine,)
+                        )
+                        sys.exit(4)
+
+                    qualified = (schema + "." + table) if schema else table
+
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            cursor.execute(sql, params)
+                            rows = cursor.fetchall()
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write(
+                                "ERROR: Failed to introspect primary key of "
+                                "%s (engine=%s): %s: %s. Verify that "
+                                "DatabaseUser %s has SELECT on %s.\n"
+                                % (qualified, engine, type(exc).__name__,
+                                   str(exc), self.user, metadata_views)
+                            )
+                            sys.exit(24)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if not rows:
+                        sys.stderr.write(
+                            "ERROR: Target table %s has no primary key "
+                            "constraint and cannot be targeted in Real_Mode "
+                            "(engine=%s).\n"
+                            % (qualified, engine)
+                        )
+                        sys.exit(23)
+
+                    # rows is a list of (column_name, ordinal_position) tuples
+                    # already in ordinal-position order via the SQL ORDER BY.
+                    return [str(row[0]) for row in rows]
+
+                def _select_target_row(
+                    self, conn, qualified_table_ref: str,
+                    pk_columns: List[str],
+                ) -> Tuple:
+                    """Select the first row's PK values, ordered by PK ascending.
+
+                    Returns a tuple of column values in the same order as
+                    ``pk_columns``. Each PK column name is rendered through
+                    ``quote_identifier`` so the SQL is safe even if the
+                    introspection query yielded a column name containing the
+                    engine's quote character.
+
+                    Exits the process with code 21 if the table has become
+                    empty between validation and selection (Requirement 4.6 /
+                    10.2), or 24 if the SELECT itself fails for any other
+                    reason.
+                    """
+                    engine = self.engine
+                    quoted_cols = ", ".join(
+                        quote_identifier(engine, c) for c in pk_columns
+                    )
+                    if engine == "sqlserver":
+                        sql = (
+                            "SELECT TOP 1 " + quoted_cols + " FROM "
+                            + qualified_table_ref + " ORDER BY "
+                            + quoted_cols + " ASC"
+                        )
+                    else:
+                        sql = (
+                            "SELECT " + quoted_cols + " FROM "
+                            + qualified_table_ref + " ORDER BY "
+                            + quoted_cols + " ASC LIMIT 1"
+                        )
+
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            cursor.execute(sql)
+                            row = cursor.fetchone()
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write(
+                                "ERROR: Failed to select target row from %s "
+                                "(engine=%s): %s: %s\n"
+                                % (qualified_table_ref, engine,
+                                   type(exc).__name__, str(exc))
+                            )
+                            sys.exit(24)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if row is None:
+                        sys.stderr.write(
+                            "ERROR: Target table %s contains zero rows; cannot "
+                            "select a row to lock (engine=%s).\n"
+                            % (qualified_table_ref, engine)
+                        )
+                        sys.exit(21)
+
+                    return tuple(row)
+
+                # ----- Blocker --------------------------------------------------------
+
+                def _acquire_blocker_lock(
+                    self, conn,
+                    lock_sql: Optional[str] = None,
+                    pk_values: Optional[Tuple] = None,
+                ) -> bool:
+                    """Acquire the Blocker's row-level exclusive lock.
+
+                    Synthetic_Mode (``lock_sql is None``): executes the
+                    hard-coded ``SELECT ... FOR UPDATE`` (postgres/mysql) or
+                    ``SELECT ... WITH (UPDLOCK, HOLDLOCK)`` (sqlserver) against
+                    ``self.TABLE_NAME`` with ``id = 1``. The synthetic table is
+                    seeded by ``ensure_table`` immediately before this call, so
+                    the row always exists; the method returns True.
+
+                    Real_Mode (``lock_sql`` provided): executes ``lock_sql``
+                    with ``pk_values`` bound. The lock SQL is built once by
+                    ``build_lock_query`` and reused for the Blocker and every
+                    Waiter so both modes share the same plumbing. Returns False
+                    if ``cursor.fetchone()`` yields no row (the target row was
+                    deleted between ``select_target_row`` and lock acquisition);
+                    the caller in ``_run_real_mode`` is expected to translate
+                    this into the design's exit-25 path. Returns True on
+                    successful lock acquisition.
+                    """
+                    cursor = conn.cursor()
+                    try:
+                        if lock_sql is None:
+                            # Synthetic_Mode: hard-coded path (preserved
+                            # verbatim from the pre-refactor implementation).
+                            if self.engine in ("postgres", "mysql"):
+                                cursor.execute(
+                                    "SELECT id FROM " + self.TABLE_NAME +
+                                    " WHERE id = 1 FOR UPDATE"
+                                )
+                            elif self.engine == "sqlserver":
+                                cursor.execute(
+                                    "SELECT id FROM dbo." + self.TABLE_NAME +
+                                    " WITH (UPDLOCK, HOLDLOCK) WHERE id = 1"
+                                )
+                            # Consume the row so the server has nothing
+                            # outstanding.
+                            cursor.fetchall()
+                            return True
+                        # Real_Mode: parameter-bound dynamic SQL. The user-
+                        # supplied table name is already quoted inside
+                        # ``lock_sql`` via ``build_quoted_table_ref`` and
+                        # primary-key values are passed via driver bindings,
+                        # never via string concatenation.
+                        cursor.execute(
+                            lock_sql,
+                            pk_values if pk_values is not None else (),
+                        )
+                        row = cursor.fetchone()
+                        if row is None:
+                            # Row was deleted between selection and lock
+                            # acquisition. Caller (orchestrator from task 3.2)
+                            # is responsible for emitting the diagnostic and
+                            # exit code 25.
+                            return False
+                        # Drain any remaining rows so the server has nothing
+                        # outstanding (the lock SQL is LIMIT/TOP 1 by
+                        # construction, but be defensive across drivers).
+                        try:
+                            cursor.fetchall()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return True
                     finally:
                         try:
                             cursor.close()
@@ -681,7 +1181,26 @@ mainSteps:
 
                 # ----- Waiters --------------------------------------------------------
 
-                def _waiter_worker(self, waiter_id: int) -> None:
+                def _waiter_worker(
+                    self, waiter_id: int,
+                    lock_sql: Optional[str] = None,
+                    pk_values: Optional[Tuple] = None,
+                ) -> None:
+                    """Run a single Waiter session against the Blocker-held row.
+
+                    Synthetic_Mode (``lock_sql is None``): issues the existing
+                    hard-coded ``UPDATE fis_blocking_locks_target SET counter =
+                    counter + 1 WHERE id = 1`` so the Waiter contends with the
+                    Blocker's row lock and then commits.
+
+                    Real_Mode (``lock_sql`` provided): issues ``lock_sql`` with
+                    ``pk_values`` bound — the same locking SELECT used by the
+                    Blocker. The locking SELECT itself blocks on the Blocker's
+                    exclusive row lock; once the Blocker releases the lock, the
+                    Waiter's SELECT returns, commits, and closes. No INSERT,
+                    UPDATE, or DELETE is ever issued against the user-supplied
+                    table.
+                    """
                     try:
                         conn = self._connect()
                     except SystemExit:
@@ -694,14 +1213,37 @@ mainSteps:
                     try:
                         cursor = conn.cursor()
                         try:
-                            cursor.execute(
-                                "UPDATE " + self.TABLE_NAME +
-                                " SET counter = counter + 1 WHERE id = 1"
-                            )
-                            conn.commit()
+                            if lock_sql is None:
+                                # Synthetic_Mode: hard-coded UPDATE preserved
+                                # verbatim from the pre-refactor implementation.
+                                cursor.execute(
+                                    "UPDATE " + self.TABLE_NAME +
+                                    " SET counter = counter + 1 WHERE id = 1"
+                                )
+                                conn.commit()
+                            else:
+                                # Real_Mode: locking SELECT against the same
+                                # row as the Blocker. The SELECT blocks until
+                                # the Blocker releases its exclusive lock.
+                                cursor.execute(
+                                    lock_sql,
+                                    pk_values if pk_values is not None else (),
+                                )
+                                # Drain rows; many drivers require this before
+                                # commit even when the result is small.
+                                try:
+                                    cursor.fetchall()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                conn.commit()
                         except Exception as exc:  # noqa: BLE001
-                            print("Waiter %d: UPDATE/COMMIT failed: %s: %s"
-                                  % (waiter_id, type(exc).__name__, str(exc)))
+                            op_label = (
+                                "UPDATE/COMMIT" if lock_sql is None
+                                else "locking SELECT/COMMIT"
+                            )
+                            print("Waiter %d: %s failed: %s: %s"
+                                  % (waiter_id, op_label,
+                                     type(exc).__name__, str(exc)))
                             try:
                                 conn.rollback()
                             except Exception:  # noqa: BLE001
@@ -717,7 +1259,18 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                def _ramp_waiters(self, schedule: List[Tuple[int, int]]) -> None:
+                def _ramp_waiters(
+                    self, schedule: List[Tuple[int, int]],
+                    lock_sql: Optional[str] = None,
+                    pk_values: Optional[Tuple] = None,
+                ) -> None:
+                    """Drive the Waiter ramp.
+
+                    ``lock_sql`` and ``pk_values`` are forwarded to each
+                    ``_waiter_worker`` thread so Synthetic_Mode (defaults of
+                    ``None``) and Real_Mode (non-None values built from the
+                    introspected primary key) share the same ramp plumbing.
+                    """
                     next_waiter_id = 1
                     total_started = 0
                     for step_idx, (wait_before, n) in enumerate(schedule, start=1):
@@ -726,7 +1279,7 @@ mainSteps:
                         for _ in range(n):
                             t = threading.Thread(
                                 target=self._waiter_worker,
-                                args=(next_waiter_id,),
+                                args=(next_waiter_id, lock_sql, pk_values),
                                 daemon=True,
                             )
                             t.start()
@@ -744,6 +1297,33 @@ mainSteps:
                     print("Engine: %s" % self.engine)
                     print("Endpoint: %s:%d  Database: %s  User: %s"
                           % (self.endpoint, self.port, self.dbname, self.user))
+                    mode_label = (
+                        "Real_Mode" if is_real_mode(self.target_table_name)
+                        else "Synthetic_Mode"
+                    )
+                    print("Mode: %s  TargetTableName: %s"
+                          % (mode_label, self.target_table_name))
+
+                    if is_real_mode(self.target_table_name):
+                        self._run_real_mode()
+                    else:
+                        self._run_synthetic_mode()
+
+                def _run_real_mode(self) -> None:
+                    """Real_Mode orchestration. Filled in by task 3.2.
+
+                    Until the Real_Mode orchestrator is implemented, dispatching
+                    here from ``run()`` is a hard error rather than a silent
+                    no-op so that operators get an immediate, diagnosable
+                    failure if they set ``TargetTableName`` to a non-default
+                    value before the feature is complete.
+                    """
+                    raise NotImplementedError(
+                        "Real_Mode is not yet implemented. "
+                        "TargetTableName=%r" % (self.target_table_name,)
+                    )
+
+                def _run_synthetic_mode(self) -> None:
                     print("WaiterCount: %d  ExperimentDuration: %ds  "
                           "RampTime: %ds  RampSteps: %d"
                           % (self.waiter_count, self.experiment_duration_s,

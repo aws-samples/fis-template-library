@@ -116,6 +116,29 @@ The experiment requires the following parameters:
 - **DatabasePasswordSecretArn**: ARN of Secrets Manager secret containing password
   - **Note** Since we don't know the ARN of your secret ahead of time, the sample SSM automation role ([database-blocking-locks-ssm-automation-role-iam-policy.json](database-blocking-locks-ssm-automation-role-iam-policy.json)) is given read access to all secrets, you should probably scope this down accordingly.
 
+### Target Table
+- **TargetTableName**: `String`. Default: `fis_blocking_locks_target`. Selects the table the harness operates against and, by extension, the experiment mode:
+  - **Default value (`fis_blocking_locks_target`)**: selects **Synthetic_Mode**. The harness creates the `fis_blocking_locks_target` table on startup (if it does not already exist), seeds a row, locks it, ramps Waiters that `UPDATE` it, and drops the table on clean shutdown if this run created it. No application data is touched.
+  - **Any other value**: enables **Real_Mode**. The harness targets the named application table, discovers its primary key via metadata views, selects the first row ordered by primary key, and locks it read-only via `SELECT ... FOR UPDATE` (PostgreSQL/MySQL) or `SELECT ... WITH (UPDLOCK, HOLDLOCK)` (SQL Server). No `INSERT`, `UPDATE`, `DELETE`, or DDL is executed against the named table.
+  - **WARNING**: Real_Mode causes **actual application impact**. Any application transaction that contends for the locked row will block for up to `ExperimentDuration`. Only set `TargetTableName` to a non-default value when you have intentionally opted into targeting a real application table and have understood the blast radius for your engine (see the Engine-Specific Blast Radius section).
+  - **SQL Server** accepts schema-qualified (`dbo.orders`) or unqualified (`orders`, defaulting to `dbo`) names.
+
+### Synthetic_Mode vs Real_Mode
+
+The experiment runs in one of two modes determined entirely by the value of `TargetTableName`. There is no separate mode flag — Real_Mode is opt-in by setting `TargetTableName` to any value other than the default.
+
+| Aspect | Synthetic_Mode | Real_Mode |
+| --- | --- | --- |
+| **How to enable** | `TargetTableName=fis_blocking_locks_target` (the default; also applies if the parameter is omitted) | `TargetTableName=<any other value>` |
+| **Table targeted** | `fis_blocking_locks_target`, an experiment-owned table that no application reads or writes | The user-supplied application table. PostgreSQL/MySQL: unqualified, scoped to the connection's current database/schema. SQL Server: schema-qualified (`dbo.orders`) or unqualified (`orders`, defaulting to `dbo`). |
+| **DDL/DML against the table** | The harness `CREATE TABLE`s the synthetic table on startup if missing, `INSERT`s seed row `id = 1`, and `DROP TABLE`s on clean shutdown if this run created it. | None. The harness issues **no** `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `INSERT`, `UPDATE`, `DELETE`, or `MERGE` against the named table at any point. |
+| **Blocker lock SQL** | PostgreSQL/MySQL: `SELECT id FROM fis_blocking_locks_target WHERE id = 1 FOR UPDATE`. SQL Server: `SELECT id FROM dbo.fis_blocking_locks_target WITH (UPDLOCK, HOLDLOCK) WHERE id = 1`. | PostgreSQL/MySQL: `SELECT <pk_cols> FROM <table> WHERE <pk_clause> FOR UPDATE`. SQL Server: `SELECT <pk_cols> FROM <table> WITH (UPDLOCK, HOLDLOCK) WHERE <pk_clause>`. The `<pk_cols>` and `<pk_clause>` are derived from the table's primary key, discovered at runtime via engine-native metadata views. |
+| **Waiter lock SQL** | `UPDATE fis_blocking_locks_target SET counter = counter + 1 WHERE id = 1` (writes the experiment-owned row). | The same locking `SELECT` statement used by the Blocker. Waiters never `UPDATE`, `INSERT`, or `DELETE`. |
+| **Application impact** | None. No application transaction touches `fis_blocking_locks_target`, so the experiment is invisible to your workload except via the engine-specific blocked-waiter metric. | **Real.** Any application transaction that contends for the locked row blocks for up to `ExperimentDuration`. The exact set of statements that block (writes only, or writes plus plain reads) depends on the engine — see the Engine-Specific Blast Radius section. |
+| **Cleanup of the target table** | The harness drops `fis_blocking_locks_target` on clean shutdown if this run created it. A pre-existing matching table is left in place. | The harness performs no DDL or DML against the named table on cleanup. The table contains the same rows with the same column values after the experiment as before. |
+
+The shipped FIS experiment template sets `TargetTableName` to `fis_blocking_locks_target` in `documentParameters`, so an out-of-the-box deploy runs in Synthetic_Mode unchanged.
+
 ### Contention Settings
 - **WaiterCount**: Total number of Waiter sessions to ramp up against the Blocker-held row (default: 50). Each currently-blocked Waiter contributes approximately 1 to the engine-specific blocked-waiter count.
 - **ExperimentDuration**: Total experiment duration in ISO8601 format (default: PT10M = 10 minutes, e.g., PT1H = 1 hour, PT30M = 30 minutes). **This parameter controls how long the Blocker session holds the row lock.**
@@ -184,6 +207,58 @@ The experiment requires the following parameters:
 17. The harness joins all Waiter threads.
 18. If this run created the `fis_blocking_locks_target` table, the harness drops it. If a pre-existing matching table was reused, the harness leaves it in place.
 19. The automation terminates the EC2 instance, waits for termination to complete, revokes the ingress rule from the database security group, and deletes the ephemeral security group.
+
+## Engine-Specific Blast Radius
+
+The set of application statements that block on the locked row depends on the database engine and, for SQL Server, on the configured isolation level. This section is most relevant when running in Real_Mode against an application table, where any application transaction that contends for the locked row will block for up to `ExperimentDuration`. Synthetic_Mode operates against an experiment-owned table that no application reads or writes, so the engine-specific blast radius described here is invisible to your workload.
+
+### PostgreSQL (Aurora PostgreSQL and RDS PostgreSQL)
+
+PostgreSQL uses MVCC (Multi-Version Concurrency Control). While the Blocker holds the row lock on the target row, the following statements against the locked row will block:
+
+- `UPDATE`
+- `DELETE`
+- `SELECT ... FOR UPDATE`
+- `SELECT ... FOR NO KEY UPDATE`, `SELECT ... FOR SHARE`, `SELECT ... FOR KEY SHARE`
+
+Plain `SELECT` statements (without `FOR UPDATE`/`FOR SHARE`) are **not** blocked. PostgreSQL readers see the last-committed version of the row via MVCC and do not need to acquire a row-level lock.
+
+### MySQL/InnoDB (Aurora MySQL and RDS MySQL)
+
+MySQL with the default InnoDB storage engine also uses MVCC. While the Blocker holds the row lock on the target row, the following statements against the locked row will block:
+
+- `UPDATE`
+- `DELETE`
+- `SELECT ... FOR UPDATE`
+- `SELECT ... FOR SHARE` (and the legacy `LOCK IN SHARE MODE`)
+
+Plain `SELECT` statements are **not** blocked. InnoDB readers see a consistent snapshot via MVCC and do not need to acquire a row-level lock.
+
+### SQL Server (RDS SQL Server)
+
+SQL Server's blast radius depends on whether **Read Committed Snapshot Isolation (RCSI)** is enabled on the target database.
+
+**With RCSI off (the default):** SQL Server's default isolation level is `READ COMMITTED` and, with RCSI off, readers acquire shared locks. While the Blocker holds the row lock on the target row, the following statements against the locked row will block:
+
+- `UPDATE`
+- `DELETE`
+- Plain `SELECT` (because the reader needs a shared lock that is incompatible with the Blocker's update lock)
+
+This is a notably wider blast radius than PostgreSQL or MySQL because plain reads are also blocked.
+
+**With RCSI on:** Plain `SELECT` statements use row versioning instead of shared locks and are **not** blocked. `UPDATE`, `DELETE`, and locking reads (`SELECT ... WITH (UPDLOCK)`, `SELECT ... WITH (XLOCK)`, etc.) still block.
+
+**RCSI is OFF by default on RDS SQL Server.** Enabling RCSI on RDS Multi-AZ deployments may require additional steps because the underlying availability-group configuration imposes constraints on the `ALTER DATABASE ... SET READ_COMMITTED_SNAPSHOT ON` statement (the database must be the only user connection at the time of the change, and Multi-AZ failover groups can complicate that requirement). Consult the RDS SQL Server documentation and coordinate with your DBA before changing isolation settings on a Multi-AZ instance.
+
+**Recommended pre-flight check.** Before running the experiment in Real_Mode against SQL Server, query the target database to confirm whether RCSI is on or off so you understand which of the two blast-radius profiles applies:
+
+```sql
+SELECT name, snapshot_isolation_state_desc, is_read_committed_snapshot_on
+FROM sys.databases
+WHERE name = DB_NAME();
+```
+
+`is_read_committed_snapshot_on = 1` indicates RCSI is on (plain `SELECT` not blocked); `is_read_committed_snapshot_on = 0` indicates RCSI is off (plain `SELECT` is blocked).
 
 ## Stop Conditions
 
