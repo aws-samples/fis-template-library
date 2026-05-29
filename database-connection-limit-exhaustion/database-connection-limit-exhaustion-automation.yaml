@@ -189,6 +189,8 @@ mainSteps:
       SecurityGroupIds:
         - '{{ CreateSecurityGroup.SecurityGroupId }}'
       IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
       TagSpecifications:
         - ResourceType: 'instance'
           Tags:

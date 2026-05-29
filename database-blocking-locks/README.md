@@ -100,6 +100,20 @@ Before running this experiment, ensure that:
 3. **SSM Document**:
    - Deploy the SSM automation document (`database-blocking-locks-automation.yaml`) to your account
 
+### Real_Mode Prerequisites
+
+The following additional prerequisites apply **only when running in Real_Mode** (that is, when `TargetTableName` is set to any value other than the default `fis_blocking_locks_target`). Synthetic_Mode runs do not require any of the items in this subsection because the harness creates and owns the synthetic table itself.
+
+1. **Target table exists and is reachable from the database user.** The table named by `TargetTableName` must already exist in the database identified by `DatabaseName` and must be reachable from the connection opened with `DatabaseUser`. The harness does not create the target table in Real_Mode. SQL Server accepts schema-qualified (`dbo.orders`) or unqualified (`orders`, defaulting to `dbo`) names; PostgreSQL and MySQL resolve `TargetTableName` against the connection's current database/schema.
+2. **Target table has at least one row.** The harness selects the first row's primary key values (ordered by primary key ascending) and uses those values to acquire a row-level lock. A table with zero rows cannot be targeted; the harness will exit with a non-zero status code if the table is empty at validation time.
+3. **Target table has a primary key.** The harness discovers the primary key column(s) via metadata views and uses those columns in the lock-acquisition `WHERE` clause. A table with no primary key constraint cannot be targeted; the harness will exit with a non-zero status code in that case. Composite primary keys (multiple columns) are supported — all columns are used in their defined ordinal position.
+4. **The database user has `SELECT` on the target table AND on the engine-appropriate metadata views.** The `DatabaseUser` identified in the experiment parameters must have:
+   - `SELECT` on the target table (required to run the existence and non-empty probes and to select the target row's primary key values).
+   - `SELECT` on `information_schema.table_constraints` and `information_schema.key_column_usage` for PostgreSQL and MySQL (required for primary-key introspection).
+   - `SELECT` on `sys.indexes`, `sys.index_columns`, and `sys.columns` for SQL Server (required for primary-key introspection).
+
+   These are database-side privileges configured on the database user, not AWS IAM permissions; the FIS and SSM IAM policies shipped with this template are unchanged by Real_Mode.
+
 ## Parameters
 
 The experiment requires the following parameters:
@@ -163,6 +177,64 @@ The shipped FIS experiment template sets `TargetTableName` to `fis_blocking_lock
   6. **Note** there is no target defined in the FIS experiment template since this is managed through the SSM Automation document and the Document parameters you just entered, so **do not amend the target section of the template**
   7. Select **Save** and then **Update experiment template**
   8. You can now **Start experiment**
+
+### Example: Real_Mode `documentParameters`
+
+To run the experiment in Real_Mode, set `TargetTableName` to the name of an application table you want to target. The harness will introspect that table's primary key via engine-native metadata views, select the first row ordered by primary key, and acquire a row-level lock against that row using a read-only locking SELECT. Replace the placeholders with values that match your environment, and replace `application_orders` with the name of the application table you intend to target:
+
+```json
+{"DatabaseEngine":"postgres","DatabaseEndpoint":"database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com","DatabasePort":"5432","DatabaseName":"appdb","DatabaseUser":"fis_runner","DatabasePasswordSecretArn":"arn:aws:secretsmanager:eu-west-1:123456789012:secret:fis/db-password-xxxxxx","TargetTableName":"application_orders","WaiterCount":"50","ExperimentDuration":"PT30M","RampTime":"PT10M","RampSteps":"10","VpcId":"vpc-1234567abcd","SubnetId":"subnet-1234-abcdef","DatabaseSecurityGroupId":"sg-1234567abcd","InstanceType":"t3.small"}
+```
+
+For SQL Server, `TargetTableName` accepts schema-qualified (`dbo.application_orders`) or unqualified (`application_orders`, defaulting to `dbo`) names. Before setting `TargetTableName` to a non-default value, confirm the target table satisfies the items in the Real_Mode Prerequisites subsection above.
+
+### Real_Mode safety posture
+
+Real_Mode never executes `INSERT`, `UPDATE`, `DELETE`, or DDL (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `MERGE`) against the target table. Both the Blocker and every Waiter acquire row locks using read-only locking statements only — `SELECT ... FOR UPDATE` on PostgreSQL and MySQL, or `SELECT ... WITH (UPDLOCK, HOLDLOCK)` on SQL Server — against the row identified by the primary key values selected at pre-flight time. After the experiment completes (whether normally or via early termination), the target table contains exactly the same rows with the same column values as before the experiment started: zero rows are inserted, zero rows are updated, zero rows are deleted, and the table's schema is unchanged. The only effect on the target table is transient row-level lock contention against the selected row for the duration of the experiment; once the Blocker COMMITs and the Waiters unblock, the contention disappears and the table is byte-for-byte equivalent to its pre-experiment state.
+
+### Real_Mode exit codes
+
+When the harness fails during Real_Mode pre-flight or lock acquisition, it exits with one of the following codes and emits a diagnostic on standard error. SSM surfaces the exit code as the `InjectBlockingLocks` step's failure output, so operators can map the step exit code back to a root cause without reading the full CloudWatch Logs stream. Every Real_Mode error path exits **before** any DDL or DML write would be issued against the user-supplied table, so a non-zero exit guarantees the target database is unmodified.
+
+Each diagnostic includes the qualified table reference, the engine, and (where applicable) the underlying driver exception class and message; introspection failures additionally name the engine-appropriate metadata views so operators know which permission to grant.
+
+- **Exit 20 — Target table does not exist.**
+  - Trigger: `validate_target_table` issued `SELECT 1 FROM <qualified_table_ref> WHERE 1=0` and the engine reported the relation as missing (PostgreSQL `UndefinedTable`, MySQL `1146 Table ... doesn't exist`, SQL Server `Invalid object name`).
+  - Diagnostic: `ERROR: Target table <qualified_table_ref> does not exist in database <DatabaseName> on <DatabaseEndpoint>:<DatabasePort> (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
+  - Most common cause: misspelled `TargetTableName`, wrong `DatabaseName`, or the target table lives in a schema other than the connection's default schema (PostgreSQL/MySQL) or `dbo` (SQL Server). For SQL Server, prefer the schema-qualified form (`dbo.orders`).
+
+- **Exit 21 — Target table is empty.**
+  - Trigger: either the non-empty probe in `validate_target_table` (`SELECT 1 FROM <ref> LIMIT 1` on PostgreSQL/MySQL, `SELECT TOP 1 1 FROM <ref>` on SQL Server) returned no rows, or `select_target_row` returned no row because the table became empty between validation and selection.
+  - Diagnostic: `ERROR: Target table <qualified_table_ref> contains zero rows; cannot select a row to lock (engine=<DatabaseEngine>).`
+  - Most common cause: the target table really is empty, or it was emptied by an application transaction during the brief pre-flight window. Real_Mode requires at least one row at the moment of row selection.
+
+- **Exit 22 — Pre-flight checks exceeded the 10s deadline.**
+  - Trigger: the existence probe and the non-empty probe combined took longer than 10 seconds of wall-clock time (Requirement 2.6). The deadline is evaluated once after both probes complete.
+  - Diagnostic: `ERROR: Real_Mode pre-flight checks exceeded 10.0s deadline against <qualified_table_ref> (engine=<DatabaseEngine>). Elapsed: <seconds>s.`
+  - Most common cause: the database is overloaded, the target table is so large that even a `LIMIT 1` probe is slow under contention, or network latency between the load generator and the database is unusually high. The harness fails closed rather than blocking the experiment indefinitely on a slow database.
+
+- **Exit 23 — Target table has no primary key.**
+  - Trigger: `introspect_primary_key` ran the engine-specific metadata query and the result set was empty, meaning the table has no `PRIMARY KEY` constraint (PostgreSQL/MySQL) or no index with `is_primary_key = 1` (SQL Server).
+  - Diagnostic: `ERROR: Target table <qualified> has no primary key constraint and cannot be targeted in Real_Mode (engine=<DatabaseEngine>).`
+  - Most common cause: the target table was modelled without a primary key. Real_Mode requires a primary key to deterministically identify and lock a single row; tables with only a unique index, only a clustered index without `is_primary_key = 1`, or no key at all are not supported.
+
+- **Exit 24 — Introspection failed / permission denied.**
+  - Trigger: any of the metadata or probe queries raised an exception. There are four call sites, each with its own diagnostic shape:
+    - Existence probe denied: `ERROR: SELECT permission denied on target table <qualified_table_ref> (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
+    - Existence probe other failure: `ERROR: Failed to probe existence of target table <qualified_table_ref> (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
+    - Non-empty probe failed: `ERROR: Failed to probe target table <qualified_table_ref> for rows (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
+    - Primary-key introspection failed: `ERROR: Failed to introspect primary key of <qualified> (engine=<DatabaseEngine>): <ExceptionClass>: <message>. Verify that DatabaseUser <DatabaseUser> has SELECT on <metadata_views>.`
+    - Target-row select failed: `ERROR: Failed to select target row from <qualified_table_ref> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+  - Most common cause: the database user identified by `DatabaseUser` lacks `SELECT` on the target table or on the engine-appropriate metadata views — `information_schema.table_constraints` and `information_schema.key_column_usage` for PostgreSQL and MySQL, or `sys.indexes`, `sys.index_columns`, and `sys.columns` for SQL Server. The introspection-failure diagnostic names the metadata views the harness queried so the DBA knows exactly which `GRANT SELECT` to issue.
+
+- **Exit 25 — Blocker failed to acquire the lock; row deleted between selection and lock acquisition.**
+  - Trigger: the Blocker connection executed the locking SELECT (`SELECT <pk_cols> FROM <ref> WHERE <pk_clause> FOR UPDATE` on PostgreSQL/MySQL, or the `WITH (UPDLOCK, HOLDLOCK)` form on SQL Server) and either the driver raised an exception, or the statement returned zero rows. Returning zero rows means the row identified by the primary-key values selected at pre-flight time is no longer present.
+  - Diagnostics:
+    - Driver exception: `ERROR: Blocker failed to acquire lock on <qualified_ref> where pk=<pk_values> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+    - Row deleted: `ERROR: Blocker failed to acquire lock on <qualified_ref> where pk=<pk_values>; row may have been deleted between selection and lock acquisition (engine=<DatabaseEngine>).`
+  - Most common cause: a concurrent application transaction deleted the selected row between pre-flight row selection and Blocker lock acquisition. The harness deliberately does not retry — re-selecting a different row would change the experiment's blast radius silently. Re-running the experiment will pick a different first row if the deletion has been committed.
+
+Exit codes outside the 20–25 range are not Real_Mode-specific and retain their original meaning (`1` argv parsing, `2` Secrets Manager retrieval, `3` database connect failure, `4` unsupported `DatabaseEngine`, `5` Synthetic_Mode lock acquisition failure, `6` Synthetic_Mode `ensure_target_table` failure).
 
 ## How It Works
 

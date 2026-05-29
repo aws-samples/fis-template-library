@@ -1,5 +1,5 @@
 schemaVersion: '0.3'
-description: 'Create ephemeral load generator and inject row-level blocking locks into the target database'
+description: 'Create load generator and inject blocking locks'
 assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/DatabaseBlockingLocks-SSM-Automation-Role'
 
 parameters:
@@ -23,7 +23,7 @@ parameters:
 
   DatabaseName:
     type: String
-    description: 'Database name to connect to (postgres: postgres, mysql: mysql, sqlserver: master)'
+    description: 'Database name to connect to'
     default: 'postgres'
 
   DatabaseUser:
@@ -37,7 +37,7 @@ parameters:
 
   WaiterCount:
     type: String
-    description: 'Total number of Waiter sessions to ramp up against the Blocker-held row'
+    description: 'Total number of Waiter sessions to ramp to'
     default: '50'
 
   ExperimentDuration:
@@ -77,6 +77,11 @@ parameters:
     description: 'Amazon Linux 2023 AMI ID'
     default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
 
+  TargetTableName:
+    type: String
+    description: 'Target table for blocking locks'
+    default: 'fis_blocking_locks_target'
+
 mainSteps:
   - name: CreateSecurityGroup
     action: 'aws:executeAwsApi'
@@ -86,7 +91,7 @@ mainSteps:
       Service: ec2
       Api: CreateSecurityGroup
       GroupName: 'FIS-DatabaseBlockingLocks-LoadGen-{{ automation:EXECUTION_ID }}'
-      Description: 'Temporary security group for FIS database blocking locks experiment'
+      Description: 'FIS database blocking locks experiment'
       VpcId: '{{ VpcId }}'
       TagSpecifications:
         - ResourceType: 'security-group'
@@ -189,6 +194,8 @@ mainSteps:
       SecurityGroupIds:
         - '{{ CreateSecurityGroup.SecurityGroupId }}'
       IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
       TagSpecifications:
         - ResourceType: 'instance'
           Tags:
@@ -285,44 +292,20 @@ mainSteps:
             #!/bin/bash
             set -e
 
-            # Write the blocking-locks harness to a local file. The heredoc is
-            # single-quoted ('PYTHON_EOF') so no shell or SSM expansion happens
-            # inside the script body; SSM parameters are substituted on the
-            # python3 invocation line below and passed as positional argv.
+            # Write the blocking-locks harness to a local file.
             cat > /tmp/blocking_locks_harness.py << 'PYTHON_EOF'
             import json
             import sys
             import threading
             import time
             import traceback
-            from typing import List, Optional, Tuple
-
+            from typing import Any, List, Optional, Tuple
             import boto3
-
-
-            # ---------------------------------------------------------------------
-            # Pure SQL-rendering helpers (module-level, no DB driver imports).
-            #
-            # These helpers are the **single source of truth** for the synthetic
-            # target-table name, the Synthetic_Mode vs Real_Mode test, and all
-            # dynamic SQL identifier rendering used by the Real_Mode code paths.
-            #
-            # The bodies of these helpers are mirrored byte-for-byte (modulo
-            # leading whitespace forced by this YAML heredoc's indentation) in
-            # ``database-blocking-locks/tests/sql_helpers.py`` so that the
-            # ``hypothesis`` property tests can exercise them without requiring
-            # ``boto3``, ``psycopg2``, ``mysql.connector``, or ``pyodbc``.
-            #
-            # If you change a helper's body here, update ``tests/sql_helpers.py``
-            # in the same commit (and vice versa).
-            # ---------------------------------------------------------------------
 
             DEFAULT_SYNTHETIC_TABLE = "fis_blocking_locks_target"
 
-
             def is_real_mode(target_table_name: str) -> bool:
                 return target_table_name != DEFAULT_SYNTHETIC_TABLE
-
 
             def quote_identifier(engine: str, name: str) -> str:
                 if engine == "postgres":
@@ -333,7 +316,6 @@ mainSteps:
                     return "[" + name.replace("]", "]]") + "]"
                 raise ValueError("unsupported engine: %r" % engine)
 
-
             def parse_qualified_table_name(engine: str, name: str) -> Tuple[Optional[str], str]:
                 if engine == "sqlserver":
                     if "." in name:
@@ -342,19 +324,16 @@ mainSteps:
                     return ("dbo", name)
                 return (None, name)
 
-
             def build_quoted_table_ref(engine: str, schema: Optional[str], table: str) -> str:
                 if engine == "sqlserver":
                     return (quote_identifier("sqlserver", schema) + "."
                             + quote_identifier("sqlserver", table))
                 return quote_identifier(engine, table)
 
-
             def build_pk_where_clause(engine: str, pk_columns: List[str]) -> str:
                 marker = "?" if engine == "sqlserver" else "%s"
                 quoted = [quote_identifier(engine, c) for c in pk_columns]
                 return " AND ".join("%s = %s" % (col, marker) for col in quoted)
-
 
             def build_lock_query(engine: str, qualified_table_ref: str,
                                  pk_columns: List[str]) -> str:
@@ -366,16 +345,9 @@ mainSteps:
                 return ("SELECT " + quoted_cols + " FROM " + qualified_table_ref
                         + " WHERE " + where_clause + " FOR UPDATE")
 
-
             class BlockingLocksHarness:
-                """Single-Blocker / N-Waiter row-lock contention harness.
-
-                Owns a dedicated target table (fis_blocking_locks_target). Opens
-                one Blocker session that acquires a row-level lock for the full
-                ExperimentDuration using an in-process sleep, while WaiterCount
-                Waiter sessions are ramped in across RampSteps over RampTime and
-                block on the same row. On shutdown, joins all Waiters and drops
-                the target table only if this run created it.
+                """
+                Single-Blocker / N-Waiter row-lock contention harness.
                 """
 
                 TABLE_NAME = DEFAULT_SYNTHETIC_TABLE
@@ -392,16 +364,11 @@ mainSteps:
                     experiment_duration_s: int,
                     ramp_time_s: int,
                     ramp_steps: int,
-                    target_table_name: str = DEFAULT_SYNTHETIC_TABLE,
+                    target_table_name: str,
                 ) -> None:
-                    # NOTE: ``target_table_name`` is given a default of
-                    # DEFAULT_SYNTHETIC_TABLE here so that the mode-dispatch
-                    # refactor introduced by task 2.1 can land before the
-                    # constructor wiring change in task 5.3 (which makes the
-                    # parameter required and threads it through ``main()``).
-                    # Behaviour with the default is identical to the previous
-                    # implementation: ``is_real_mode`` returns False and the
-                    # synthetic-mode code path runs.
+                    # ``target_table_name`` from SSM: equal to
+                    # ``DEFAULT_SYNTHETIC_TABLE`` → Synthetic_Mode, else
+                    # Real_Mode.
                     self.engine = engine
                     self.endpoint = endpoint
                     self.port = port
@@ -418,15 +385,10 @@ mainSteps:
                     self._waiter_threads: List[threading.Thread] = []
                     self._blocker_terminated_early = False
 
-                # ----- pure helpers ---------------------------------------------------
-
                 @staticmethod
                 def parse_iso8601_duration(duration: str) -> int:
-                    """Parse an ISO 8601 duration of the PT[nH][nM][nS] form into seconds.
-
-                    Mirrors the parser used by the database-connection-limit-exhaustion
-                    harness: tolerant of missing components, only supports hours/minutes/
-                    seconds (the durations the template exposes).
+                    """
+                    Parse an ISO 8601 duration of the PT[nH][nM][nS] form into seconds.
                     """
                     if not duration or not duration.startswith("PT"):
                         raise ValueError(
@@ -454,21 +416,12 @@ mainSteps:
                     ramp_time_seconds: int,
                     experiment_duration_seconds: int,
                 ) -> List[Tuple[int, int]]:
-                    """Compute the Waiter ramp schedule as (wait_before_s, waiters_to_start) tuples.
-
-                    Rules (per design and requirements 8.1-8.6):
-                      - effective_ramp_steps = min(ramp_steps, waiter_count)
-                      - If ramp_time > experiment_duration, clamp ramp_time = experiment_duration
-                      - If ramp_time == 0 (or waiter_count == 0): single step, all waiters at t=0
-                      - Otherwise spread waiters across steps evenly; the remainder lands on
-                        the final step so the sum of waiters_to_start equals waiter_count.
-                      - First tuple always has wait_before_s == 0 (start immediately). Each
-                        subsequent tuple's wait_before_s is the gap to wait before that step.
+                    """
+                    Compute the Waiter ramp schedule as (wait_before_s, waiters_to_start) tuples.
                     """
                     if waiter_count <= 0:
                         return []
 
-                    # Clamp ramp time to experiment duration (log in the caller; pure here).
                     if ramp_time_seconds > experiment_duration_seconds:
                         ramp_time_seconds = experiment_duration_seconds
 
@@ -482,11 +435,7 @@ mainSteps:
                     per_step = waiter_count // effective_steps
                     remainder = waiter_count - per_step * effective_steps
 
-                    # Integer step-delay seconds. Use float-derived integer so we
-                    # do not drift past ramp_time_seconds when summed.
                     step_delay = ramp_time_seconds // effective_steps
-                    # Guarantee forward progress: if integer division floored to 0
-                    # but we have more than one step, use 1s spacing.
                     if step_delay <= 0:
                         step_delay = 1
 
@@ -498,7 +447,6 @@ mainSteps:
                             waiters_this_step += remainder
                         schedule.append((wait_before, waiters_this_step))
 
-                    # Defensive invariant: sum must equal waiter_count.
                     assert sum(n for _, n in schedule) == waiter_count, (
                         "compute_ramp_schedule invariant violated: "
                         "sum(waiters_to_start)=%d != waiter_count=%d"
@@ -506,16 +454,10 @@ mainSteps:
                     )
                     return schedule
 
-                # ----- Secrets Manager ------------------------------------------------
-
                 @staticmethod
                 def get_password(secret_arn: str, region: str) -> str:
-                    """Fetch the database password from Secrets Manager.
-
-                    Accepts either a JSON secret with a 'password' key, or a raw string
-                    secret which is used verbatim. On any error the process exits
-                    non-zero with a diagnostic that names the ARN but never includes
-                    the secret value.
+                    """
+                    Fetch the database password from Secrets Manager.
                     """
                     try:
                         client = boto3.client("secretsmanager", region_name=region)
@@ -546,13 +488,9 @@ mainSteps:
                         return parsed["password"]
                     return secret_string
 
-                # ----- Engine dispatch ------------------------------------------------
-
                 def _connect(self):
-                    """Open a new connection to the target database with autocommit off.
-
-                    Raises SystemExit(3) if the engine is unsupported or the connection
-                    cannot be established.
+                    """
+                    Open a new connection to the target database with autocommit off.
                     """
                     engine = self.engine
                     try:
@@ -647,11 +585,8 @@ mainSteps:
                     return False
 
                 def ensure_table(self, conn) -> bool:
-                    """Create fis_blocking_locks_target if absent and seed id=1.
-
-                    Returns True iff the table was absent before this call (i.e. THIS
-                    run created it; its shutdown path is then responsible for
-                    dropping it).
+                    """
+                    Create fis_blocking_locks_target if absent and seed id=1.
                     """
                     cursor = conn.cursor()
                     try:
@@ -700,8 +635,6 @@ mainSteps:
                     try:
                         conn = self._connect()
                     except SystemExit:
-                        # _connect exits the process on hard failures; if that
-                        # happens during cleanup we cannot proceed further.
                         raise
                     except Exception as exc:  # noqa: BLE001
                         print("WARN: cleanup connection failed: %s: %s"
@@ -733,30 +666,15 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                # ----- Real_Mode introspection helpers -------------------------------
-                #
-                # These methods are only invoked from ``_run_real_mode``. They open
-                # no connections; the caller passes in a control connection and is
-                # responsible for closing it. Each method exits the process via
-                # ``sys.exit`` with the design-specified exit code on failure; no
-                # DDL or DML is ever executed against the user-supplied table.
-
-                # Wall-clock budget for ``_validate_target_table``'s combined
-                # existence-and-non-empty probes (Requirement 2.6).
-                _REAL_MODE_VALIDATION_DEADLINE_S = 10.0
-
                 @staticmethod
                 def _is_relation_missing_error(engine: str, exc: BaseException) -> bool:
                     """Heuristically detect 'relation does not exist' errors per engine."""
                     msg = str(exc).lower()
                     if engine == "postgres":
-                        # psycopg2 UndefinedTable: "relation \"x\" does not exist"
                         return "does not exist" in msg
                     if engine == "mysql":
-                        # mysql-connector ER_NO_SUCH_TABLE 1146: "Table 'x' doesn't exist"
                         return "doesn't exist" in msg or "does not exist" in msg
                     if engine == "sqlserver":
-                        # pyodbc SQL state 42S02 / msg 208: "Invalid object name"
                         return "invalid object name" in msg
                     return False
 
@@ -765,17 +683,12 @@ mainSteps:
                     """Heuristically detect 'permission denied / access denied' per engine."""
                     msg = str(exc).lower()
                     if engine == "postgres":
-                        # psycopg2 InsufficientPrivilege: "permission denied for table x"
                         return "permission denied" in msg
                     if engine == "mysql":
-                        # mysql-connector ER_TABLEACCESS_DENIED_ERROR 1142:
-                        # "SELECT command denied to user 'x'@'h' for table 'y'"
                         return ("command denied" in msg
                                 or "access denied" in msg
                                 or "permission denied" in msg)
                     if engine == "sqlserver":
-                        # pyodbc msg 229: "The SELECT permission was denied on the
-                        # object 'x', database 'y', schema 'z'"
                         return ("permission was denied" in msg
                                 or "permission denied" in msg)
                     return False
@@ -783,34 +696,12 @@ mainSteps:
                 def _validate_target_table(
                     self, conn, qualified_table_ref: str,
                 ) -> None:
-                    """Probe that the user-supplied table exists, is reachable, and is non-empty.
-
-                    Issues two SELECTs against the table and inspects the results
-                    plus any raised driver exception. Exits the process on failure
-                    with the design-specified code:
-
-                    * 20 — relation does not exist (existence probe failed and the
-                      engine-specific exception text matches the missing-relation
-                      pattern)
-                    * 21 — non-empty probe returned no rows
-                    * 22 — combined elapsed time of both probes exceeded
-                      ``_REAL_MODE_VALIDATION_DEADLINE_S`` seconds (Requirement 2.6)
-                    * 24 — permission denied, or any other unexpected driver error
-                      while probing the table
-
-                    ``qualified_table_ref`` MUST already be quoted via
-                    ``build_quoted_table_ref``; this method splices it directly
-                    into the FROM clause of the probe SQL. The user-controlled
-                    table name is never inserted into SQL except through that
-                    quoting path.
+                    """
+                    Probe existence + SELECT-permission and non-emptiness.
                     """
                     deadline_s = self._REAL_MODE_VALIDATION_DEADLINE_S
                     start = time.monotonic()
 
-                    # 1. Existence + SELECT-permission probe. ``WHERE 1=0`` returns
-                    #    an empty result set on every engine if the table exists
-                    #    and the caller has SELECT on it; otherwise the driver
-                    #    raises an engine-specific exception.
                     cursor = conn.cursor()
                     try:
                         try:
@@ -855,7 +746,6 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                    # 2. Non-empty probe.
                     cursor = conn.cursor()
                     try:
                         try:
@@ -901,10 +791,6 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                    # 3. Deadline check (Requirement 2.6). Both probes must
-                    #    complete inside the budget; we evaluate the elapsed
-                    #    wall-clock once after both have finished so a single
-                    #    slow probe still trips the deadline.
                     elapsed = time.monotonic() - start
                     if elapsed > deadline_s:
                         sys.stderr.write(
@@ -918,26 +804,8 @@ mainSteps:
                 def _introspect_primary_key(
                     self, conn, schema: Optional[str], table: str,
                 ) -> List[str]:
-                    """Discover ordered primary-key column names for the target table.
-
-                    The table name (and schema, on SQL Server) is passed to the
-                    metadata query via parameter binding only, never via string
-                    concatenation. The query selects from the engine-appropriate
-                    metadata views:
-
-                    * ``information_schema.table_constraints`` joined with
-                      ``information_schema.key_column_usage`` for postgres and
-                      mysql (mysql additionally scopes by ``DATABASE()``)
-                    * ``sys.indexes`` + ``sys.index_columns`` + ``sys.columns``
-                      for sqlserver, with the table identified by
-                      ``OBJECT_ID(?)`` so both schema-qualified and unqualified
-                      names resolve correctly
-
-                    Returns the ordered list of column names in PK ordinal
-                    position. Exits the process with code 23 if the table has no
-                    primary key constraint, or 24 if the metadata query fails
-                    (typically because the database user lacks SELECT on the
-                    metadata views).
+                    """
+                    Discover ordered primary-key column names for the target table.
                     """
                     engine = self.engine
                     if engine == "postgres":
@@ -990,8 +858,7 @@ mainSteps:
                             "  AND i.object_id = OBJECT_ID(?) "
                             "ORDER BY ic.key_ordinal"
                         )
-                        # OBJECT_ID resolves both 'dbo.orders' and bare 'orders'
-                        # (the latter against the caller's default schema).
+
                         if schema:
                             params = (schema + "." + table,)
                         else:
@@ -1037,26 +904,14 @@ mainSteps:
                         )
                         sys.exit(23)
 
-                    # rows is a list of (column_name, ordinal_position) tuples
-                    # already in ordinal-position order via the SQL ORDER BY.
                     return [str(row[0]) for row in rows]
 
                 def _select_target_row(
                     self, conn, qualified_table_ref: str,
                     pk_columns: List[str],
                 ) -> Tuple:
-                    """Select the first row's PK values, ordered by PK ascending.
-
-                    Returns a tuple of column values in the same order as
-                    ``pk_columns``. Each PK column name is rendered through
-                    ``quote_identifier`` so the SQL is safe even if the
-                    introspection query yielded a column name containing the
-                    engine's quote character.
-
-                    Exits the process with code 21 if the table has become
-                    empty between validation and selection (Requirement 4.6 /
-                    10.2), or 24 if the SELECT itself fails for any other
-                    reason.
+                    """
+                    Select the first row's PK values (ordered by PK ASC).
                     """
                     engine = self.engine
                     quoted_cols = ", ".join(
@@ -1104,37 +959,17 @@ mainSteps:
 
                     return tuple(row)
 
-                # ----- Blocker --------------------------------------------------------
-
                 def _acquire_blocker_lock(
                     self, conn,
                     lock_sql: Optional[str] = None,
-                    pk_values: Optional[Tuple] = None,
+                    pk_values: Optional[Tuple[Any, ...]] = None,
                 ) -> bool:
-                    """Acquire the Blocker's row-level exclusive lock.
-
-                    Synthetic_Mode (``lock_sql is None``): executes the
-                    hard-coded ``SELECT ... FOR UPDATE`` (postgres/mysql) or
-                    ``SELECT ... WITH (UPDLOCK, HOLDLOCK)`` (sqlserver) against
-                    ``self.TABLE_NAME`` with ``id = 1``. The synthetic table is
-                    seeded by ``ensure_table`` immediately before this call, so
-                    the row always exists; the method returns True.
-
-                    Real_Mode (``lock_sql`` provided): executes ``lock_sql``
-                    with ``pk_values`` bound. The lock SQL is built once by
-                    ``build_lock_query`` and reused for the Blocker and every
-                    Waiter so both modes share the same plumbing. Returns False
-                    if ``cursor.fetchone()`` yields no row (the target row was
-                    deleted between ``select_target_row`` and lock acquisition);
-                    the caller in ``_run_real_mode`` is expected to translate
-                    this into the design's exit-25 path. Returns True on
-                    successful lock acquisition.
+                    """
+                    Acquire the Blocker's row-level exclusive lock.
                     """
                     cursor = conn.cursor()
                     try:
                         if lock_sql is None:
-                            # Synthetic_Mode: hard-coded path (preserved
-                            # verbatim from the pre-refactor implementation).
                             if self.engine in ("postgres", "mysql"):
                                 cursor.execute(
                                     "SELECT id FROM " + self.TABLE_NAME +
@@ -1145,15 +980,8 @@ mainSteps:
                                     "SELECT id FROM dbo." + self.TABLE_NAME +
                                     " WITH (UPDLOCK, HOLDLOCK) WHERE id = 1"
                                 )
-                            # Consume the row so the server has nothing
-                            # outstanding.
                             cursor.fetchall()
                             return True
-                        # Real_Mode: parameter-bound dynamic SQL. The user-
-                        # supplied table name is already quoted inside
-                        # ``lock_sql`` via ``build_quoted_table_ref`` and
-                        # primary-key values are passed via driver bindings,
-                        # never via string concatenation.
                         cursor.execute(
                             lock_sql,
                             pk_values if pk_values is not None else (),
@@ -1161,13 +989,7 @@ mainSteps:
                         row = cursor.fetchone()
                         if row is None:
                             # Row was deleted between selection and lock
-                            # acquisition. Caller (orchestrator from task 3.2)
-                            # is responsible for emitting the diagnostic and
-                            # exit code 25.
                             return False
-                        # Drain any remaining rows so the server has nothing
-                        # outstanding (the lock SQL is LIMIT/TOP 1 by
-                        # construction, but be defensive across drivers).
                         try:
                             cursor.fetchall()
                         except Exception:  # noqa: BLE001
@@ -1179,27 +1001,13 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                # ----- Waiters --------------------------------------------------------
-
                 def _waiter_worker(
                     self, waiter_id: int,
                     lock_sql: Optional[str] = None,
-                    pk_values: Optional[Tuple] = None,
+                    pk_values: Optional[Tuple[Any, ...]] = None,
                 ) -> None:
-                    """Run a single Waiter session against the Blocker-held row.
-
-                    Synthetic_Mode (``lock_sql is None``): issues the existing
-                    hard-coded ``UPDATE fis_blocking_locks_target SET counter =
-                    counter + 1 WHERE id = 1`` so the Waiter contends with the
-                    Blocker's row lock and then commits.
-
-                    Real_Mode (``lock_sql`` provided): issues ``lock_sql`` with
-                    ``pk_values`` bound — the same locking SELECT used by the
-                    Blocker. The locking SELECT itself blocks on the Blocker's
-                    exclusive row lock; once the Blocker releases the lock, the
-                    Waiter's SELECT returns, commits, and closes. No INSERT,
-                    UPDATE, or DELETE is ever issued against the user-supplied
-                    table.
+                    """
+                    Run a single Waiter session against the Blocker-held row.
                     """
                     try:
                         conn = self._connect()
@@ -1214,23 +1022,16 @@ mainSteps:
                         cursor = conn.cursor()
                         try:
                             if lock_sql is None:
-                                # Synthetic_Mode: hard-coded UPDATE preserved
-                                # verbatim from the pre-refactor implementation.
                                 cursor.execute(
                                     "UPDATE " + self.TABLE_NAME +
                                     " SET counter = counter + 1 WHERE id = 1"
                                 )
                                 conn.commit()
                             else:
-                                # Real_Mode: locking SELECT against the same
-                                # row as the Blocker. The SELECT blocks until
-                                # the Blocker releases its exclusive lock.
                                 cursor.execute(
                                     lock_sql,
                                     pk_values if pk_values is not None else (),
                                 )
-                                # Drain rows; many drivers require this before
-                                # commit even when the result is small.
                                 try:
                                     cursor.fetchall()
                                 except Exception:  # noqa: BLE001
@@ -1262,14 +1063,10 @@ mainSteps:
                 def _ramp_waiters(
                     self, schedule: List[Tuple[int, int]],
                     lock_sql: Optional[str] = None,
-                    pk_values: Optional[Tuple] = None,
+                    pk_values: Optional[Tuple[Any, ...]] = None,
                 ) -> None:
-                    """Drive the Waiter ramp.
-
-                    ``lock_sql`` and ``pk_values`` are forwarded to each
-                    ``_waiter_worker`` thread so Synthetic_Mode (defaults of
-                    ``None``) and Real_Mode (non-None values built from the
-                    introspected primary key) share the same ramp plumbing.
+                    """
+                    Drive the Waiter ramp.
                     """
                     next_waiter_id = 1
                     total_started = 0
@@ -1290,8 +1087,6 @@ mainSteps:
                               % (step_idx, len(schedule), n, total_started,
                                  self.waiter_count))
 
-                # ----- Main orchestration --------------------------------------------
-
                 def run(self) -> None:
                     print("=== Database Blocking Locks Harness ===")
                     print("Engine: %s" % self.engine)
@@ -1310,18 +1105,207 @@ mainSteps:
                         self._run_synthetic_mode()
 
                 def _run_real_mode(self) -> None:
-                    """Real_Mode orchestration. Filled in by task 3.2.
-
-                    Until the Real_Mode orchestrator is implemented, dispatching
-                    here from ``run()`` is a hard error rather than a silent
-                    no-op so that operators get an immediate, diagnosable
-                    failure if they set ``TargetTableName`` to a non-default
-                    value before the feature is complete.
                     """
-                    raise NotImplementedError(
-                        "Real_Mode is not yet implemented. "
-                        "TargetTableName=%r" % (self.target_table_name,)
+                    Real_Mode orchestration: lock a real-table row read-only.
+                    """
+                    print("WaiterCount: %d  ExperimentDuration: %ds  "
+                          "RampTime: %ds  RampSteps: %d"
+                          % (self.waiter_count, self.experiment_duration_s,
+                             self.ramp_time_s, self.ramp_steps))
+
+                    schema, table = parse_qualified_table_name(
+                        self.engine, self.target_table_name,
                     )
+                    qualified_ref = build_quoted_table_ref(
+                        self.engine, schema, table,
+                    )
+                    print("Real_Mode target: %s (engine=%s)"
+                          % (qualified_ref, self.engine))
+
+                    control_conn = self._connect()
+                    try:
+                        self._validate_target_table(control_conn, qualified_ref)
+                        pk_columns = self._introspect_primary_key(
+                            control_conn, schema, table,
+                        )
+                        pk_values = self._select_target_row(
+                            control_conn, qualified_ref, pk_columns,
+                        )
+                    finally:
+                        try:
+                            control_conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    print("Discovered primary key columns: %s" % (pk_columns,))
+                    print("Locking target row pk_values=%r" % (pk_values,))
+
+                    # 3. Build the lock SQL exactly once; PK values are
+                    #    driver-bound at execute time, never spliced.
+                    lock_sql = build_lock_query(
+                        self.engine, qualified_ref, pk_columns,
+                    )
+                    print("Lock SQL: %s" % (lock_sql,))
+
+                    # 4. Ramp schedule (same clamping arithmetic as
+                    #    _run_synthetic_mode; Requirement 6.7).
+                    effective_ramp_time = self.ramp_time_s
+                    if effective_ramp_time > self.experiment_duration_s:
+                        print("NOTE: RampTime (%ds) exceeds ExperimentDuration "
+                              "(%ds); clamping RampTime to ExperimentDuration."
+                              % (effective_ramp_time,
+                                 self.experiment_duration_s))
+                        effective_ramp_time = self.experiment_duration_s
+                    schedule = self.compute_ramp_schedule(
+                        self.waiter_count,
+                        self.ramp_steps,
+                        effective_ramp_time,
+                        self.experiment_duration_s,
+                    )
+                    print("Ramp schedule (wait_before_s, waiters_to_start): %s"
+                          % (schedule,))
+
+                    def _drive_ramp() -> None:
+                        try:
+                            self._ramp_waiters(
+                                schedule,
+                                lock_sql=lock_sql,
+                                pk_values=pk_values,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print("Ramp driver failed: %s: %s"
+                                  % (type(exc).__name__, str(exc)))
+
+                    ramp_thread = threading.Thread(
+                        target=_drive_ramp, daemon=True,
+                    )
+
+                    blocker_conn = self._connect()
+                    blocker_start = time.monotonic()
+                    try:
+                        try:
+                            acquired = self._acquire_blocker_lock(
+                                blocker_conn,
+                                lock_sql=lock_sql,
+                                pk_values=pk_values,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write(
+                                "ERROR: Blocker failed to acquire lock on %s "
+                                "where pk=%r (engine=%s): %s: %s\n"
+                                % (qualified_ref, pk_values, self.engine,
+                                   type(exc).__name__, str(exc))
+                            )
+                            try:
+                                blocker_conn.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            try:
+                                blocker_conn.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            sys.exit(25)
+
+                        if not acquired:
+                            sys.stderr.write(
+                                "ERROR: Blocker failed to acquire lock on %s "
+                                "where pk=%r; row may have been deleted "
+                                "between selection and lock acquisition "
+                                "(engine=%s).\n"
+                                % (qualified_ref, pk_values, self.engine)
+                            )
+                            try:
+                                blocker_conn.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            try:
+                                blocker_conn.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            sys.exit(25)
+
+                        print("Blocker acquired row lock on %s pk=%r at t=0s; "
+                              "holding for %ds"
+                              % (qualified_ref, pk_values,
+                                 self.experiment_duration_s))
+                        ramp_thread.start()
+
+                        liveness_exceptions = self._connection_closed_exceptions()
+                        chunk_seconds = 15
+                        deadline = (blocker_start
+                                    + self.experiment_duration_s)
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(chunk_seconds, remaining))
+                            try:
+                                cursor = blocker_conn.cursor()
+                                try:
+                                    cursor.execute("SELECT 1")
+                                    cursor.fetchall()
+                                finally:
+                                    try:
+                                        cursor.close()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                            except liveness_exceptions as exc:
+                                elapsed = int(
+                                    time.monotonic() - blocker_start
+                                )
+                                print(
+                                    "Blocker transaction terminated by server "
+                                    "after %d seconds (engine=%s). Likely "
+                                    "cause: DBA-configured idle-in-transaction "
+                                    "timeout."
+                                    % (elapsed, self.engine)
+                                )
+                                print("Underlying exception: %s: %s"
+                                      % (type(exc).__name__, str(exc)))
+                                self._blocker_terminated_early = True
+                                break
+
+                        if not self._blocker_terminated_early:
+                            try:
+                                blocker_conn.commit()
+                                print("Blocker committed; row lock on %s "
+                                      "pk=%r released after %ds"
+                                      % (qualified_ref, pk_values,
+                                         self.experiment_duration_s))
+                            except Exception as exc:  # noqa: BLE001
+                                elapsed = int(
+                                    time.monotonic() - blocker_start
+                                )
+                                print(
+                                    "Blocker transaction terminated by server "
+                                    "after %d seconds (engine=%s). Likely "
+                                    "cause: DBA-configured idle-in-transaction "
+                                    "timeout."
+                                    % (elapsed, self.engine)
+                                )
+                                print("Underlying exception on COMMIT: %s: %s"
+                                      % (type(exc).__name__, str(exc)))
+                                self._blocker_terminated_early = True
+                    finally:
+                        try:
+                            blocker_conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    ramp_thread.join(timeout=60)
+  
+                    print("Joining %d waiter threads (timeout=30s each)..."
+                          % len(self._waiter_threads))
+                    for t in self._waiter_threads:
+                        t.join(timeout=30)
+                    alive = sum(
+                        1 for t in self._waiter_threads if t.is_alive()
+                    )
+                    if alive:
+                        print("WARN: %d waiter thread(s) still alive after "
+                              "join timeout" % alive)
+                    else:
+                        print("All waiter threads joined cleanly")
 
                 def _run_synthetic_mode(self) -> None:
                     print("WaiterCount: %d  ExperimentDuration: %ds  "
@@ -1345,8 +1329,6 @@ mainSteps:
                     print("Ramp schedule (wait_before_s, waiters_to_start): %s"
                           % (schedule,))
 
-                    # 1. Control connection: ensure target table exists and is seeded.
-                    control_conn = self._connect()
                     try:
                         try:
                             self._created_table = self.ensure_table(control_conn)
@@ -1368,8 +1350,6 @@ mainSteps:
                         print("Reusing pre-existing target table %s (will NOT drop)"
                               % self.TABLE_NAME)
 
-                    # 2. Kick off the Waiter ramp in a background thread so the main
-                    #    thread can run the Blocker's sleep + liveness loop.
                     def _drive_ramp() -> None:
                         try:
                             self._ramp_waiters(schedule)
@@ -1379,9 +1359,6 @@ mainSteps:
 
                     ramp_thread = threading.Thread(target=_drive_ramp, daemon=True)
 
-                    # 3. Open the Blocker, acquire the lock, *then* start the ramp.
-                    # We do this by running the Blocker inline; it starts the ramp
-                    # thread immediately after acquiring the lock.
                     blocker_conn = self._connect()
                     blocker_start = time.monotonic()
                     try:
@@ -1408,8 +1385,6 @@ mainSteps:
                               % (self.TABLE_NAME, self.experiment_duration_s))
                         ramp_thread.start()
 
-                        # In-process sleep for ExperimentDuration with periodic
-                        # liveness checks so idle-in-transaction kills are detected.
                         liveness_exceptions = self._connection_closed_exceptions()
                         chunk_seconds = 15
                         deadline = blocker_start + self.experiment_duration_s
@@ -1463,10 +1438,8 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                    # 4. Let the ramp thread finish launching any remaining waiters.
                     ramp_thread.join(timeout=60)
 
-                    # 5. Wait for Waiters to unblock, commit, and close.
                     print("Joining %d waiter threads (timeout=30s each)..."
                           % len(self._waiter_threads))
                     for t in self._waiter_threads:
@@ -1494,18 +1467,19 @@ mainSteps:
 
             def main(argv: Optional[List[str]] = None) -> None:
                 argv = list(sys.argv if argv is None else argv)
-                if len(argv) != 12:
+                if len(argv) != 13:
                     sys.stderr.write(
                         "Usage: %s DatabaseEngine DatabaseEndpoint DatabasePort "
                         "DatabaseName DatabaseUser DatabasePasswordSecretArn "
-                        "WaiterCount ExperimentDuration RampTime RampSteps Region\n"
+                        "WaiterCount ExperimentDuration RampTime RampSteps Region "
+                        "TargetTableName\n"
                         % (argv[0] if argv else "blocking_locks_harness.py",)
                     )
                     sys.exit(1)
 
                 (_prog, engine, endpoint, port_raw, dbname, user, secret_arn,
                  waiter_count_raw, experiment_duration_iso, ramp_time_iso,
-                 ramp_steps_raw, region) = argv
+                 ramp_steps_raw, region, target_table_name) = argv
 
                 if engine not in ("postgres", "mysql", "sqlserver"):
                     sys.stderr.write(
@@ -1534,10 +1508,9 @@ mainSteps:
                     experiment_duration_s=experiment_duration_s,
                     ramp_time_s=ramp_time_s,
                     ramp_steps=ramp_steps,
+                    target_table_name=target_table_name,
                 )
 
-                # Top-level try/except/finally so that DROP TABLE cleanup is
-                # best-effort even on uncaught exceptions.
                 exit_code = 0
                 try:
                     harness.run()
@@ -1558,9 +1531,6 @@ mainSteps:
                 main()
             PYTHON_EOF
 
-            # Execute the harness with parameters substituted by SSM. The heredoc
-            # above is single-quoted so {{ ... }} inside the Python body is not
-            # touched; only the arguments below are substituted.
             python3 /tmp/blocking_locks_harness.py \
               "{{ DatabaseEngine }}" \
               "{{ DatabaseEndpoint }}" \
@@ -1572,7 +1542,8 @@ mainSteps:
               "{{ ExperimentDuration }}" \
               "{{ RampTime }}" \
               "{{ RampSteps }}" \
-              "{{ global:REGION }}"
+              "{{ global:REGION }}" \
+              "{{ TargetTableName }}"
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'
