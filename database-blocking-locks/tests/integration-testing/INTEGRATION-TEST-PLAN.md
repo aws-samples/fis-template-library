@@ -1,5 +1,18 @@
 # Database Blocking Locks — Integration Test Plan
 
+
+Completed:
+
+Happy path test for Aurora PostgreSQL synthetic branch
+Happy path test for Aurora MySQL - in progress
+Checked experiment stops and rolls back if I stop the experiment via FIS console
+
+
+
+
+
+
+
 ## Purpose
 
 Validate that the `database-blocking-locks` experiment causes the intended fault (row-level lock contention surfaced by the engine-specific blocked-waiter metric), respects every documented safety guarantee, and cleans up after itself, across all three supported engines and both Synthetic_Mode and Real_Mode.

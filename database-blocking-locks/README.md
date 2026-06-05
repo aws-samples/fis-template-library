@@ -7,18 +7,38 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTIO
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+## What This Experiment Is For
+
+This experiment is best suited to rehearsing **detection and diagnosis** of row-level lock contention: validating that your blocked-waiter alarms fire fast enough, that your DBA team can find the offending session, and that your runbook for "a transaction is holding a row lock too long" works under prod-like conditions. The two modes target different parts of that story. **Synthetic_Mode** locks an experiment-owned row that no application reads or writes, so it produces a clean engine-side signal with effectively zero customer impact — ideal for repeatable detection rehearsal. **Real_Mode** locks the first row of a user-supplied application table, so it potentially produces real customer impact scoped to whatever code paths touch that row — useful when you also need to validate application-side behaviour like connection-pool sizing, retry logic, and upstream timeouts under contention.
+
+What this experiment is **not** well suited to is producing a wide, system-saturating outage. Locking a single row is a narrow fault by construction: even in Real_Mode, the impact is bounded by which code paths query the locked row, and on PostgreSQL/MySQL plain `SELECT` traffic is unaffected by MVCC. If your goal is "validate that the system survives a wide database problem," the [`database-connection-limit-exhaustion`](../database-connection-limit-exhaustion/README.md) experiment is a more direct lever — it saturates `max_connections` and immediately affects every code path that opens a database connection. Use this experiment when your hypothesis is specifically about lock contention; use connection exhaustion when your hypothesis is about wide database degradation.
+
+| Dimension | `database-connection-limit-exhaustion` | `database-blocking-locks` Synthetic_Mode | `database-blocking-locks` Real_Mode |
+| --- | --- | --- | --- |
+| **System-wide impact** | Yes, by construction | No — synthetic table is application-invisible | Only for paths touching the locked row |
+| **Customer-visible signal** | Strong: requests fail at the connection layer | None directly; only via your monitoring | Real, scoped to the affected row |
+| **What it actually tests** | Detection, impact, recovery, cascading effects | Detection and recovery of metrics, only | Detection and impact (scoped) and recovery, plus your guardrails |
+| **Risk to production** | High (saturates pooled resources) | Effectively zero | Real but predictable; under operator control |
+| **Repeatability against unknown environments** | Easy (no schema knowledge needed) | Easy | Requires picking a target table and accepting the impact |
+
 ## Example Hypotheses
 
-When the {service1} database is subjected to row-level blocking locks, the engine-specific blocked-waiter signal for {workload} should climb in a predictable, stepped pattern that tracks the `WaiterCount` ramp, and operations should be able to detect the event within {y} minutes via the engine-specific blocked-waiter metric (Aurora MySQL `BlockedTransactions`, RDS SQL Server `db.General Statistics.Processes blocked`, or the lock-tree view in CloudWatch Database Insights for PostgreSQL). Other critical user journeys relating to {workload}; {service2} and {service3} should continue unaffected. A leading alarm should be raised and the DevOps team notified within {y} minutes.
+When the {service1} database is subjected to synthetic row-level blocking locks the operations an alarm should be raised and the DevOps team should be notified within {x} minutes. The teams should be able to detect and respond to the cause within {y} minutes via the engine-specific blocked-waiter metric. Critical user journeys relating to {workload} should continue unaffected.
 
-When the `ExperimentDuration` elapses and the Blocker session COMMITs, all Waiter sessions should unblock, complete their UPDATEs, and close, and the engine-specific blocked-waiter metric should return to baseline within {z} minutes without manual database intervention. The steady state of {n} transactions per second against {service1} should resume.
+When the {service1} database is subjected to directed row-level blocking locks the operations an alarm should be raised and the DevOps team should be notified within {x} minutes. The teams should be able to detect and respond to the cause within {y} minutes via the engine-specific blocked-waiter metric. Critical user journeys relating to {workload} should/shouldn't be impacted in {manner of impact}.
+
+#### Engine specific metrics:
+* Aurora MySQL `BlockedTransactions`
+* RDS SQL Server `db.General Statistics.Processes blocked`
+* Aurora PostgreSQL and RDS PostgreSQL: the `Lock:Tuple` (and `Lock:transactionid`) wait events on the Performance Insights Database load chart
 
 ### What does this enable me to verify?
 
 * Appropriate customer experience metrics and observability of your database are in place (were you able to detect the blocked-waiter signal as it climbed with the Waiter ramp?)
 * Alarms are configured correctly on the engine-specific blocked-waiter metric (were the right people notified at the right time and/or automations triggered?)
 * Your application gracefully handles transactions that block on contended rows (retries, timeouts, circuit breakers)
-* Recovery controls (if any) work as expected once the Blocker releases its lock
+* Recovery controls (if any) work as expected
+* Your application recovers once the blocks are released
 
 ## Description
 
@@ -27,7 +47,7 @@ This experiment tests your application's resilience to database row-level lock c
 1. **Dynamically creating** an ephemeral EC2 instance as a load generator
 2. **Bootstrapping** the instance with the appropriate database client (PostgreSQL, MySQL, or SQL Server)
 3. **Opening one Blocker session** that holds a row-level lock on a dedicated `fis_blocking_locks_target` table for the full `ExperimentDuration`
-4. **Ramping in `WaiterCount` Waiter sessions** over `RampTime` across `RampSteps` evenly spaced steps, where each Waiter opens a connection, begins a transaction, and issues an `UPDATE` against the Blocker-held row so that it shows up as a blocked transaction on the database
+4. **Ramping in `WaiterCount` Waiter sessions** over `RampTime` across `RampSteps` evenly spaced steps, where each Waiter opens a connection, begins a transaction, and issues the same engine-native row-level locking `SELECT` against the Blocker-held row so that it shows up as a blocked transaction on the database
 5. **Cleaning up** by committing the Blocker, joining Waiter threads, dropping the target table if this run created it, terminating the load generator, and removing the ephemeral security-group rules
 
 The experiment is **parameterized by database engine**, making it reusable across engines in RDS:
@@ -132,7 +152,7 @@ The experiment requires the following parameters:
 
 ### Target Table
 - **TargetTableName**: `String`. Default: `fis_blocking_locks_target`. Selects the table the harness operates against and, by extension, the experiment mode:
-  - **Default value (`fis_blocking_locks_target`)**: selects **Synthetic_Mode**. The harness creates the `fis_blocking_locks_target` table on startup (if it does not already exist), seeds a row, locks it, ramps Waiters that `UPDATE` it, and drops the table on clean shutdown if this run created it. No application data is touched.
+  - **Default value (`fis_blocking_locks_target`)**: selects **Synthetic_Mode**. The harness creates the `fis_blocking_locks_target` table on startup (if it does not already exist), seeds a row, locks it, ramps Waiters that issue the same locking `SELECT` against it, and drops the table on clean shutdown if this run created it. No application data is touched.
   - **Any other value**: enables **Real_Mode**. The harness targets the named application table, discovers its primary key via metadata views, selects the first row ordered by primary key, and locks it read-only via `SELECT ... FOR UPDATE` (PostgreSQL/MySQL) or `SELECT ... WITH (UPDLOCK, HOLDLOCK)` (SQL Server). No `INSERT`, `UPDATE`, `DELETE`, or DDL is executed against the named table.
   - **WARNING**: Real_Mode causes **actual application impact**. Any application transaction that contends for the locked row will block for up to `ExperimentDuration`. Only set `TargetTableName` to a non-default value when you have intentionally opted into targeting a real application table and have understood the blast radius for your engine (see the Engine-Specific Blast Radius section).
   - **SQL Server** accepts schema-qualified (`dbo.orders`) or unqualified (`orders`, defaulting to `dbo`) names.
@@ -147,7 +167,7 @@ The experiment runs in one of two modes determined entirely by the value of `Tar
 | **Table targeted** | `fis_blocking_locks_target`, an experiment-owned table that no application reads or writes | The user-supplied application table. PostgreSQL/MySQL: unqualified, scoped to the connection's current database/schema. SQL Server: schema-qualified (`dbo.orders`) or unqualified (`orders`, defaulting to `dbo`). |
 | **DDL/DML against the table** | The harness `CREATE TABLE`s the synthetic table on startup if missing, `INSERT`s seed row `id = 1`, and `DROP TABLE`s on clean shutdown if this run created it. | None. The harness issues **no** `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `INSERT`, `UPDATE`, `DELETE`, or `MERGE` against the named table at any point. |
 | **Blocker lock SQL** | PostgreSQL/MySQL: `SELECT id FROM fis_blocking_locks_target WHERE id = 1 FOR UPDATE`. SQL Server: `SELECT id FROM dbo.fis_blocking_locks_target WITH (UPDLOCK, HOLDLOCK) WHERE id = 1`. | PostgreSQL/MySQL: `SELECT <pk_cols> FROM <table> WHERE <pk_clause> FOR UPDATE`. SQL Server: `SELECT <pk_cols> FROM <table> WITH (UPDLOCK, HOLDLOCK) WHERE <pk_clause>`. The `<pk_cols>` and `<pk_clause>` are derived from the table's primary key, discovered at runtime via engine-native metadata views. |
-| **Waiter lock SQL** | `UPDATE fis_blocking_locks_target SET counter = counter + 1 WHERE id = 1` (writes the experiment-owned row). | The same locking `SELECT` statement used by the Blocker. Waiters never `UPDATE`, `INSERT`, or `DELETE`. |
+| **Waiter lock SQL** | The same locking `SELECT` statement used by the Blocker, against `id = 1` of `fis_blocking_locks_target`. PostgreSQL/MySQL: `SELECT id FROM fis_blocking_locks_target WHERE id = 1 FOR UPDATE`. SQL Server: `SELECT id FROM dbo.fis_blocking_locks_target WITH (UPDLOCK, HOLDLOCK) WHERE id = 1`. Waiters never `UPDATE`, `INSERT`, or `DELETE`. | The same locking `SELECT` statement used by the Blocker. Waiters never `UPDATE`, `INSERT`, or `DELETE`. |
 | **Application impact** | None. No application transaction touches `fis_blocking_locks_target`, so the experiment is invisible to your workload except via the engine-specific blocked-waiter metric. | **Real.** Any application transaction that contends for the locked row blocks for up to `ExperimentDuration`. The exact set of statements that block (writes only, or writes plus plain reads) depends on the engine — see the Engine-Specific Blast Radius section. |
 | **Cleanup of the target table** | The harness drops `fis_blocking_locks_target` on clean shutdown if this run created it. A pre-existing matching table is left in place. | The harness performs no DDL or DML against the named table on cleanup. The table contains the same rows with the same column values after the experiment as before. |
 
@@ -200,39 +220,41 @@ Each diagnostic includes the qualified table reference, the engine, and (where a
 
 - **Exit 20 — Target table does not exist.**
   - Trigger: `validate_target_table` issued `SELECT 1 FROM <qualified_table_ref> WHERE 1=0` and the engine reported the relation as missing (PostgreSQL `UndefinedTable`, MySQL `1146 Table ... doesn't exist`, SQL Server `Invalid object name`).
-  - Diagnostic: `ERROR: Target table <qualified_table_ref> does not exist in database <DatabaseName> on <DatabaseEndpoint>:<DatabasePort> (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
+  - Diagnostic: `ERROR: table <qualified_table_ref> missing in db <DatabaseName> on <DatabaseEndpoint>:<DatabasePort> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
   - Most common cause: misspelled `TargetTableName`, wrong `DatabaseName`, or the target table lives in a schema other than the connection's default schema (PostgreSQL/MySQL) or `dbo` (SQL Server). For SQL Server, prefer the schema-qualified form (`dbo.orders`).
 
 - **Exit 21 — Target table is empty.**
   - Trigger: either the non-empty probe in `validate_target_table` (`SELECT 1 FROM <ref> LIMIT 1` on PostgreSQL/MySQL, `SELECT TOP 1 1 FROM <ref>` on SQL Server) returned no rows, or `select_target_row` returned no row because the table became empty between validation and selection.
-  - Diagnostic: `ERROR: Target table <qualified_table_ref> contains zero rows; cannot select a row to lock (engine=<DatabaseEngine>).`
+  - Diagnostic: `ERROR: table <qualified_table_ref> empty; cannot select row (engine=<DatabaseEngine>).`
   - Most common cause: the target table really is empty, or it was emptied by an application transaction during the brief pre-flight window. Real_Mode requires at least one row at the moment of row selection.
 
 - **Exit 22 — Pre-flight checks exceeded the 10s deadline.**
   - Trigger: the existence probe and the non-empty probe combined took longer than 10 seconds of wall-clock time (Requirement 2.6). The deadline is evaluated once after both probes complete.
-  - Diagnostic: `ERROR: Real_Mode pre-flight checks exceeded 10.0s deadline against <qualified_table_ref> (engine=<DatabaseEngine>). Elapsed: <seconds>s.`
+  - Diagnostic: `ERROR: pre-flight exceeded 10.0s deadline on <qualified_table_ref> (engine=<DatabaseEngine>); elapsed <seconds>s.`
   - Most common cause: the database is overloaded, the target table is so large that even a `LIMIT 1` probe is slow under contention, or network latency between the load generator and the database is unusually high. The harness fails closed rather than blocking the experiment indefinitely on a slow database.
 
 - **Exit 23 — Target table has no primary key.**
   - Trigger: `introspect_primary_key` ran the engine-specific metadata query and the result set was empty, meaning the table has no `PRIMARY KEY` constraint (PostgreSQL/MySQL) or no index with `is_primary_key = 1` (SQL Server).
-  - Diagnostic: `ERROR: Target table <qualified> has no primary key constraint and cannot be targeted in Real_Mode (engine=<DatabaseEngine>).`
+  - Diagnostic: `ERROR: table <qualified> has no PK; Real_Mode requires one (engine=<DatabaseEngine>).`
   - Most common cause: the target table was modelled without a primary key. Real_Mode requires a primary key to deterministically identify and lock a single row; tables with only a unique index, only a clustered index without `is_primary_key = 1`, or no key at all are not supported.
 
 - **Exit 24 — Introspection failed / permission denied.**
-  - Trigger: any of the metadata or probe queries raised an exception. There are four call sites, each with its own diagnostic shape:
-    - Existence probe denied: `ERROR: SELECT permission denied on target table <qualified_table_ref> (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
-    - Existence probe other failure: `ERROR: Failed to probe existence of target table <qualified_table_ref> (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
-    - Non-empty probe failed: `ERROR: Failed to probe target table <qualified_table_ref> for rows (engine=<DatabaseEngine>). Underlying error: <ExceptionClass>: <message>`
-    - Primary-key introspection failed: `ERROR: Failed to introspect primary key of <qualified> (engine=<DatabaseEngine>): <ExceptionClass>: <message>. Verify that DatabaseUser <DatabaseUser> has SELECT on <metadata_views>.`
-    - Target-row select failed: `ERROR: Failed to select target row from <qualified_table_ref> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+  - Trigger: any of the metadata or probe queries raised an exception. There are five call sites, each with its own diagnostic shape:
+    - Existence probe denied: `ERROR: SELECT denied on <qualified_table_ref> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+    - Existence probe other failure: `ERROR: existence probe failed for <qualified_table_ref> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+    - Non-empty probe failed: `ERROR: non-empty probe failed for <qualified_table_ref> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+    - Primary-key introspection failed: `ERROR: PK introspection failed for <qualified> (engine=<DatabaseEngine>): <ExceptionClass>: <message>. Verify <DatabaseUser> has SELECT on <metadata_views>.`
+    - Target-row select failed: `ERROR: target-row select failed for <qualified_table_ref> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
   - Most common cause: the database user identified by `DatabaseUser` lacks `SELECT` on the target table or on the engine-appropriate metadata views — `information_schema.table_constraints` and `information_schema.key_column_usage` for PostgreSQL and MySQL, or `sys.indexes`, `sys.index_columns`, and `sys.columns` for SQL Server. The introspection-failure diagnostic names the metadata views the harness queried so the DBA knows exactly which `GRANT SELECT` to issue.
 
 - **Exit 25 — Blocker failed to acquire the lock; row deleted between selection and lock acquisition.**
   - Trigger: the Blocker connection executed the locking SELECT (`SELECT <pk_cols> FROM <ref> WHERE <pk_clause> FOR UPDATE` on PostgreSQL/MySQL, or the `WITH (UPDLOCK, HOLDLOCK)` form on SQL Server) and either the driver raised an exception, or the statement returned zero rows. Returning zero rows means the row identified by the primary-key values selected at pre-flight time is no longer present.
   - Diagnostics:
-    - Driver exception: `ERROR: Blocker failed to acquire lock on <qualified_ref> where pk=<pk_values> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
-    - Row deleted: `ERROR: Blocker failed to acquire lock on <qualified_ref> where pk=<pk_values>; row may have been deleted between selection and lock acquisition (engine=<DatabaseEngine>).`
+    - Driver exception: `ERROR: blocker lock failed on <qualified_ref> pk=<pk_values> (engine=<DatabaseEngine>): <ExceptionClass>: <message>`
+    - Row deleted: `ERROR: blocker lock failed on <qualified_ref> pk=<pk_values>; row deleted before lock acquired (engine=<DatabaseEngine>).`
   - Most common cause: a concurrent application transaction deleted the selected row between pre-flight row selection and Blocker lock acquisition. The harness deliberately does not retry — re-selecting a different row would change the experiment's blast radius silently. Re-running the experiment will pick a different first row if the deletion has been committed.
+
+> **Note on log message brevity.** To stay under the 64 KiB SSM document size limit, the diagnostic strings above were tightened from longer, more descriptive forms. The structure (exit code, table reference, engine, underlying exception class and message) is preserved; only the prose is shorter.
 
 Exit codes outside the 20–25 range are not Real_Mode-specific and retain their original meaning (`1` argv parsing, `2` Secrets Manager retrieval, `3` database connect failure, `4` unsupported `DatabaseEngine`, `5` Synthetic_Mode lock acquisition failure, `6` Synthetic_Mode `ensure_target_table` failure).
 
@@ -269,13 +291,13 @@ Exit codes outside the 20–25 range are not Real_Mode-specific and retain their
 13. For each step, the harness spawns the step's share of Waiter threads. Each Waiter:
     1. Opens a new database connection
     2. Begins an explicit transaction
-    3. Issues `UPDATE fis_blocking_locks_target SET counter = counter + 1 WHERE id = 1`
+    3. Issues the same engine-native locking `SELECT` the Blocker used: `SELECT id FROM fis_blocking_locks_target WHERE id = 1 FOR UPDATE` on PostgreSQL/MySQL, `SELECT id FROM dbo.fis_blocking_locks_target WITH (UPDLOCK, HOLDLOCK) WHERE id = 1` on SQL Server
     4. Blocks on the Blocker's row lock
 14. Example: `WaiterCount=50`, `RampTime=PT1M`, `RampSteps=10` produces 10 steps of 5 Waiters each, roughly 6 seconds apart, so the engine-specific blocked-waiter metric climbs in ten 5-unit increments.
 
 ### Phase 5: Cleanup
 15. When `ExperimentDuration` elapses, the Blocker COMMITs and closes its connection.
-16. Every Waiter's blocked `UPDATE` returns, the Waiter COMMITs, and the Waiter closes its connection.
+16. Every Waiter's blocked locking `SELECT` returns, the Waiter COMMITs, and the Waiter closes its connection.
 17. The harness joins all Waiter threads.
 18. If this run created the `fis_blocking_locks_target` table, the harness drops it. If a pre-existing matching table was reused, the harness leaves it in place.
 19. The automation terminates the EC2 instance, waits for termination to complete, revokes the ingress rule from the database security group, and deletes the ephemeral security group.
@@ -349,7 +371,7 @@ The engine-specific metric that reflects blocked waiters is different for each s
 
 - **Aurora MySQL**: the `BlockedTransactions` Amazon CloudWatch metric at the instance level.
 - **RDS SQL Server**: the `db.General Statistics.Processes blocked` counter in Performance Insights.
-- **Aurora PostgreSQL and RDS PostgreSQL**: blocked waiters are surfaced via lock-tree analysis in **CloudWatch Database Insights (Advanced mode)** rather than as a top-level CloudWatch metric.
+- **Aurora PostgreSQL and RDS PostgreSQL**: open the **Performance Insights Database load** chart for the writer instance and group by **Waits**. The `Lock:Tuple` wait event will rise to roughly `WaiterCount` while the experiment runs (Waiters blocked on `SELECT ... FOR UPDATE` against the locked row report as `Lock:Tuple`; you may also see `Lock:transactionid` depending on the contention pattern). For alarm-driven detection, set `log_lock_waits = on` in the **DB parameter group** for the writer instance, publish the PostgreSQL log to CloudWatch Logs, and create a CloudWatch Logs metric filter on the substring `still waiting for`. PostgreSQL does not publish a top-level `BlockedTransactions`-style CloudWatch metric, and Performance Insights wait events are not exposed via the `DB_PERF_INSIGHTS` metric math function. After the alarm fires, use **CloudWatch Database Insights (Advanced mode)** lock-tree analysis to identify the blocking session.
 
 Expect the chosen metric to climb in stepped increments matching the Waiter ramp (`WaiterCount / RampSteps` per step), plateau at roughly `WaiterCount` once the ramp is complete, and return to baseline within a short interval after `ExperimentDuration` elapses and the Blocker COMMITs.
 
@@ -375,6 +397,10 @@ SHOW VARIABLES LIKE 'max_execution_time';
 
 A value of `0` means "no timeout". Any non-zero value less than `ExperimentDuration` (in milliseconds for PostgreSQL) will cause the Blocker's idle transaction to be terminated early.
 
+### Parameter group placement (Aurora PostgreSQL / RDS PostgreSQL)
+
+Several PostgreSQL parameters relevant to this experiment — `idle_in_transaction_session_timeout`, `log_lock_waits`, `deadlock_timeout` — are **DB parameter group** settings (per-instance), not **DB cluster parameter group** settings. They appear on the *instance's* Modify screen, not on the cluster's. If you have built a custom parameter group and don't see these parameters when modifying the cluster, attach the custom DB parameter group to the writer instance (and any reader instances you want covered) instead. `log_lock_waits` is a dynamic parameter and applies without a reboot; `deadlock_timeout` is static and requires an instance reboot to take effect.
+
 ## Leftover Table Side Effect
 
 The harness creates a dedicated `fis_blocking_locks_target` table in the target database on startup if it does not already exist, and drops it on clean shutdown. If the harness is terminated in a way that bypasses its cleanup (for example a hard kill of the EC2 instance without graceful shutdown, or a process crash between the Blocker COMMIT and the DROP TABLE), the `fis_blocking_locks_target` table may be left behind in the target database.
@@ -393,7 +419,7 @@ As you adapt this scenario to your needs, we recommend:
 
 1. **Start Small**: Begin with a small `WaiterCount` (for example 10) to confirm the blocked-waiter signal appears on the engine-specific metric you expect, before scaling up.
 2. **Use Gradual Ramp-Up**: Set a non-zero `RampTime` and a meaningful `RampSteps` (for example `RampTime=PT5M`, `RampSteps=10`) so that the blocked-waiter metric climbs in visible increments.
-3. **Create a CloudWatch Alarm on the Blocked-Waiter Metric**: Build a CloudWatch alarm on the engine-specific metric that reflects blocked waiters (`BlockedTransactions` on Aurora MySQL, `db.General Statistics.Processes blocked` on RDS SQL Server, or a Database Insights lock-tree metric on PostgreSQL).
+3. **Create a CloudWatch Alarm on the Blocked-Waiter Signal**: Build a CloudWatch alarm on the engine-specific signal that reflects blocked waiters (`BlockedTransactions` on Aurora MySQL, `db.General Statistics.Processes blocked` on RDS SQL Server, or — on Aurora PostgreSQL / RDS PostgreSQL — a CloudWatch Logs metric filter on the `still waiting for` substring after enabling `log_lock_waits = on` and publishing the PostgreSQL log to CloudWatch Logs).
 4. **Add the Alarm as an FIS Stop Condition**: Attach that alarm as a `stopConditions` entry on the FIS experiment template so the experiment auto-halts if the blocked-waiter count exceeds a threshold that would be unsafe in your environment.
 5. **Run the DBA Pre-flight Check**: Confirm that `idle_in_transaction_session_timeout` is unset, zero, or greater than `ExperimentDuration` before running against any shared database.
 6. **Monitor Cleanup**: Verify that the EC2 instance is terminated, the ephemeral security group is deleted, and the `fis_blocking_locks_target` table is gone (if this run created it) after the experiment.

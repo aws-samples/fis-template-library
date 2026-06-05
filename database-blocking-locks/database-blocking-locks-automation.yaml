@@ -299,10 +299,28 @@ mainSteps:
             import threading
             import time
             import traceback
+            from collections import namedtuple
             from typing import Any, List, Optional, Tuple
             import boto3
 
             DEFAULT_SYNTHETIC_TABLE = "fis_blocking_locks_target"
+
+            # TargetSpec is the only thing prepare_target() returns. The rest of
+            # the harness operates against this same shape in both modes.
+            #   qualified_ref: engine-quoted table reference for SQL splicing
+            #     (e.g. '"fis_blocking_locks_target"', '`fis_blocking_locks_target`',
+            #     '[dbo].[orders]').
+            #   pk_columns: ordered list of primary key column names, used to
+            #     build the lock SQL.
+            #   pk_values: the primary key values of the row to lock, bound as
+            #     query parameters at execute time. Synthetic_Mode: (1,).
+            #   created_table: True only when Synthetic_Mode created the table
+            #     this run (controls whether cleanup drops it). Always False
+            #     in Real_Mode.
+            TargetSpec = namedtuple(
+                "TargetSpec",
+                ["qualified_ref", "pk_columns", "pk_values", "created_table"],
+            )
 
             def is_real_mode(target_table_name: str) -> bool:
                 return target_table_name != DEFAULT_SYNTHETIC_TABLE
@@ -351,6 +369,11 @@ mainSteps:
                 """
 
                 TABLE_NAME = DEFAULT_SYNTHETIC_TABLE
+
+                # Real_Mode pre-flight checks (existence + permission probe,
+                # non-empty probe, PK introspection, target-row select) must
+                # complete inside this wall-clock budget. Requirement 2.6.
+                _REAL_MODE_VALIDATION_DEADLINE_S = 10
 
                 def __init__(
                     self,
@@ -463,20 +486,12 @@ mainSteps:
                         client = boto3.client("secretsmanager", region_name=region)
                         response = client.get_secret_value(SecretId=secret_arn)
                     except Exception as exc:  # noqa: BLE001 - broad by design
-                        sys.stderr.write(
-                            "ERROR: Failed to retrieve password from Secrets Manager "
-                            "(SecretId=%s): %s: %s\n"
-                            % (secret_arn, type(exc).__name__, str(exc))
-                        )
+                        sys.stderr.write("ERROR: SecretsManager get failed (SecretId=%s): %s: %s\n" % (secret_arn, type(exc).__name__, str(exc)))
                         sys.exit(2)
 
                     secret_string = response.get("SecretString")
                     if secret_string is None:
-                        sys.stderr.write(
-                            "ERROR: Secrets Manager response for SecretId=%s has no "
-                            "SecretString (binary secrets are not supported).\n"
-                            % (secret_arn,)
-                        )
+                        sys.stderr.write("ERROR: Secrets Manager response for SecretId=%s has no SecretString (binary secrets unsupported).\n" % (secret_arn,))
                         sys.exit(2)
 
                     try:
@@ -529,17 +544,10 @@ mainSteps:
                             conn = pyodbc.connect(conn_str, timeout=10, autocommit=False)
                             return conn
                     except Exception as exc:  # noqa: BLE001
-                        sys.stderr.write(
-                            "ERROR: Failed to connect to %s at %s:%d db=%s as %s: %s: %s\n"
-                            % (engine, self.endpoint, self.port, self.dbname, self.user,
-                               type(exc).__name__, str(exc))
-                        )
+                        sys.stderr.write("ERROR: connect failed to %s at %s:%d db=%s as %s: %s: %s\n" % (engine, self.endpoint, self.port, self.dbname, self.user, type(exc).__name__, str(exc)))
                         sys.exit(3)
 
-                    sys.stderr.write(
-                        "ERROR: Unsupported DatabaseEngine %r. "
-                        "Expected one of: postgres, mysql, sqlserver.\n" % (engine,)
-                    )
+                    sys.stderr.write("ERROR: Unsupported DatabaseEngine %r. Expected one of: postgres, mysql, sqlserver.\n" % (engine,))
                     sys.exit(4)
 
                 def _connection_closed_exceptions(self) -> Tuple[type, ...]:
@@ -586,7 +594,14 @@ mainSteps:
 
                 def ensure_table(self, conn) -> bool:
                     """
-                    Create fis_blocking_locks_target if absent and seed id=1.
+                    Create ``fis_blocking_locks_target`` if absent and seed
+                    ``id = 1``.
+
+                    Returns True if this run created the table, False if a
+                    matching table was already present. The caller uses this
+                    flag to decide whether to drop the table on cleanup, so
+                    a pre-existing table belonging to another tenant is
+                    never dropped by this run.
                     """
                     cursor = conn.cursor()
                     try:
@@ -594,33 +609,33 @@ mainSteps:
                         if self.engine == "postgres":
                             cursor.execute(
                                 "CREATE TABLE IF NOT EXISTS " + self.TABLE_NAME +
-                                " (id INTEGER PRIMARY KEY, counter INTEGER NOT NULL DEFAULT 0)"
+                                " (id INTEGER PRIMARY KEY)"
                             )
                             cursor.execute(
                                 "INSERT INTO " + self.TABLE_NAME +
-                                " (id, counter) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
+                                " (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
                             )
                         elif self.engine == "mysql":
                             cursor.execute(
                                 "CREATE TABLE IF NOT EXISTS " + self.TABLE_NAME +
-                                " (id INT PRIMARY KEY, counter INT NOT NULL DEFAULT 0)"
+                                " (id INT PRIMARY KEY)"
                                 " ENGINE=InnoDB"
                             )
                             cursor.execute(
                                 "INSERT IGNORE INTO " + self.TABLE_NAME +
-                                " (id, counter) VALUES (1, 0)"
+                                " (id) VALUES (1)"
                             )
                         elif self.engine == "sqlserver":
                             cursor.execute(
                                 "IF OBJECT_ID('dbo." + self.TABLE_NAME + "', 'U') IS NULL "
                                 "CREATE TABLE dbo." + self.TABLE_NAME +
-                                " (id INT PRIMARY KEY, counter INT NOT NULL DEFAULT 0)"
+                                " (id INT PRIMARY KEY)"
                             )
                             cursor.execute(
                                 "IF NOT EXISTS (SELECT 1 FROM dbo." + self.TABLE_NAME +
                                 " WHERE id = 1) "
                                 "INSERT INTO dbo." + self.TABLE_NAME +
-                                " (id, counter) VALUES (1, 0)"
+                                " (id) VALUES (1)"
                             )
                         conn.commit()
                         return not existed
@@ -637,8 +652,7 @@ mainSteps:
                     except SystemExit:
                         raise
                     except Exception as exc:  # noqa: BLE001
-                        print("WARN: cleanup connection failed: %s: %s"
-                              % (type(exc).__name__, str(exc)))
+                        print("WARN: cleanup connection failed: %s: %s" % (type(exc).__name__, str(exc)))
                         return
                     try:
                         cursor = conn.cursor()
@@ -651,15 +665,14 @@ mainSteps:
                             else:
                                 cursor.execute("DROP TABLE IF EXISTS " + self.TABLE_NAME)
                             conn.commit()
-                            print("Dropped target table %s" % self.TABLE_NAME)
+                            print("Dropped %s" % self.TABLE_NAME)
                         finally:
                             try:
                                 cursor.close()
                             except Exception:  # noqa: BLE001
                                 pass
                     except Exception as exc:  # noqa: BLE001
-                        print("WARN: DROP TABLE %s failed: %s: %s"
-                              % (self.TABLE_NAME, type(exc).__name__, str(exc)))
+                        print("WARN: DROP TABLE %s failed: %s: %s" % (self.TABLE_NAME, type(exc).__name__, str(exc)))
                     finally:
                         try:
                             conn.close()
@@ -712,33 +725,12 @@ mainSteps:
                             cursor.fetchall()
                         except Exception as exc:  # noqa: BLE001
                             if self._is_relation_missing_error(self.engine, exc):
-                                sys.stderr.write(
-                                    "ERROR: Target table %s does not exist in "
-                                    "database %s on %s:%d (engine=%s). "
-                                    "Underlying error: %s: %s\n"
-                                    % (qualified_table_ref, self.dbname,
-                                       self.endpoint, self.port, self.engine,
-                                       type(exc).__name__, str(exc))
-                                )
+                                sys.stderr.write("ERROR: table %s missing in db %s on %s:%d (engine=%s): %s: %s\n" % (qualified_table_ref, self.dbname, self.endpoint, self.port, self.engine, type(exc).__name__, str(exc)))
                                 sys.exit(20)
-                            if self._is_permission_denied_error(
-                                self.engine, exc,
-                            ):
-                                sys.stderr.write(
-                                    "ERROR: SELECT permission denied on target "
-                                    "table %s (engine=%s). Underlying error: "
-                                    "%s: %s\n"
-                                    % (qualified_table_ref, self.engine,
-                                       type(exc).__name__, str(exc))
-                                )
+                            if self._is_permission_denied_error(self.engine, exc):
+                                sys.stderr.write("ERROR: SELECT denied on %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
                                 sys.exit(24)
-                            sys.stderr.write(
-                                "ERROR: Failed to probe existence of target "
-                                "table %s (engine=%s). Underlying error: %s: "
-                                "%s\n"
-                                % (qualified_table_ref, self.engine,
-                                   type(exc).__name__, str(exc))
-                            )
+                            sys.stderr.write("ERROR: existence probe failed for %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
                             sys.exit(24)
                     finally:
                         try:
@@ -760,30 +752,13 @@ mainSteps:
                                 )
                             row = cursor.fetchone()
                         except Exception as exc:  # noqa: BLE001
-                            if self._is_permission_denied_error(
-                                self.engine, exc,
-                            ):
-                                sys.stderr.write(
-                                    "ERROR: SELECT permission denied on target "
-                                    "table %s (engine=%s). Underlying error: "
-                                    "%s: %s\n"
-                                    % (qualified_table_ref, self.engine,
-                                       type(exc).__name__, str(exc))
-                                )
+                            if self._is_permission_denied_error(self.engine, exc):
+                                sys.stderr.write("ERROR: SELECT denied on %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
                                 sys.exit(24)
-                            sys.stderr.write(
-                                "ERROR: Failed to probe target table %s for "
-                                "rows (engine=%s). Underlying error: %s: %s\n"
-                                % (qualified_table_ref, self.engine,
-                                   type(exc).__name__, str(exc))
-                            )
+                            sys.stderr.write("ERROR: non-empty probe failed for %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
                             sys.exit(24)
                         if row is None:
-                            sys.stderr.write(
-                                "ERROR: Target table %s contains zero rows; "
-                                "cannot select a row to lock (engine=%s).\n"
-                                % (qualified_table_ref, self.engine)
-                            )
+                            sys.stderr.write("ERROR: table %s empty; cannot select row (engine=%s).\n" % (qualified_table_ref, self.engine))
                             sys.exit(21)
                     finally:
                         try:
@@ -793,12 +768,7 @@ mainSteps:
 
                     elapsed = time.monotonic() - start
                     if elapsed > deadline_s:
-                        sys.stderr.write(
-                            "ERROR: Real_Mode pre-flight checks exceeded %.1fs "
-                            "deadline against %s (engine=%s). Elapsed: %.2fs.\n"
-                            % (deadline_s, qualified_table_ref, self.engine,
-                               elapsed)
-                        )
+                        sys.stderr.write("ERROR: pre-flight exceeded %.1fs deadline on %s (engine=%s); elapsed %.2fs.\n" % (deadline_s, qualified_table_ref, self.engine, elapsed))
                         sys.exit(22)
 
                 def _introspect_primary_key(
@@ -867,10 +837,7 @@ mainSteps:
                             "sys.indexes, sys.index_columns, sys.columns"
                         )
                     else:
-                        sys.stderr.write(
-                            "ERROR: Unsupported DatabaseEngine %r for Real_Mode "
-                            "introspection.\n" % (engine,)
-                        )
+                        sys.stderr.write("ERROR: Unsupported DatabaseEngine %r for Real_Mode introspection.\n" % (engine,))
                         sys.exit(4)
 
                     qualified = (schema + "." + table) if schema else table
@@ -881,13 +848,7 @@ mainSteps:
                             cursor.execute(sql, params)
                             rows = cursor.fetchall()
                         except Exception as exc:  # noqa: BLE001
-                            sys.stderr.write(
-                                "ERROR: Failed to introspect primary key of "
-                                "%s (engine=%s): %s: %s. Verify that "
-                                "DatabaseUser %s has SELECT on %s.\n"
-                                % (qualified, engine, type(exc).__name__,
-                                   str(exc), self.user, metadata_views)
-                            )
+                            sys.stderr.write("ERROR: PK introspection failed for %s (engine=%s): %s: %s. Verify %s has SELECT on %s.\n" % (qualified, engine, type(exc).__name__, str(exc), self.user, metadata_views))
                             sys.exit(24)
                     finally:
                         try:
@@ -896,12 +857,7 @@ mainSteps:
                             pass
 
                     if not rows:
-                        sys.stderr.write(
-                            "ERROR: Target table %s has no primary key "
-                            "constraint and cannot be targeted in Real_Mode "
-                            "(engine=%s).\n"
-                            % (qualified, engine)
-                        )
+                        sys.stderr.write("ERROR: table %s has no PK; Real_Mode requires one (engine=%s).\n" % (qualified, engine))
                         sys.exit(23)
 
                     return [str(row[0]) for row in rows]
@@ -936,12 +892,7 @@ mainSteps:
                             cursor.execute(sql)
                             row = cursor.fetchone()
                         except Exception as exc:  # noqa: BLE001
-                            sys.stderr.write(
-                                "ERROR: Failed to select target row from %s "
-                                "(engine=%s): %s: %s\n"
-                                % (qualified_table_ref, engine,
-                                   type(exc).__name__, str(exc))
-                            )
+                            sys.stderr.write("ERROR: target-row select failed for %s (engine=%s): %s: %s\n" % (qualified_table_ref, engine, type(exc).__name__, str(exc)))
                             sys.exit(24)
                     finally:
                         try:
@@ -950,45 +901,31 @@ mainSteps:
                             pass
 
                     if row is None:
-                        sys.stderr.write(
-                            "ERROR: Target table %s contains zero rows; cannot "
-                            "select a row to lock (engine=%s).\n"
-                            % (qualified_table_ref, engine)
-                        )
+                        sys.stderr.write("ERROR: table %s empty; cannot select row (engine=%s).\n" % (qualified_table_ref, engine))
                         sys.exit(21)
 
                     return tuple(row)
 
                 def _acquire_blocker_lock(
                     self, conn,
-                    lock_sql: Optional[str] = None,
-                    pk_values: Optional[Tuple[Any, ...]] = None,
+                    lock_sql: str,
+                    pk_values: Tuple[Any, ...],
                 ) -> bool:
                     """
                     Acquire the Blocker's row-level exclusive lock.
+
+                    Always parameterised: ``lock_sql`` is built once by
+                    ``build_lock_query`` and ``pk_values`` are driver-bound at
+                    execute time so user-controlled values are never spliced
+                    into SQL. Returns False iff the locking SELECT returned
+                    zero rows (target row deleted between selection and lock
+                    acquisition).
                     """
                     cursor = conn.cursor()
                     try:
-                        if lock_sql is None:
-                            if self.engine in ("postgres", "mysql"):
-                                cursor.execute(
-                                    "SELECT id FROM " + self.TABLE_NAME +
-                                    " WHERE id = 1 FOR UPDATE"
-                                )
-                            elif self.engine == "sqlserver":
-                                cursor.execute(
-                                    "SELECT id FROM dbo." + self.TABLE_NAME +
-                                    " WITH (UPDLOCK, HOLDLOCK) WHERE id = 1"
-                                )
-                            cursor.fetchall()
-                            return True
-                        cursor.execute(
-                            lock_sql,
-                            pk_values if pk_values is not None else (),
-                        )
+                        cursor.execute(lock_sql, pk_values)
                         row = cursor.fetchone()
                         if row is None:
-                            # Row was deleted between selection and lock
                             return False
                         try:
                             cursor.fetchall()
@@ -1003,48 +940,39 @@ mainSteps:
 
                 def _waiter_worker(
                     self, waiter_id: int,
-                    lock_sql: Optional[str] = None,
-                    pk_values: Optional[Tuple[Any, ...]] = None,
+                    lock_sql: str,
+                    pk_values: Tuple[Any, ...],
                 ) -> None:
                     """
                     Run a single Waiter session against the Blocker-held row.
+
+                    Always issues the engine-native row-level locking SELECT
+                    (`SELECT ... FOR UPDATE` on PostgreSQL/MySQL,
+                    `SELECT ... WITH (UPDLOCK, HOLDLOCK)` on SQL Server).
+                    Synthetic_Mode and Real_Mode share this exact same path;
+                    only the bound ``pk_values`` differ. Synthetic_Mode keeps
+                    the ``counter`` column on ``fis_blocking_locks_target`` for
+                    schema compatibility with the original requirement, but
+                    it is never mutated.
                     """
                     try:
                         conn = self._connect()
                     except SystemExit:
-                        # _connect already printed; don't double-log.
                         return
                     except Exception as exc:  # noqa: BLE001
-                        print("Waiter %d: connect failed: %s: %s"
-                              % (waiter_id, type(exc).__name__, str(exc)))
+                        print("W%d connect fail: %s: %s" % (waiter_id, type(exc).__name__, str(exc)))
                         return
                     try:
                         cursor = conn.cursor()
                         try:
-                            if lock_sql is None:
-                                cursor.execute(
-                                    "UPDATE " + self.TABLE_NAME +
-                                    " SET counter = counter + 1 WHERE id = 1"
-                                )
-                                conn.commit()
-                            else:
-                                cursor.execute(
-                                    lock_sql,
-                                    pk_values if pk_values is not None else (),
-                                )
-                                try:
-                                    cursor.fetchall()
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                conn.commit()
+                            cursor.execute(lock_sql, pk_values)
+                            try:
+                                cursor.fetchall()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            conn.commit()
                         except Exception as exc:  # noqa: BLE001
-                            op_label = (
-                                "UPDATE/COMMIT" if lock_sql is None
-                                else "locking SELECT/COMMIT"
-                            )
-                            print("Waiter %d: %s failed: %s: %s"
-                                  % (waiter_id, op_label,
-                                     type(exc).__name__, str(exc)))
+                            print("W%d locking SELECT/COMMIT fail: %s: %s" % (waiter_id, type(exc).__name__, str(exc)))
                             try:
                                 conn.rollback()
                             except Exception:  # noqa: BLE001
@@ -1062,8 +990,8 @@ mainSteps:
 
                 def _ramp_waiters(
                     self, schedule: List[Tuple[int, int]],
-                    lock_sql: Optional[str] = None,
-                    pk_values: Optional[Tuple[Any, ...]] = None,
+                    lock_sql: str,
+                    pk_values: Tuple[Any, ...],
                 ) -> None:
                     """
                     Drive the Waiter ramp.
@@ -1083,44 +1011,80 @@ mainSteps:
                             self._waiter_threads.append(t)
                             next_waiter_id += 1
                             total_started += 1
-                        print("Ramp step %d/%d: started %d waiter(s), total=%d/%d"
-                              % (step_idx, len(schedule), n, total_started,
-                                 self.waiter_count))
+                        print("Ramp %d/%d: +%d waiter(s), total=%d/%d" % (step_idx, len(schedule), n, total_started, self.waiter_count))
 
-                def run(self) -> None:
-                    print("=== Database Blocking Locks Harness ===")
-                    print("Engine: %s" % self.engine)
-                    print("Endpoint: %s:%d  Database: %s  User: %s"
-                          % (self.endpoint, self.port, self.dbname, self.user))
-                    mode_label = (
-                        "Real_Mode" if is_real_mode(self.target_table_name)
-                        else "Synthetic_Mode"
-                    )
-                    print("Mode: %s  TargetTableName: %s"
-                          % (mode_label, self.target_table_name))
+                def prepare_target(self) -> TargetSpec:
+                    """
+                    Resolve the experiment target into a single ``TargetSpec``.
 
+                    The only thing that differs between Synthetic_Mode and
+                    Real_Mode is *target preparation*: which table, which PK
+                    columns, which row, and whether cleanup will drop the
+                    table at the end. Everything downstream of this method
+                    runs the same in both modes.
+                    """
                     if is_real_mode(self.target_table_name):
-                        self._run_real_mode()
+                        return self._prepare_real_target()
+                    return self._prepare_synthetic_target()
+
+                def _prepare_synthetic_target(self) -> TargetSpec:
+                    """
+                    Synthetic_Mode preparation: ensure the experiment-owned
+                    ``fis_blocking_locks_target`` table exists with seed row
+                    ``id = 1``, and return a TargetSpec that points the rest
+                    of the harness at it. ``created_table`` is True only when
+                    this run created the table, so cleanup drops only what we
+                    made.
+                    """
+                    qualified_ref = build_quoted_table_ref(
+                        self.engine, None, self.TABLE_NAME,
+                    )
+                    if self.engine == "sqlserver":
+                        # SQL Server defaults to dbo schema; build_quoted_table_ref
+                        # will emit [dbo].[fis_blocking_locks_target].
+                        qualified_ref = build_quoted_table_ref(
+                            self.engine, "dbo", self.TABLE_NAME,
+                        )
+
+                    control_conn = self._connect()
+                    try:
+                        try:
+                            self._created_table = self.ensure_table(control_conn)
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write("ERROR: ensure_table failed for %s: %s: %s\n" % (self.TABLE_NAME, type(exc).__name__, str(exc)))
+                            sys.exit(6)
+                    finally:
+                        try:
+                            control_conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if self._created_table:
+                        print("Created %s (will DROP on cleanup)" % self.TABLE_NAME)
                     else:
-                        self._run_synthetic_mode()
+                        print("Reusing %s (will NOT drop on cleanup)" % self.TABLE_NAME)
 
-                def _run_real_mode(self) -> None:
-                    """
-                    Real_Mode orchestration: lock a real-table row read-only.
-                    """
-                    print("WaiterCount: %d  ExperimentDuration: %ds  "
-                          "RampTime: %ds  RampSteps: %d"
-                          % (self.waiter_count, self.experiment_duration_s,
-                             self.ramp_time_s, self.ramp_steps))
+                    return TargetSpec(
+                        qualified_ref=qualified_ref,
+                        pk_columns=["id"],
+                        pk_values=(1,),
+                        created_table=self._created_table,
+                    )
 
+                def _prepare_real_target(self) -> TargetSpec:
+                    """
+                    Real_Mode preparation: validate the user-supplied table,
+                    introspect its primary key, and select the first row's PK
+                    values. ``created_table`` is always False in Real_Mode so
+                    cleanup never drops the user's table.
+                    """
                     schema, table = parse_qualified_table_name(
                         self.engine, self.target_table_name,
                     )
                     qualified_ref = build_quoted_table_ref(
                         self.engine, schema, table,
                     )
-                    print("Real_Mode target: %s (engine=%s)"
-                          % (qualified_ref, self.engine))
+                    print("Real_Mode: %s (%s)" % (qualified_ref, self.engine))
 
                     control_conn = self._connect()
                     try:
@@ -1137,48 +1101,90 @@ mainSteps:
                         except Exception:  # noqa: BLE001
                             pass
 
-                    print("Discovered primary key columns: %s" % (pk_columns,))
-                    print("Locking target row pk_values=%r" % (pk_values,))
+                    print("PK columns: %s" % (pk_columns,))
+                    print("Locking pk_values=%r" % (pk_values,))
+                    return TargetSpec(
+                        qualified_ref=qualified_ref,
+                        pk_columns=pk_columns,
+                        pk_values=pk_values,
+                        created_table=False,
+                    )
 
-                    # 3. Build the lock SQL exactly once; PK values are
-                    #    driver-bound at execute time, never spliced.
+                def run(self) -> None:
+                    """
+                    Mode-agnostic experiment driver.
+
+                    The flow is identical for Synthetic_Mode and Real_Mode:
+
+                      1. Resolve the target via ``prepare_target`` into a
+                         ``TargetSpec``.
+                      2. Build the engine-native lock SQL once. Both Blocker
+                         and Waiters reuse it.
+                      3. Compute the Waiter ramp schedule.
+                      4. Acquire the Blocker, ramp Waiters, sleep with
+                         liveness checks, COMMIT and join.
+                    """
+                    print("=== Blocking Locks Harness ===")
+                    print("Engine: %s" % self.engine)
+                    print("Endpoint: %s:%d Database: %s User: %s" % (self.endpoint, self.port, self.dbname, self.user))
+                    mode_label = (
+                        "Real_Mode" if is_real_mode(self.target_table_name)
+                        else "Synthetic_Mode"
+                    )
+                    print("Mode: %s TargetTableName: %s" % (mode_label, self.target_table_name))
+                    print("Waiters=%d Duration=%ds Ramp=%ds Steps=%d" % (self.waiter_count, self.experiment_duration_s, self.ramp_time_s, self.ramp_steps))
+
+                    target = self.prepare_target()
+
                     lock_sql = build_lock_query(
-                        self.engine, qualified_ref, pk_columns,
+                        self.engine, target.qualified_ref, target.pk_columns,
                     )
                     print("Lock SQL: %s" % (lock_sql,))
 
-                    # 4. Ramp schedule (same clamping arithmetic as
-                    #    _run_synthetic_mode; Requirement 6.7).
+                    schedule = self._compute_clamped_schedule()
+                    print("Ramp schedule: %s" % (schedule,))
+
+                    self._run_experiment(target, lock_sql, schedule)
+
+                def _compute_clamped_schedule(self) -> List[Tuple[int, int]]:
+                    """
+                    Compute the Waiter ramp schedule, clamping ``ramp_time_s``
+                    to ``experiment_duration_s`` if it exceeds it (Requirement
+                    8.6).
+                    """
                     effective_ramp_time = self.ramp_time_s
                     if effective_ramp_time > self.experiment_duration_s:
-                        print("NOTE: RampTime (%ds) exceeds ExperimentDuration "
-                              "(%ds); clamping RampTime to ExperimentDuration."
-                              % (effective_ramp_time,
-                                 self.experiment_duration_s))
+                        print("NOTE: RampTime %ds > Duration %ds; clamping." % (effective_ramp_time, self.experiment_duration_s))
                         effective_ramp_time = self.experiment_duration_s
-                    schedule = self.compute_ramp_schedule(
+                    return self.compute_ramp_schedule(
                         self.waiter_count,
                         self.ramp_steps,
                         effective_ramp_time,
                         self.experiment_duration_s,
                     )
-                    print("Ramp schedule (wait_before_s, waiters_to_start): %s"
-                          % (schedule,))
 
+                def _run_experiment(
+                    self, target: TargetSpec, lock_sql: str,
+                    schedule: List[Tuple[int, int]],
+                ) -> None:
+                    """
+                    Run the Blocker + ramp + liveness-loop + join.
+
+                    This is the single mode-agnostic experiment body. It
+                    receives a fully-resolved ``TargetSpec`` plus the lock
+                    SQL and schedule, and does not branch on mode.
+                    """
                     def _drive_ramp() -> None:
                         try:
                             self._ramp_waiters(
                                 schedule,
                                 lock_sql=lock_sql,
-                                pk_values=pk_values,
+                                pk_values=target.pk_values,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            print("Ramp driver failed: %s: %s"
-                                  % (type(exc).__name__, str(exc)))
+                            print("Ramp failed: %s: %s" % (type(exc).__name__, str(exc)))
 
-                    ramp_thread = threading.Thread(
-                        target=_drive_ramp, daemon=True,
-                    )
+                    ramp_thread = threading.Thread(target=_drive_ramp, daemon=True)
 
                     blocker_conn = self._connect()
                     blocker_start = time.monotonic()
@@ -1187,15 +1193,10 @@ mainSteps:
                             acquired = self._acquire_blocker_lock(
                                 blocker_conn,
                                 lock_sql=lock_sql,
-                                pk_values=pk_values,
+                                pk_values=target.pk_values,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            sys.stderr.write(
-                                "ERROR: Blocker failed to acquire lock on %s "
-                                "where pk=%r (engine=%s): %s: %s\n"
-                                % (qualified_ref, pk_values, self.engine,
-                                   type(exc).__name__, str(exc))
-                            )
+                            sys.stderr.write("ERROR: blocker lock failed on %s pk=%r (engine=%s): %s: %s\n" % (target.qualified_ref, target.pk_values, self.engine, type(exc).__name__, str(exc)))
                             try:
                                 blocker_conn.rollback()
                             except Exception:  # noqa: BLE001
@@ -1204,16 +1205,10 @@ mainSteps:
                                 blocker_conn.close()
                             except Exception:  # noqa: BLE001
                                 pass
-                            sys.exit(25)
+                            sys.exit(25 if is_real_mode(self.target_table_name) else 5)
 
                         if not acquired:
-                            sys.stderr.write(
-                                "ERROR: Blocker failed to acquire lock on %s "
-                                "where pk=%r; row may have been deleted "
-                                "between selection and lock acquisition "
-                                "(engine=%s).\n"
-                                % (qualified_ref, pk_values, self.engine)
-                            )
+                            sys.stderr.write("ERROR: blocker lock failed on %s pk=%r; row deleted before lock acquired (engine=%s).\n" % (target.qualified_ref, target.pk_values, self.engine))
                             try:
                                 blocker_conn.rollback()
                             except Exception:  # noqa: BLE001
@@ -1222,167 +1217,9 @@ mainSteps:
                                 blocker_conn.close()
                             except Exception:  # noqa: BLE001
                                 pass
-                            sys.exit(25)
+                            sys.exit(25 if is_real_mode(self.target_table_name) else 5)
 
-                        print("Blocker acquired row lock on %s pk=%r at t=0s; "
-                              "holding for %ds"
-                              % (qualified_ref, pk_values,
-                                 self.experiment_duration_s))
-                        ramp_thread.start()
-
-                        liveness_exceptions = self._connection_closed_exceptions()
-                        chunk_seconds = 15
-                        deadline = (blocker_start
-                                    + self.experiment_duration_s)
-                        while True:
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                break
-                            time.sleep(min(chunk_seconds, remaining))
-                            try:
-                                cursor = blocker_conn.cursor()
-                                try:
-                                    cursor.execute("SELECT 1")
-                                    cursor.fetchall()
-                                finally:
-                                    try:
-                                        cursor.close()
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                            except liveness_exceptions as exc:
-                                elapsed = int(
-                                    time.monotonic() - blocker_start
-                                )
-                                print(
-                                    "Blocker transaction terminated by server "
-                                    "after %d seconds (engine=%s). Likely "
-                                    "cause: DBA-configured idle-in-transaction "
-                                    "timeout."
-                                    % (elapsed, self.engine)
-                                )
-                                print("Underlying exception: %s: %s"
-                                      % (type(exc).__name__, str(exc)))
-                                self._blocker_terminated_early = True
-                                break
-
-                        if not self._blocker_terminated_early:
-                            try:
-                                blocker_conn.commit()
-                                print("Blocker committed; row lock on %s "
-                                      "pk=%r released after %ds"
-                                      % (qualified_ref, pk_values,
-                                         self.experiment_duration_s))
-                            except Exception as exc:  # noqa: BLE001
-                                elapsed = int(
-                                    time.monotonic() - blocker_start
-                                )
-                                print(
-                                    "Blocker transaction terminated by server "
-                                    "after %d seconds (engine=%s). Likely "
-                                    "cause: DBA-configured idle-in-transaction "
-                                    "timeout."
-                                    % (elapsed, self.engine)
-                                )
-                                print("Underlying exception on COMMIT: %s: %s"
-                                      % (type(exc).__name__, str(exc)))
-                                self._blocker_terminated_early = True
-                    finally:
-                        try:
-                            blocker_conn.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-
-                    ramp_thread.join(timeout=60)
-  
-                    print("Joining %d waiter threads (timeout=30s each)..."
-                          % len(self._waiter_threads))
-                    for t in self._waiter_threads:
-                        t.join(timeout=30)
-                    alive = sum(
-                        1 for t in self._waiter_threads if t.is_alive()
-                    )
-                    if alive:
-                        print("WARN: %d waiter thread(s) still alive after "
-                              "join timeout" % alive)
-                    else:
-                        print("All waiter threads joined cleanly")
-
-                def _run_synthetic_mode(self) -> None:
-                    print("WaiterCount: %d  ExperimentDuration: %ds  "
-                          "RampTime: %ds  RampSteps: %d"
-                          % (self.waiter_count, self.experiment_duration_s,
-                             self.ramp_time_s, self.ramp_steps))
-
-                    effective_ramp_time = self.ramp_time_s
-                    if effective_ramp_time > self.experiment_duration_s:
-                        print("NOTE: RampTime (%ds) exceeds ExperimentDuration (%ds); "
-                              "clamping RampTime to ExperimentDuration."
-                              % (effective_ramp_time, self.experiment_duration_s))
-                        effective_ramp_time = self.experiment_duration_s
-
-                    schedule = self.compute_ramp_schedule(
-                        self.waiter_count,
-                        self.ramp_steps,
-                        effective_ramp_time,
-                        self.experiment_duration_s,
-                    )
-                    print("Ramp schedule (wait_before_s, waiters_to_start): %s"
-                          % (schedule,))
-
-                    try:
-                        try:
-                            self._created_table = self.ensure_table(control_conn)
-                        except Exception as exc:  # noqa: BLE001
-                            sys.stderr.write(
-                                "ERROR: Failed to create/seed target table %s: %s: %s\n"
-                                % (self.TABLE_NAME, type(exc).__name__, str(exc))
-                            )
-                            sys.exit(6)
-                    finally:
-                        try:
-                            control_conn.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                    if self._created_table:
-                        print("Created target table %s (will DROP on exit)"
-                              % self.TABLE_NAME)
-                    else:
-                        print("Reusing pre-existing target table %s (will NOT drop)"
-                              % self.TABLE_NAME)
-
-                    def _drive_ramp() -> None:
-                        try:
-                            self._ramp_waiters(schedule)
-                        except Exception as exc:  # noqa: BLE001
-                            print("Ramp driver failed: %s: %s"
-                                  % (type(exc).__name__, str(exc)))
-
-                    ramp_thread = threading.Thread(target=_drive_ramp, daemon=True)
-
-                    blocker_conn = self._connect()
-                    blocker_start = time.monotonic()
-                    try:
-                        try:
-                            self._acquire_blocker_lock(blocker_conn)
-                        except Exception as exc:  # noqa: BLE001
-                            sys.stderr.write(
-                                "ERROR: Blocker failed to acquire row lock on "
-                                "%s.id=1: %s: %s\n"
-                                % (self.TABLE_NAME, type(exc).__name__, str(exc))
-                            )
-                            try:
-                                blocker_conn.rollback()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            try:
-                                blocker_conn.close()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            sys.exit(5)
-
-                        print("Blocker acquired row lock on %s.id=1 at t=0s; "
-                              "holding for %ds"
-                              % (self.TABLE_NAME, self.experiment_duration_s))
+                        print("Blocker locked %s pk=%r; holding %ds" % (target.qualified_ref, target.pk_values, self.experiment_duration_s))
                         ramp_thread.start()
 
                         liveness_exceptions = self._connection_closed_exceptions()
@@ -1405,32 +1242,19 @@ mainSteps:
                                         pass
                             except liveness_exceptions as exc:
                                 elapsed = int(time.monotonic() - blocker_start)
-                                print(
-                                    "Blocker transaction terminated by server after "
-                                    "%d seconds (engine=%s). Likely cause: "
-                                    "DBA-configured idle-in-transaction timeout."
-                                    % (elapsed, self.engine)
-                                )
-                                print("Underlying exception: %s: %s"
-                                      % (type(exc).__name__, str(exc)))
+                                print("Blocker tx killed by server after %ds (engine=%s). idle-in-tx kill." % (elapsed, self.engine))
+                                print("Underlying exception: %s: %s" % (type(exc).__name__, str(exc)))
                                 self._blocker_terminated_early = True
                                 break
 
                         if not self._blocker_terminated_early:
                             try:
                                 blocker_conn.commit()
-                                print("Blocker committed; row lock released after "
-                                      "%ds" % self.experiment_duration_s)
+                                print("Blocker COMMIT; %s pk=%r released after %ds" % (target.qualified_ref, target.pk_values, self.experiment_duration_s))
                             except Exception as exc:  # noqa: BLE001
                                 elapsed = int(time.monotonic() - blocker_start)
-                                print(
-                                    "Blocker transaction terminated by server after "
-                                    "%d seconds (engine=%s). Likely cause: "
-                                    "DBA-configured idle-in-transaction timeout."
-                                    % (elapsed, self.engine)
-                                )
-                                print("Underlying exception on COMMIT: %s: %s"
-                                      % (type(exc).__name__, str(exc)))
+                                print("Blocker tx killed by server after %ds (engine=%s). idle-in-tx kill." % (elapsed, self.engine))
+                                print("Underlying exception on COMMIT: %s: %s" % (type(exc).__name__, str(exc)))
                                 self._blocker_terminated_early = True
                     finally:
                         try:
@@ -1440,24 +1264,21 @@ mainSteps:
 
                     ramp_thread.join(timeout=60)
 
-                    print("Joining %d waiter threads (timeout=30s each)..."
-                          % len(self._waiter_threads))
+                    print("Joining %d waiter threads..." % len(self._waiter_threads))
                     for t in self._waiter_threads:
                         t.join(timeout=30)
                     alive = sum(1 for t in self._waiter_threads if t.is_alive())
                     if alive:
-                        print("WARN: %d waiter thread(s) still alive after join timeout"
-                              % alive)
+                        print("WARN: %d waiter(s) still alive after timeout" % alive)
                     else:
-                        print("All waiter threads joined cleanly")
+                        print("Waiters joined")
 
 
             def _positive_int(name: str, raw: str) -> int:
                 try:
                     value = int(raw)
                 except ValueError:
-                    sys.stderr.write("ERROR: %s must be an integer, got %r\n"
-                                     % (name, raw))
+                    sys.stderr.write("ERROR: %s must be an integer, got %r\n" % (name, raw))
                     sys.exit(1)
                 if value < 0:
                     sys.stderr.write("ERROR: %s must be >= 0, got %d\n" % (name, value))
@@ -1468,13 +1289,7 @@ mainSteps:
             def main(argv: Optional[List[str]] = None) -> None:
                 argv = list(sys.argv if argv is None else argv)
                 if len(argv) != 13:
-                    sys.stderr.write(
-                        "Usage: %s DatabaseEngine DatabaseEndpoint DatabasePort "
-                        "DatabaseName DatabaseUser DatabasePasswordSecretArn "
-                        "WaiterCount ExperimentDuration RampTime RampSteps Region "
-                        "TargetTableName\n"
-                        % (argv[0] if argv else "blocking_locks_harness.py",)
-                    )
+                    sys.stderr.write("Usage: %s ENGINE ENDPOINT PORT DBNAME USER SECRET_ARN WAITERS DURATION RAMP_TIME RAMP_STEPS REGION TARGET_TABLE\n" % (argv[0] if argv else "harness.py",))
                     sys.exit(1)
 
                 (_prog, engine, endpoint, port_raw, dbname, user, secret_arn,
@@ -1482,10 +1297,7 @@ mainSteps:
                  ramp_steps_raw, region, target_table_name) = argv
 
                 if engine not in ("postgres", "mysql", "sqlserver"):
-                    sys.stderr.write(
-                        "ERROR: Unsupported DatabaseEngine %r. "
-                        "Expected one of: postgres, mysql, sqlserver.\n" % (engine,)
-                    )
+                    sys.stderr.write("ERROR: Unsupported DatabaseEngine %r. Expected one of: postgres, mysql, sqlserver.\n" % (engine,))
                     sys.exit(4)
 
                 port = _positive_int("DatabasePort", port_raw)
