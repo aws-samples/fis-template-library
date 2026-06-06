@@ -51,11 +51,11 @@ INSERT INTO app_order_items (order_id, line_no, sku, qty)
 WITH RECURSIVE orders (o) AS (
     SELECT 1 UNION ALL SELECT o + 1 FROM orders WHERE o < 20
 ),
-lines (l) AS (
-    SELECT 1 UNION ALL SELECT l + 1 FROM lines WHERE l < 5
+order_lines (l) AS (
+    SELECT 1 UNION ALL SELECT l + 1 FROM order_lines WHERE l < 5
 )
 SELECT o, l, CONCAT('SKU-', (o * 10 + l)), (l * 2)
-FROM orders, lines;
+FROM orders, order_lines;
 
 -- Fixture C: no primary key, 100 rows. Used by Phase 3c (exit 23).
 CREATE TABLE app_no_pk (
@@ -89,10 +89,10 @@ GRANT SELECT ON appdb.app_empty         TO 'fis_runner'@'%';
 FLUSH PRIVILEGES;
 
 -- Quick sanity check.
-SELECT 'app_orders'      AS fixture, COUNT(*) AS rows FROM app_orders
+SELECT 'app_orders'      AS fixture, COUNT(*) AS row_count FROM app_orders
 UNION ALL
-SELECT 'app_order_items',            COUNT(*)        FROM app_order_items
+SELECT 'app_order_items',            COUNT(*)             FROM app_order_items
 UNION ALL
-SELECT 'app_no_pk',                  COUNT(*)        FROM app_no_pk
+SELECT 'app_no_pk',                  COUNT(*)             FROM app_no_pk
 UNION ALL
-SELECT 'app_empty',                  COUNT(*)        FROM app_empty;
+SELECT 'app_empty',                  COUNT(*)             FROM app_empty;

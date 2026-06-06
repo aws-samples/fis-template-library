@@ -28,7 +28,7 @@ When the {service1} database is subjected to synthetic row-level blocking locks 
 When the {service1} database is subjected to directed row-level blocking locks the operations an alarm should be raised and the DevOps team should be notified within {x} minutes. The teams should be able to detect and respond to the cause within {y} minutes via the engine-specific blocked-waiter metric. Critical user journeys relating to {workload} should/shouldn't be impacted in {manner of impact}.
 
 #### Engine specific metrics:
-* Aurora MySQL `BlockedTransactions`
+* Aurora MySQL / RDS MySQL: `db.Locks.innodb_row_lock_waits.avg` (cumulative count of row-lock waits — climbs while the experiment runs) and `db.Locks.innodb_lock_timeouts.avg` (count of `ERROR 1205` aborts — the "Waiters being killed" signal). Both alarmable via `DB_PERF_INSIGHTS('RDS', '<id>', '<metric>')`. Supplement with application-side `1205 (HY000) Lock wait timeout exceeded` error rate. Aurora MySQL `BlockedTransactions` is bursty under default `innodb_lock_wait_timeout` (50 s) and not the right primary signal — see the MySQL-specific note in the Observability section.
 * RDS SQL Server `db.General Statistics.Processes blocked`
 * Aurora PostgreSQL and RDS PostgreSQL: the `Lock:Tuple` (and `Lock:transactionid`) wait events on the Performance Insights Database load chart
 
@@ -105,7 +105,9 @@ Before running this experiment, ensure that:
 2. **Database Configuration**:
    - Supported database is running (Aurora PostgreSQL, Aurora MySQL, RDS PostgreSQL, RDS MySQL, or RDS SQL Server)
    - You know the database endpoint, username, and port
+   - You have a user database the master user can create tables in, and you know its name. RDS does not auto-create one for MySQL, and the system schemas (`mysql` on RDS MySQL, `master` on RDS SQL Server) are not suitable targets — RDS revokes DDL on `mysql`, and `master` is reserved for engine metadata. If you don't have an application database, create one once with `CREATE DATABASE fis_test;` and pass its name as `DatabaseName`.
    - You have stored the database password as an AWS Secrets Manager secret and know its ARN. The secret can be either a raw string or a JSON document with a `password` key (the shape used by the RDS-managed master password secret).
+   - **Instance class for Performance Insights-based monitoring**: if you intend to alarm via the `DB_PERF_INSIGHTS` metric math function on counters such as `db.Locks.innodb_row_lock_waits.avg` (Aurora MySQL / RDS MySQL) or `db.General Statistics.Processes blocked.avg` (RDS SQL Server), Performance Insights must be enabled on the instance, and Performance Insights does not support burstable classes (`db.t2.*`, `db.t3.*`, `db.t4g.*`). The experiment itself runs on any supported instance class — only the alarm path is constrained. On a burstable class you can still observe the engine's Database Insights graphs and use application-side error rates (for example a CloudWatch Logs metric filter on `Lock wait timeout exceeded`) for alerting; choose a non-burstable class (for example `db.r6g.large` or larger) only if you specifically need `DB_PERF_INSIGHTS`-driven alarms.
 
 ### Create Required Experiment Resources
 
@@ -142,10 +144,10 @@ The experiment requires the following parameters:
 - **DatabaseEngine**: `postgres`, `mysql`, or `sqlserver` (default: `postgres`)
 - **DatabaseEndpoint**: Database DNS hostname or endpoint
 - **DatabasePort**: Database port (default: 5432 for PostgreSQL, use 3306 for MySQL, 1433 for SQL Server)
-- **DatabaseName**: Database name to connect to e.g.
-  - PostgreSQL: `postgres` (default system database)
-  - MySQL: `mysql` (default system database)
-  - SQL Server: `master` (default system database)
+- **DatabaseName**: User database the harness connects to. The harness creates the synthetic `fis_blocking_locks_target` table inside this database (Synthetic_Mode) or expects to find the user-supplied target table inside it (Real_Mode), so the database user identified by `DatabaseUser` needs CREATE / INSERT / SELECT / DROP on it. Use one of:
+  - Your existing application database, if you have one.
+  - A dedicated experiment database (for example `fis_test`), created once with `CREATE DATABASE fis_test;`.
+  - **Do not** point this at engine-managed system schemas — `mysql` on RDS MySQL revokes DDL from the master user; `postgres` on RDS PostgreSQL works but is a poor default to encourage; `master` on RDS SQL Server should likewise be avoided in favour of a user database.
 - **DatabaseUser**: Database username (default: `postgres`)
 - **DatabasePasswordSecretArn**: ARN of Secrets Manager secret containing password
   - **Note** Since we don't know the ARN of your secret ahead of time, the sample SSM automation role ([database-blocking-locks-ssm-automation-role-iam-policy.json](database-blocking-locks-ssm-automation-role-iam-policy.json)) is given read access to all secrets, you should probably scope this down accordingly.
@@ -369,9 +371,31 @@ Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 
 The engine-specific metric that reflects blocked waiters is different for each supported engine. Each Waiter that is currently blocked on the Target_Row contributes approximately 1 to the corresponding count, and the `ExperimentDuration` parameter directly controls how long the Blocker holds the row lock.
 
-- **Aurora MySQL**: the `BlockedTransactions` Amazon CloudWatch metric at the instance level.
+- **Aurora MySQL and RDS MySQL**: the right primary signals are two cumulative counters in the `db.Locks.*` namespace. **`db.Locks.innodb_row_lock_waits.avg`** is the count of times any transaction has waited for a row lock; this rises by 1 per blocked Waiter as it enters the wait queue. **`db.Locks.innodb_lock_timeouts.avg`** is the count of `ERROR 1205 (HY000) Lock wait timeout exceeded` aborts — this is the *direct* "Waiters being killed by the engine's `innodb_lock_wait_timeout`" signal and is the most precise expression of the failure mode. View both as **Row lock time** / **Row lock waits** / **Lock timeouts** in Performance Insights → Database Insights, or alarm on either with `DB_PERF_INSIGHTS('RDS', '<resource-id>', '<metric-name>')`. Cross-reference with the **application-side `1205 (HY000) Lock wait timeout exceeded` error rate** — this is the customer-impact signal and the highest-priority alarm. Aurora MySQL `BlockedTransactions` is a point-in-time gauge that is *bursty* under default settings (it rises briefly then falls back as Waiters get aborted) and so will not plateau at `WaiterCount` the way the SQL Server and PostgreSQL signals do; treat it as supplementary rather than primary.
 - **RDS SQL Server**: the `db.General Statistics.Processes blocked` counter in Performance Insights.
 - **Aurora PostgreSQL and RDS PostgreSQL**: open the **Performance Insights Database load** chart for the writer instance and group by **Waits**. The `Lock:Tuple` wait event will rise to roughly `WaiterCount` while the experiment runs (Waiters blocked on `SELECT ... FOR UPDATE` against the locked row report as `Lock:Tuple`; you may also see `Lock:transactionid` depending on the contention pattern). For alarm-driven detection, set `log_lock_waits = on` in the **DB parameter group** for the writer instance, publish the PostgreSQL log to CloudWatch Logs, and create a CloudWatch Logs metric filter on the substring `still waiting for`. PostgreSQL does not publish a top-level `BlockedTransactions`-style CloudWatch metric, and Performance Insights wait events are not exposed via the `DB_PERF_INSIGHTS` metric math function. After the alarm fires, use **CloudWatch Database Insights (Advanced mode)** lock-tree analysis to identify the blocking session.
+
+#### MySQL-specific note: why the signal is bursty, not flat
+
+On MySQL, `innodb_lock_wait_timeout` (default 50 s) only applies to transactions waiting *to acquire* a lock; it does **not** bound the holder. So the production failure mode is: one transaction holds a row lock indefinitely, application transactions trying to update the row each wait up to 50 s and are aborted with `ERROR 1205`, the application either retries or fails the user request, and a steady stream of new transactions keeps arriving and being aborted. A point-in-time gauge like `BlockedTransactions` therefore stays low even though contention is sustained and customer-visible. The cumulative `Innodb_row_lock_waits` counter and the application-side 1205 error rate both reflect the rate of aborts and are the right operational signals.
+
+#### MySQL-specific parameter sizing
+
+The harness creates each Waiter once and does not replenish it after the engine aborts it at `innodb_lock_wait_timeout` (default 50 s). On MySQL this means the standard "ramp Waiters then watch them sit" model from PostgreSQL and SQL Server doesn't apply: every Waiter you create dies once at ~50 s after its start and is gone. To produce sustained, realistic contention signal across the full `ExperimentDuration` you need to size two parameters together:
+
+- **`RampTime = ExperimentDuration`.** Spread Waiter creation evenly across the experiment so new Waiters are still being created late into the run, rather than ramping all of them in the first few minutes and then having no Waiters left to abort.
+- **`WaiterCount` ≈ `ExperimentDuration` / 50 s × target concurrent timeouts.** Each Waiter is alive for at most 50 s, so to maintain *N* concurrent abort-pending Waiters across an `ExperimentDuration`-second run you need roughly `WaiterCount = ExperimentDuration / 50 × N` Waiters in total.
+
+Suggested starting values for typical `ExperimentDuration` choices, targeting roughly 5 concurrent abort-pending Waiters at any moment:
+
+| `ExperimentDuration` | `RampTime` | `WaiterCount` | What you'll see |
+| --- | --- | --- | --- |
+| `PT5M` (300 s) | `PT5M` | 30 | ~6 timeouts/min sustained |
+| `PT10M` (600 s) | `PT10M` | 60 | ~6 timeouts/min sustained |
+| `PT30M` (1800 s) | `PT30M` | 180 | ~6 timeouts/min sustained |
+| `PT1H` (3600 s) | `PT1H` | 360 | ~6 timeouts/min sustained |
+
+These figures size the harness so that `db.Locks.innodb_lock_timeouts.avg` (and the equivalent application-side 1205 error rate) shows a roughly steady non-zero rate for the whole experiment rather than a single early burst followed by silence. Scale `WaiterCount` proportionally if you want a higher concurrent-abort target. PostgreSQL and SQL Server do not need this adjustment because their Waiters do not get aborted; on those engines the original "small `RampTime`, modest `WaiterCount`" model holds.
 
 Expect the chosen metric to climb in stepped increments matching the Waiter ramp (`WaiterCount / RampSteps` per step), plateau at roughly `WaiterCount` once the ramp is complete, and return to baseline within a short interval after `ExperimentDuration` elapses and the Blocker COMMITs.
 

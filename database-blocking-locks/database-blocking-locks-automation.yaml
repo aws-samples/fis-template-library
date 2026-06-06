@@ -23,7 +23,7 @@ parameters:
 
   DatabaseName:
     type: String
-    description: 'Database name to connect to'
+    description: 'User database the harness connects to. Must be a database the master user can create tables in (Synthetic_Mode creates fis_blocking_locks_target inside it). Do not target engine-managed system schemas (mysql, master). Default postgres works for RDS/Aurora PostgreSQL only; create a user database such as fis_test for MySQL or SQL Server.'
     default: 'postgres'
 
   DatabaseUser:
