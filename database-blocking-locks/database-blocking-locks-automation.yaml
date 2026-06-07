@@ -1036,15 +1036,14 @@ mainSteps:
                     this run created the table, so cleanup drops only what we
                     made.
                     """
+                    # SQL Server requires a two-part identifier so the lock
+                    # SQL emits [dbo].[fis_blocking_locks_target]. PostgreSQL
+                    # and MySQL use the connection's current schema/database,
+                    # so the schema component is None.
+                    schema = "dbo" if self.engine == "sqlserver" else None
                     qualified_ref = build_quoted_table_ref(
-                        self.engine, None, self.TABLE_NAME,
+                        self.engine, schema, self.TABLE_NAME,
                     )
-                    if self.engine == "sqlserver":
-                        # SQL Server defaults to dbo schema; build_quoted_table_ref
-                        # will emit [dbo].[fis_blocking_locks_target].
-                        qualified_ref = build_quoted_table_ref(
-                            self.engine, "dbo", self.TABLE_NAME,
-                        )
 
                     control_conn = self._connect()
                     try:
