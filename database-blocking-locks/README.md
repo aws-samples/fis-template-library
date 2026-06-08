@@ -300,7 +300,7 @@ The most common reason the Blocker's lock is released before `ExperimentDuration
 
 ## Leftover Table Side Effect
 
-The harness creates a dedicated `fis_blocking_locks_target` table in the target database on startup if it does not already exist, and drops it on clean shutdown. If the harness is terminated in a way that bypasses its cleanup (for example a hard kill of the EC2 instance without graceful shutdown, or a process crash between the Blocker COMMIT and the DROP TABLE), the `fis_blocking_locks_target` table may be left behind in the target database.
+In **Synthetic_Mode** the harness creates a dedicated `fis_blocking_locks_target` table in the target database on startup if it does not already exist, and drops it on clean shutdown. If the harness is terminated in a way that bypasses its cleanup (for example a hard kill of the SSM created EC2 instance (load generator) without graceful shutdown, or a process crash between the Blocker COMMIT and the DROP TABLE), the `fis_blocking_locks_target` table may be left behind in the target database.
 
 To remove a leftover table:
 
