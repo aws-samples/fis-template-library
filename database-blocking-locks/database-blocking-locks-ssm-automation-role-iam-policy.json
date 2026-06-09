@@ -85,21 +85,12 @@
             "Sid": "AllowPassRoleToEC2",
             "Effect": "Allow",
             "Action": "iam:PassRole",
-            "Resource": "arn:aws:iam::*:role/SSM-Managed-Instance-Profile-Role",
+            "Resource": "arn:aws:iam::*:role/SSM-Managed-Instance-Profile",
             "Condition": {
                 "StringEquals": {
                     "iam:PassedToService": "ec2.amazonaws.com"
                 }
             }
-        },
-        {
-            "Sid": "AllowSecretsManagerAccess",
-            "Effect": "Allow",
-            "Action": [
-                "secretsmanager:GetSecretValue",
-                "secretsmanager:DescribeSecret"
-            ],
-            "Resource": "arn:aws:secretsmanager:*:*:secret:*"
         },
         {
             "Sid": "AllowSSMParameterAccess",

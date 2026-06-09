@@ -7,7 +7,7 @@ This repository contains a collection of AWS Fault Injection Service (FIS) exper
 Browse the experiment directories to find templates for various fault injection scenarios:
 
 - **EC2 Instance Management**: `ec2-instances-terminate/`, `ec2-spot-interruption/`, `ec2-windows-stop-iis/`
-- **Database Resilience**: `aurora-cluster-failover/`, `sap-ebs-pause-database-data/`
+- **Database Resilience**: `aurora-cluster-failover/`, `sap-ebs-pause-database-data/`, `database-blocking-locks`, `database-connection-limit-exhaustion`
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
 - **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
 

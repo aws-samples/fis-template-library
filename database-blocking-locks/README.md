@@ -22,7 +22,7 @@ When the {service1} database is subjected to directed row-level blocking locks a
 #### Engine specific CloudWatch metrics:
 * Aurora MySQL / RDS MySQL: `db.Locks.innodb_row_lock_waits.avg` (cumulative count of row-lock waits — climbs while the experiment runs) and `db.Locks.innodb_lock_timeouts.avg` (count of `ERROR 1205` aborts — the "Waiters being killed" signal). Both alarmable via `DB_PERF_INSIGHTS('RDS', '<resource_id>', '<metric>')`. Supplement with application-side `1205 (HY000) Lock wait timeout exceeded` error rate. Aurora MySQL `BlockedTransactions` is bursty under default `innodb_lock_wait_timeout` (50 s) and not the right primary signal — see the MySQL-specific note in the Observability section.
 * RDS SQL Server: `db.General Statistics.Processes blocked.avg`, alarmable via `DB_PERF_INSIGHTS('RDS', '<resource_id>', 'db.General Statistics.Processes blocked.avg')`.
-* Aurora PostgreSQL and RDS PostgreSQL: the `Lock:Tuple` (and `Lock:transactionid`) wait events on the Performance Insights Database Insights / Datasbe load / Slicde by Waits (visible in the Performance Insights UI but not exposed via `DB_PERF_INSIGHTS` in metric math). The CloudWatch-alarmable path is to enable `log_lock_waits=on` in the DB instance parameter group, ship the engine log to CloudWatch Logs, and put a metric filter for the string `still waiting for`.
+* Aurora PostgreSQL and RDS PostgreSQL: the `Lock:Tuple` (and `Lock:transactionid`) wait events on the Performance Insights Database Insights / Database load / Sliced by Waits (visible in the Performance Insights UI but not exposed via `DB_PERF_INSIGHTS` in metric math). The CloudWatch-alarmable path is to enable `log_lock_waits=on` in the DB instance parameter group, ship the engine log to CloudWatch Logs, and put a metric filter for the string `still waiting for`.
 
 ### What does this enable me to verify?
 
@@ -106,10 +106,10 @@ Before running this experiment, ensure that:
 1. **Experiment template**:
    - Import the FIS experiment template (`database-blocking-locks-template.json`) into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
 
-2. **IAM Roles**: Create the following IAM roles in your account using the sample policies provided:
-   - FIS execution role (`DatabaseBlockingLocks-FIS-Role`) with permissions to start SSM automation
-   - SSM automation role (`DatabaseBlockingLocks-SSM-Automation-Role`) with permissions to launch EC2 instances, execute commands, read the database password from Secrets Manager, and manage the ephemeral security group
-   - EC2 instance profile (`SSM-Managed-Instance-Profile`) with the `AmazonSSMManagedInstanceCore` managed policy attached
+2. **IAM Roles**: Create the following IAM roles in your account:
+   - FIS execution role (`DatabaseBlockingLocks-FIS-Role`) with permissions to start SSM automation (Sample policy provided)
+   - SSM automation role (`DatabaseBlockingLocks-SSM-Automation-Role`) with permissions to launch EC2 instances, execute commands and manage the ephemeral security group (Sample policy provided)
+   - EC2 instance profile (`SSM-Managed-Instance-Profile`) with the `AmazonSSMManagedInstanceCore` managed policy attached **and** Secrets Manager access to your database secret(s)
 
 3. **SSM Document**:
    - Deploy the SSM automation document (`database-blocking-locks-automation.yaml`) to your account

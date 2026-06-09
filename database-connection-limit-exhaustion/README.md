@@ -91,10 +91,10 @@ Before running this experiment, ensure that:
 1. **Experiment template**:
    - Import the FIS experiment template (`database-connection-limit-exhaustion-experiment-template.json`) into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
 
-2. **IAM Roles**: Create the following IAM roles in your account using the sample policies provided:
-   - FIS execution role with permissions to start SSM automation
-   - SSM automation role with permissions to launch EC2 instances and execute commands
-   - EC2 instance profile with the AmazonSSMManagedInstanceCore managed policy attached
+2. **IAM Roles**: Create the following IAM roles in your account:
+   - FIS execution role (`ConnectionLimitExhaustion-FIS-Role`) with permissions to start SSM automation (Sample policy provided)
+   - SSM automation role (`ConnectionLimitExhaustion-SSM-Automation-Role`) with permissions to launch EC2 instances and execute commands (Sample policy provided)
+   - EC2 instance profile (`SSM-Managed-Instance-Profile`) with the `AmazonSSMManagedInstanceCore` managed policy attached **and** Secrets Manager access to your database secret(s)
 
 3. **SSM Document**:
    - Deploy the SSM automation document (`database-connection-limit-exhaustion-automation.yaml`) to your account
@@ -113,7 +113,6 @@ The experiment requires the following parameters:
   - SQL Server: `master` (default system database)
 - **DatabaseUser**: Database username (default: `postgres`)
 - **DatabasePasswordSecretArn**: ARN of Secrets Manager secret containing password
-  - **Note** Since we don't know the ARN of your secret ahead of time, the [sample ssm automation role ](aurora-postgres-connection-limit-exhaustion-ssm-automation-role-iam-policy.json) is given read access to all secrets, you should probably scope this down accordingly.
 
 ### Connection Settings
 - **MaxConnections**: Number of connections to open (default: 1000)
