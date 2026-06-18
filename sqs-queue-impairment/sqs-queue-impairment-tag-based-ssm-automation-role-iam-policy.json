@@ -2,12 +2,18 @@
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowQueueDiscovery",
       "Effect": "Allow",
       "Action": [
         "sqs:ListQueues",
-        "sqs:ListQueueTags",
-        "sqs:AddPermission",
-        "sqs:RemovePermission",
+        "sqs:ListQueueTags"
+      ],
+      "Resource": "arn:aws:sqs:<YOUR REGION>:<YOUR AWS ACCOUNT>:*"
+    },
+    {
+      "Sid": "AllowPolicyChangeOnTaggedQueues",
+      "Effect": "Allow",
+      "Action": [
         "sqs:GetQueueAttributes",
         "sqs:SetQueueAttributes"
       ],

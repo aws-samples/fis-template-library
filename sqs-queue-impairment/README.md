@@ -38,7 +38,9 @@ This experiment simulates a worsening impairment of an SQS queue by applying a d
 6. Wait period: 2 minutes of normal operation
 7. Fourth impairment: Blocks access to the SQS queue for 15 minutes
 
-The impairment is implemented using an SSM Automation Document invoked by FIS. The SSM Automation Document adds a deny statement to the SQS queue policy that prevents all principals from performing key operations like sending and receiving messages. After the specified duration, the Automation Document removes the deny statement, restoring normal access to the queue.
+The impairment is implemented using an SSM Automation Document invoked by FIS. The SSM Automation Document adds a deny statement to the SQS queue policy that blocks data-plane operations like sending and receiving messages. After the specified duration, the Automation Document removes the deny statement, restoring normal access to the queue.
+
+By default the deny applies to all principals (`Principal: "*"`), simulating a full service partition. To impair only your application — and leave admins, monitoring, and other consumers of the queue unaffected — set the optional `targetPrincipalArn` parameter to the application's IAM role ARN; the deny is then scoped to that principal. The deny covers only data-plane actions (`SendMessage`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `PurgeQueue`) and never queue-management actions, so the automation (and your admins) can always remove it.
 
 To verify the experiment is setup and working properly, you can use the AWS CLI to attempt operations on a targeted SQS queue:
 
@@ -50,13 +52,42 @@ During the impairment periods, you should see "AccessDenied" errors when attempt
 
 ![FIS Console showing actions](./images/sqs.png "FIS Console showing actions")
 
-## Stop Conditions
-
-The experiment does not have any specific stop conditions defined. It will continue to run until all actions are completed or until manually stopped.
-
 ## Observability and stop conditions
 
-Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+Stop conditions are based on an AWS CloudWatch alarm tied to an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics, so it does not include stop conditions by default (`"stopConditions": [{ "source": "none" }]`).
+
+**Choose the stop-condition metric carefully.** Do *not* alarm on the queue metrics this experiment perturbs (`ApproximateAgeOfOldestMessage`, `NumberOfMessagesSent`, `ApproximateNumberOfMessagesVisible` on the source queue). Those are expected to move during impairment, so an alarm on them would abort the experiment during the first short phase — before the longer phases surface the failure modes you care about. Instead, alarm on a signal that should stay healthy if your resilience works, i.e. real customer/business impact:
+
+* An application error-rate or transaction-success metric your app emits (best — directly measures customer impact).
+* Load balancer 5xx count or target response time (a good proxy if you don't yet emit a business metric).
+* Dead-letter queue depth (`ApproximateNumberOfMessagesVisible` on the **DLQ**), which signals permanent message failure rather than recoverable backlog.
+
+Create the alarm, then reference it in the experiment template's `stopConditions`:
+
+```json
+"stopConditions": [
+  {
+    "source": "aws:cloudwatch:alarm",
+    "value": "arn:aws:cloudwatch:<YOUR REGION>:<YOUR AWS ACCOUNT>:alarm:sqs-fis-customer-impact"
+  }
+]
+```
+
+Example alarm using ALB 5xx errors as a customer-impact proxy. Set the threshold above normal noise but below a real outage, use a short evaluation window so the experiment aborts quickly, and treat missing data as not breaching so idle periods don't trip it:
+
+```bash
+aws cloudwatch put-metric-alarm \
+  --alarm-name sqs-fis-customer-impact \
+  --namespace AWS/ApplicationELB \
+  --metric-name HTTPCode_Target_5XX_Count \
+  --dimensions Name=LoadBalancer,Value=app/<YOUR APP>/<ID> \
+  --statistic Sum --period 60 --evaluation-periods 1 \
+  --threshold 50 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching \
+  --region <YOUR REGION>
+```
+
+See [Stop conditions for AWS FIS](https://docs.aws.amazon.com/fis/latest/userguide/stop-conditions.html).
 
 ## Next Steps
 
@@ -64,9 +95,8 @@ As you adapt this scenario to your needs, we recommend:
 
 1. Reviewing the tag names you use to ensure they fit your specific use case.
 2. Identifying business metrics tied to your SQS queue processing, such as application transaction rates.
-3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the SQS impairment.
-4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. Implementing appropriate circuit breakers in your application to handle SQS service impairments gracefully.
+3. **Before running anything beyond a short test, add a stop condition** tied to a customer-impact alarm so the experiment aborts automatically if critical thresholds are breached (see [Observability and stop conditions](#observability-and-stop-conditions) for how to choose the metric and an example alarm).
+4. Implementing appropriate circuit breakers in your application to handle SQS service impairments gracefully.
 6. Testing your application's recovery mechanisms to ensure they work as expected after the SQS service is restored.
 7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
 

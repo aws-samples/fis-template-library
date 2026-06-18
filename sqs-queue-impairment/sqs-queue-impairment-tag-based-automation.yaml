@@ -1,4 +1,4 @@
-description: "Apply a deny-all policy to SQS queues with specific tag to simulate impairment using SQS:AddPermission and SQS:RemovePermission"
+description: "Apply a scoped deny policy to SQS queues with a specific tag to simulate impairment. The deny statement is added and removed via SQS:SetQueueAttributes so that apply and cleanup use the same (inverse) API."
 schemaVersion: "0.3"
 assumeRole: "{{ AutomationAssumeRole }}"
 parameters:
@@ -18,6 +18,10 @@ parameters:
     type: String
     description: "AWS Region of the SQS queues"
     default: "{{global:REGION}}"
+  targetPrincipalArn:
+    type: String
+    description: "Optional IAM principal (e.g. the application's role ARN) to scope the deny to. If set, only this principal loses data-plane access and other callers (admins, monitoring) are unaffected. Leave empty to deny all principals (Principal: '*'), simulating a full service partition."
+    default: ""
   AutomationAssumeRole:
     type: String
     description: "IAM role for the automation execution"
@@ -81,18 +85,27 @@ mainSteps:
         def apply_deny_policy(events, context):
             region = events['region']
             target_queues = events['targetQueues']
-            
+            target_principal = (events.get('targetPrincipalArn') or '').strip()
+
             sqs = boto3.client('sqs', region_name=region)
             results = []
-            
+
+            # Scope the deny to a single principal if one was provided, otherwise deny
+            # all principals. Scoping to the application's role means only that app loses
+            # data-plane access -- admins and monitoring are unaffected. Denying "*"
+            # simulates a full service partition where every caller loses access.
+            deny_principal = {"AWS": target_principal} if target_principal else "*"
+
             for queue_url in target_queues:
                 try:
-                    # Get existing policy
+                    # Get existing policy and the queue ARN so the deny can be scoped to this queue
                     response = sqs.get_queue_attributes(
                         QueueUrl=queue_url,
-                        AttributeNames=['Policy']
+                        AttributeNames=['Policy', 'QueueArn']
                     )
-                    
+
+                    queue_arn = response.get('Attributes', {}).get('QueueArn', '*')
+
                     existing_policy = {}
                     if 'Policy' in response.get('Attributes', {}):
                         existing_policy = json.loads(response['Attributes']['Policy'])
@@ -101,11 +114,13 @@ mainSteps:
                             "Version": "2012-10-17",
                             "Statement": []
                         }
-                    
-                    # Add deny statement
+
+                    # Add a scoped deny statement. Deny only data-plane actions so that
+                    # management actions (SetQueueAttributes, AddPermission, RemovePermission)
+                    # are never blocked and the cleanup step can always remove this statement.
                     deny_statement = {
                         "Effect": "Deny",
-                        "Principal": "*",
+                        "Principal": deny_principal,
                         "Action":  [
                           "sqs:DeleteMessage",
                           "sqs:ChangeMessageVisibility",
@@ -113,7 +128,7 @@ mainSteps:
                           "sqs:ReceiveMessage",
                           "sqs:SendMessage"
                         ],
-                        "Resource": "*",
+                        "Resource": queue_arn,
                         "Sid": "FISTemporaryDeny"
                     }
                     
@@ -140,6 +155,7 @@ mainSteps:
       InputPayload:
         region: "{{ region }}"
         targetQueues: "{{ getTargetQueues.targetQueues }}"
+        targetPrincipalArn: "{{ targetPrincipalArn }}"
     outputs:
       - Name: affectedQueues
         Selector: $.Payload.affectedQueues
@@ -164,24 +180,63 @@ mainSteps:
       Handler: remove_deny_policy
       Script: |
         import boto3
+        import json
 
         def remove_deny_policy(events, context):
             region = events['region']
             affected_queues = events['affectedQueues']
-            
+
             sqs = boto3.client('sqs', region_name=region)
             results = []
-            
+            failures = []
+
             for queue_url in affected_queues:
                 try:
-                    sqs.remove_permission(
+                    # Remove the deny statement the same way it was applied: by setting
+                    # the queue policy. RemovePermission only revokes statements added via
+                    # AddPermission (matched by Label) and will not reliably remove a
+                    # statement injected with SetQueueAttributes.
+                    response = sqs.get_queue_attributes(
                         QueueUrl=queue_url,
-                        Label='FISTemporaryDeny'
+                        AttributeNames=['Policy']
                     )
+
+                    if 'Policy' not in response.get('Attributes', {}):
+                        results.append(f"No policy found on {queue_url}; nothing to remove")
+                        continue
+
+                    policy = json.loads(response['Attributes']['Policy'])
+                    policy['Statement'] = [s for s in policy.get('Statement', [])
+                                           if s.get('Sid') != 'FISTemporaryDeny']
+
+                    if policy['Statement']:
+                        sqs.set_queue_attributes(
+                            QueueUrl=queue_url,
+                            Attributes={'Policy': json.dumps(policy)}
+                        )
+                    else:
+                        # Our deny was the only statement. SQS rejects a policy with an
+                        # empty Statement list, so the correct way to remove the policy is
+                        # to set the Policy attribute to an empty string ''. Do NOT change
+                        # this to '{}' or a {"Statement": []} document -- both are invalid
+                        # and will raise MalformedPolicy.
+                        sqs.set_queue_attributes(
+                            QueueUrl=queue_url,
+                            Attributes={'Policy': ''}
+                        )
+
                     results.append(f"Successfully removed deny policy from {queue_url}")
                 except Exception as e:
-                    results.append(f"Failed to remove deny policy from {queue_url}: {str(e)}")
-            
+                    # Collect the error but do NOT swallow it: a failed cleanup leaves the
+                    # queue impaired, so the step must surface as failed to FIS.
+                    failures.append(f"Failed to remove deny policy from {queue_url}: {str(e)}")
+
+            if failures:
+                raise RuntimeError(
+                    "Cleanup failed for one or more queues; deny policy may still be in place: "
+                    + "; ".join(failures)
+                )
+
             return results
       InputPayload:
         region: "{{ region }}"
