@@ -11,8 +11,7 @@
                 "ssm:DescribeAutomationStepExecutions"
             ],
             "Resource": [
-                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ecs-fargate-az-impairment-add-subnet-automation:*",
-                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ecs-fargate-az-impairment-remove-subnet-automation:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ecs-fargate-az-impairment-subnet-automation:*",
                 "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
             ]
         },

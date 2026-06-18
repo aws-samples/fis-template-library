@@ -60,23 +60,15 @@ cd "$SCRIPT_DIR"
 # Step 1: Create SSM Automation Documents
 echo "Step 1: Creating SSM Automation Documents..."
 
-echo "  Creating remove-subnet automation document..."
+echo "  Creating subnet automation document..."
 aws ssm create-document \
-  --name "ecs-fargate-az-impairment-remove-subnet-automation" \
+  --name "ecs-fargate-az-impairment-subnet-automation" \
   --document-type "Automation" \
-  --content file://ecs-fargate-az-impairment-remove-subnet-automation.yaml \
+  --content file://ecs-fargate-az-impairment-subnet-automation.yaml \
   --document-format YAML \
   --region "$AWS_REGION" $PROFILE_FLAG >/dev/null 2>&1 || echo "  Document already exists, skipping..."
 
-echo "  Creating add-subnet automation document..."
-aws ssm create-document \
-  --name "ecs-fargate-az-impairment-add-subnet-automation" \
-  --document-type "Automation" \
-  --content file://ecs-fargate-az-impairment-add-subnet-automation.yaml \
-  --document-format YAML \
-  --region "$AWS_REGION" $PROFILE_FLAG >/dev/null 2>&1 || echo "  Document already exists, skipping..."
-
-echo "  SSM Documents created."
+echo "  SSM Document created."
 echo ""
 
 # Step 2: Create IAM Roles
@@ -166,8 +158,7 @@ echo "Deployment Complete!"
 echo "=============================================="
 echo ""
 echo "Resources created:"
-echo "  - SSM Document: ecs-fargate-az-impairment-remove-subnet-automation"
-echo "  - SSM Document: ecs-fargate-az-impairment-add-subnet-automation"
+echo "  - SSM Document: ecs-fargate-az-impairment-subnet-automation"
 echo "  - IAM Role: fis-ecs-az-impairment-role"
 echo "  - IAM Role: ssm-ecs-az-impairment-role"
 echo "  - IAM Policy: fis-ecs-az-impairment-policy"

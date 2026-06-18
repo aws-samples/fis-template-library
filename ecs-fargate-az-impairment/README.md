@@ -25,14 +25,14 @@ Before running this experiment, ensure that:
 2. The IAM roles have been deployed via the CloudFormation template or manually created with the required permissions from `ecs-fargate-az-impairment-iam-policy.json`.
 3. The ECS cluster and service you want to target have the `FIS-Ready=True` tag applied.
 4. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required - the experiment cannot remove the last subnet).
-5. The SSM automation documents (`ecs-fargate-az-impairment-remove-subnet-automation` and `ecs-fargate-az-impairment-add-subnet-automation`) have been deployed to your account.
+5. The SSM automation document (`ecs-fargate-az-impairment-subnet-automation`) has been deployed to your account.
 6. Your service has sufficient capacity in remaining AZs to handle the workload during the 15-minute experiment duration.
 7. SSM Agent connectivity is available for the automation documents to execute.
 8. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
 ## How It Works
 
-This experiment simulates a complete Availability Zone impairment by executing multiple fault injection actions in parallel, followed by automatic recovery:
+This experiment simulates a complete Availability Zone impairment by executing multiple fault injection actions in parallel. The SSM automation document manages the full subnet impairment lifecycle (remove → wait → restore) with built-in cleanup on cancel or failure:
 
 ### Experiment Flow
 
@@ -41,16 +41,11 @@ This experiment simulates a complete Availability Zone impairment by executing m
 │                         PARALLEL ACTIONS (Start)                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
-│  │  stop-tasks-in-az   │  │ remove-subnet-from- │  │ inject-network-     │  │
-│  │  (aws:ecs:stop-task)│  │ service (SSM)       │  │ packet-loss         │  │
-│  │  Duration: 15min    │  │ Duration: 10min max │  │ Duration: 15min     │  │
+│  │  stop-tasks-in-az   │  │  impair-subnet-in-  │  │ inject-network-     │  │
+│  │  (aws:ecs:stop-task)│  │  az (SSM lifecycle) │  │ packet-loss         │  │
+│  │                     │  │  remove → wait →    │  │ Duration: 15min     │  │
+│  │                     │  │  restore (40m max)  │  │                     │  │
 │  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       restore-subnet-to-service                             │
-│                    (SSM Automation - adds subnet back)                      │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,31 +53,23 @@ This experiment simulates a complete Availability Zone impairment by executing m
 
 | Action | Action ID | Description | Duration |
 |--------|-----------|-------------|----------|
-| `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | 15 minutes |
-| `remove-subnet-from-service` | `aws:ssm:start-automation-execution` | Removes the target subnet from the ECS service network configuration | 5 min max |
+| `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | Immediate |
+| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet, waits for duration, then restores. Cleans up on cancel/failure. | 40 min max |
 | `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | 15 minutes |
-| `restore-subnet-to-service` | `aws:ssm:start-automation-execution` | Restores the subnet to the ECS service configuration | 5 min max |
 
-### SSM Automation Documents
+### SSM Automation Document
 
-The experiment uses two custom SSM Automation documents:
+The experiment uses a single SSM Automation document (`ecs-fargate-az-impairment-subnet-automation`) that manages the complete fault lifecycle:
 
-**ecs-fargate-az-impairment-remove-subnet-automation**
-- Validates input parameters (subnet ID format, cluster/service existence)
-- Retrieves current ECS service network configuration
-- Validates the subnet exists in the current configuration
-- Ensures at least one subnet remains after removal
-- Updates the ECS service with the new subnet configuration
-- Waits for service stability (up to 10 minutes)
-- Generates detailed execution report
+1. Validates input parameters (subnet ID format, cluster/service existence)
+2. Retrieves current ECS service network configuration
+3. Validates the subnet exists and is not the last one in the configuration
+4. **Removes the subnet** from the ECS service network configuration
+5. Waits for service stability (up to 10 minutes)
+6. **Waits for the impairment duration** (configurable, default 15 minutes)
+7. **Restores the subnet** to the ECS service configuration
 
-**ecs-fargate-az-impairment-add-subnet-automation**
-- Validates input parameters and subnet existence in EC2
-- Validates the subnet is in the same VPC as existing subnets
-- Checks if subnet already exists (skips if already present)
-- Updates the ECS service to include the restored subnet
-- Waits for service stability
-- Generates detailed execution report
+Steps 4–6 have `onFailure` and `onCancel` routing to the restore step, ensuring the subnet is always restored even if the experiment is cancelled or encounters an error. The restore step is self-contained and idempotent — it re-discovers the current service configuration and skips the update if the subnet is already present.
 
 ## Targets
 
@@ -190,7 +177,6 @@ After deployment, update the experiment template in the FIS console with your ac
 | `ecs-fargate-az-impairment-iam-policy.json` | IAM policy for FIS and SSM execution |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ecs-fargate-az-impairment-ssm-trust-relationship.json` | Trust policy for SSM service |
-| `ecs-fargate-az-impairment-remove-subnet-automation.yaml` | SSM Automation document to remove subnet |
-| `ecs-fargate-az-impairment-add-subnet-automation.yaml` | SSM Automation document to add subnet |
+| `ecs-fargate-az-impairment-subnet-automation.yaml` | SSM Automation document (remove, wait, restore with cleanup on cancel/failure) |
 | `fis-ecs-fargate-az-impairment-cloudformation-template.yaml` | CloudFormation template for full deployment |
 | `ecs-fargate-az-impairment-experiment-setup.sh` | Manual deployment script |

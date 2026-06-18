@@ -9,13 +9,13 @@
                 "Tasks": "ecs-tasks-for-stop"
             }
         },
-        "remove-subnet-from-service": {
+        "impair-subnet-in-az": {
             "actionId": "aws:ssm:start-automation-execution",
-            "description": "Remove subnet from ECS service configuration to simulate AZ loss",
+            "description": "Remove subnet from ECS service, wait for impairment duration, then restore. Handles cleanup on cancel/failure.",
             "parameters": {
-                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-remove-subnet-automation",
-                "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\", \"ClusterName\": \"<YOUR ECS CLUSTER>\", \"ServiceName\": \"<YOUR ECS SERVICE>\", \"SubnetId\": \"<YOUR SUBNET ID>\"}",
-                "maxDuration": "PT10M"
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-subnet-automation",
+                "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\", \"ClusterName\": \"<YOUR ECS CLUSTER>\", \"ServiceName\": \"<YOUR ECS SERVICE>\", \"SubnetId\": \"<YOUR SUBNET ID>\", \"Duration\": \"PT15M\"}",
+                "maxDuration": "PT40M"
             }
         },
         "inject-network-packet-loss": {
@@ -30,18 +30,6 @@
             "targets": {
                 "Tasks": "ecs-tasks-for-packet-loss"
             }
-        },
-        "restore-subnet-to-service": {
-            "actionId": "aws:ssm:start-automation-execution",
-            "description": "Restore subnet to ECS service configuration",
-            "parameters": {
-                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-add-subnet-automation",
-                "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\", \"ClusterName\": \"<YOUR ECS CLUSTER>\", \"ServiceName\": \"<YOUR ECS SERVICE>\", \"SubnetId\": \"<YOUR SUBNET ID>\"}",
-                "maxDuration": "PT10M"
-            },
-            "startAfter": [
-                "inject-network-packet-loss", "remove-subnet-from-service"
-            ]
         }
     },
     "stopConditions": [
