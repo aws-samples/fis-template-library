@@ -1,0 +1,310 @@
+schemaVersion: '0.3'
+description: Add a subnet to ECS Fargate service configuration for AZ impairment recovery
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role for automation execution
+    default: ''
+  ClusterName:
+    type: String
+    description: Name of the ECS cluster
+  ServiceName:
+    type: String
+    description: Name of the ECS service
+  SubnetId:
+    type: String
+    description: Subnet ID to add to the service configuration
+mainSteps:
+  - name: ValidateInputs
+    description: Validate input parameters
+    action: aws:executeScript
+    nextStep: GetCurrentServiceConfiguration
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: validate_inputs
+      Script: |
+        import boto3
+        import re
+
+        def validate_inputs(events, context):
+            cluster_name = events['ClusterName']
+            service_name = events['ServiceName']
+            subnet_id = events['SubnetId']
+
+            # Validate subnet ID format
+            if not re.match(r'^subnet-[a-f0-9]{8,17}$', subnet_id):
+                raise ValueError(f"Invalid subnet ID format: {subnet_id}")
+
+            # Validate cluster and service names
+            if not cluster_name or not service_name:
+                raise ValueError("Cluster name and service name cannot be empty")
+
+            return "Validation completed successfully"
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+        SubnetId: '{{ SubnetId }}'
+    outputs:
+      - Name: ValidationResult
+        Selector: $.Payload
+        Type: String
+
+  - name: GetCurrentServiceConfiguration
+    description: Get current ECS service configuration
+    action: aws:executeAwsApi
+    nextStep: CheckSubnetAndPrepareConfig
+    isEnd: false
+    inputs:
+      Service: ecs
+      Api: DescribeServices
+      cluster: '{{ ClusterName }}'
+      services:
+        - '{{ ServiceName }}'
+    outputs:
+      - Name: ServiceDetails
+        Selector: $.services[0]
+        Type: StringMap
+
+  - name: CheckSubnetAndPrepareConfig
+    description: Check subnet and prepare new configuration
+    action: aws:executeScript
+    nextStep: UpdateServiceConfiguration
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: check_and_prepare
+      Script: |
+        import boto3
+        import json
+
+        def check_and_prepare(events, context):
+            ec2_client = boto3.client('ec2')
+            service_details = events['ServiceDetails']
+            subnet_to_add = events['SubnetId']
+
+            # Validate subnet exists
+            try:
+                subnet_response = ec2_client.describe_subnets(SubnetIds=[subnet_to_add])
+                subnet = subnet_response['Subnets'][0]
+                subnet_vpc_id = subnet['VpcId']
+            except Exception as e:
+                raise ValueError(f"Subnet {subnet_to_add} not found: {str(e)}")
+
+            if 'networkConfiguration' not in service_details:
+                raise ValueError('Service has no network configuration')
+
+            network_config = service_details['networkConfiguration']
+            if 'awsvpcConfiguration' not in network_config:
+                raise ValueError('Service has no VPC configuration')
+
+            current_subnets = network_config['awsvpcConfiguration'].get('subnets', [])
+
+            # If subnet already exists, return current config (idempotent)
+            if subnet_to_add in current_subnets:
+                new_network_config = {
+                    'subnets': current_subnets,
+                    'securityGroups': network_config['awsvpcConfiguration'].get('securityGroups', []),
+                    'assignPublicIp': network_config['awsvpcConfiguration'].get('assignPublicIp', 'DISABLED')
+                }
+                return json.dumps({
+                    'NewNetworkConfiguration': new_network_config,
+                    'AddedSubnet': subnet_to_add,
+                    'CurrentSubnets': current_subnets,
+                    'AlreadyExists': True
+                })
+
+            # Validate same VPC
+            if current_subnets:
+                existing_subnet_response = ec2_client.describe_subnets(SubnetIds=[current_subnets[0]])
+                existing_vpc_id = existing_subnet_response['Subnets'][0]['VpcId']
+                if subnet_vpc_id != existing_vpc_id:
+                    raise ValueError(f'Subnet VPC mismatch')
+
+            new_subnets = current_subnets + [subnet_to_add]
+            new_network_config = {
+                'subnets': new_subnets,
+                'securityGroups': network_config['awsvpcConfiguration'].get('securityGroups', []),
+                'assignPublicIp': network_config['awsvpcConfiguration'].get('assignPublicIp', 'DISABLED')
+            }
+
+            return json.dumps({
+                'NewNetworkConfiguration': new_network_config,
+                'AddedSubnet': subnet_to_add,
+                'PreviousSubnets': current_subnets,
+                'NewSubnets': new_subnets,
+                'AlreadyExists': False
+            })
+      InputPayload:
+        ServiceDetails: '{{ GetCurrentServiceConfiguration.ServiceDetails }}'
+        SubnetId: '{{ SubnetId }}'
+    outputs:
+      - Name: ConfigurationResult
+        Selector: $.Payload
+        Type: String
+
+
+  - name: UpdateServiceConfiguration
+    description: Update ECS service with new subnet configuration
+    action: aws:executeScript
+    nextStep: WaitForServiceStable
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: update_service
+      Script: |
+        import boto3
+        import json
+
+        def update_service(events, context):
+            ecs_client = boto3.client('ecs')
+            cluster_name = events['ClusterName']
+            service_name = events['ServiceName']
+            config_result = json.loads(events['ConfigurationResult'])
+
+            new_network_config = config_result['NewNetworkConfiguration']
+
+            response = ecs_client.update_service(
+                cluster=cluster_name,
+                service=service_name,
+                networkConfiguration={
+                    'awsvpcConfiguration': new_network_config
+                }
+            )
+
+            return json.dumps({
+                'UpdateStatus': 'SUCCESS',
+                'ServiceArn': response['service']['serviceArn'],
+                'TaskDefinition': response['service']['taskDefinition']
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+        ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+    outputs:
+      - Name: UpdateResult
+        Selector: $.Payload
+        Type: String
+
+  - name: WaitForServiceStable
+    description: Wait for service to reach stable state
+    action: aws:executeScript
+    nextStep: VerifySubnetAddition
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: wait_for_stable
+      Script: |
+        import boto3
+        import time
+        import json
+
+        def wait_for_stable(events, context):
+            ecs_client = boto3.client('ecs')
+            cluster_name = events['ClusterName']
+            service_name = events['ServiceName']
+
+            max_wait_time = 600
+            check_interval = 15
+            elapsed_time = 0
+
+            while elapsed_time < max_wait_time:
+                response = ecs_client.describe_services(
+                    cluster=cluster_name,
+                    services=[service_name]
+                )
+
+                service = response['services'][0]
+                deployments = service['deployments']
+
+                all_stable = all(
+                    deployment['status'] in ['PRIMARY', 'ACTIVE'] and
+                    deployment['runningCount'] == deployment['desiredCount']
+                    for deployment in deployments
+                )
+
+                if all_stable:
+                    return json.dumps({
+                        'Status': 'STABLE',
+                        'Message': 'Service has reached stable state',
+                        'ElapsedTime': elapsed_time
+                    })
+
+                time.sleep(check_interval)
+                elapsed_time += check_interval
+
+            return json.dumps({
+                'Status': 'TIMEOUT',
+                'Message': 'Service did not reach stable state within timeout period',
+                'ElapsedTime': elapsed_time
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+    outputs:
+      - Name: StabilityResult
+        Selector: $.Payload
+        Type: String
+
+  - name: VerifySubnetAddition
+    description: Verify that subnet has been successfully added
+    action: aws:executeAwsApi
+    nextStep: GenerateReport
+    isEnd: false
+    inputs:
+      Service: ecs
+      Api: DescribeServices
+      cluster: '{{ ClusterName }}'
+      services:
+        - '{{ ServiceName }}'
+    outputs:
+      - Name: FinalServiceDetails
+        Selector: $.services[0]
+        Type: StringMap
+
+  - name: GenerateReport
+    description: Generate execution report
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: generate_report
+      Script: |
+        import json
+
+        def generate_report(events, context):
+            subnet_to_add = events['SubnetId']
+            config_result = json.loads(events['ConfigurationResult'])
+
+            final_service = events.get('FinalServiceDetails')
+            if final_service:
+                current_subnets = final_service['networkConfiguration']['awsvpcConfiguration']['subnets']
+                success = subnet_to_add in current_subnets
+
+                return json.dumps({
+                    'ExecutionType': 'ACTUAL',
+                    'Success': success,
+                    'AddedSubnet': subnet_to_add,
+                    'CurrentSubnets': current_subnets,
+                    'AlreadyExisted': config_result.get('AlreadyExists', False),
+                    'Message': 'Subnet successfully added' if success else 'Subnet addition failed'
+                })
+            else:
+                return json.dumps({
+                    'ExecutionType': 'ACTUAL',
+                    'Success': True,
+                    'AddedSubnet': subnet_to_add,
+                    'Message': 'Subnet addition completed'
+                })
+      InputPayload:
+        SubnetId: '{{ SubnetId }}'
+        ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+        FinalServiceDetails: '{{ VerifySubnetAddition.FinalServiceDetails }}'
+    outputs:
+      - Name: ExecutionReport
+        Selector: $.Payload
+        Type: String
+
+outputs:
+  - GenerateReport.ExecutionReport

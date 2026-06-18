@@ -1,0 +1,782 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FIS Experiment Template for ECS Fargate AZ Impairment - Deploy first, then update experiment parameters before running'
+
+Resources:
+  # SSM Automation Document - Remove Subnet
+  RemoveSubnetAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: 'ecs-fargate-az-impairment-remove-subnet-automation'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: Remove a subnet from ECS Fargate service configuration to simulate AZ impairment
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: IAM role for automation execution
+            default: ''
+          ClusterName:
+            type: String
+            description: Name of the ECS cluster
+          ServiceName:
+            type: String
+            description: Name of the ECS service
+          SubnetId:
+            type: String
+            description: Subnet ID to remove from the service configuration
+        mainSteps:
+          - name: ValidateInputs
+            description: Validate input parameters
+            action: aws:executeScript
+            nextStep: GetCurrentServiceConfiguration
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: validate_inputs
+              Script: |
+                import boto3
+                import re
+
+                def validate_inputs(events, context):
+                    cluster_name = events['ClusterName']
+                    service_name = events['ServiceName']
+                    subnet_id = events['SubnetId']
+
+                    if not re.match(r'^subnet-[a-f0-9]{8,17}$', subnet_id):
+                        raise ValueError(f"Invalid subnet ID format: {subnet_id}")
+
+                    if not cluster_name or not service_name:
+                        raise ValueError("Cluster name and service name cannot be empty")
+
+                    return "Validation completed successfully"
+              InputPayload:
+                ClusterName: '{{ ClusterName }}'
+                ServiceName: '{{ ServiceName }}'
+                SubnetId: '{{ SubnetId }}'
+            outputs:
+              - Name: ValidationResult
+                Selector: $.Payload
+                Type: String
+          - name: GetCurrentServiceConfiguration
+            description: Get current ECS service configuration
+            action: aws:executeAwsApi
+            nextStep: CheckSubnetAndPrepareConfig
+            isEnd: false
+            inputs:
+              Service: ecs
+              Api: DescribeServices
+              cluster: '{{ ClusterName }}'
+              services:
+                - '{{ ServiceName }}'
+            outputs:
+              - Name: ServiceDetails
+                Selector: $.services[0]
+                Type: StringMap
+          - name: CheckSubnetAndPrepareConfig
+            description: Check subnet exists and prepare new configuration
+            action: aws:executeScript
+            nextStep: UpdateServiceConfiguration
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: check_and_prepare
+              Script: |
+                import json
+
+                def check_and_prepare(events, context):
+                    service_details = events['ServiceDetails']
+                    subnet_to_remove = events['SubnetId']
+
+                    if 'networkConfiguration' not in service_details:
+                        raise ValueError('Service has no network configuration')
+
+                    network_config = service_details['networkConfiguration']
+                    if 'awsvpcConfiguration' not in network_config:
+                        raise ValueError('Service has no VPC configuration')
+
+                    current_subnets = network_config['awsvpcConfiguration'].get('subnets', [])
+
+                    if subnet_to_remove not in current_subnets:
+                        raise ValueError(f'Subnet {subnet_to_remove} not found in current configuration')
+
+                    if len(current_subnets) <= 1:
+                        raise ValueError('Cannot remove the last subnet from service configuration')
+
+                    new_subnets = [subnet for subnet in current_subnets if subnet != subnet_to_remove]
+
+                    new_network_config = {
+                        'subnets': new_subnets,
+                        'securityGroups': network_config['awsvpcConfiguration'].get('securityGroups', []),
+                        'assignPublicIp': network_config['awsvpcConfiguration'].get('assignPublicIp', 'DISABLED')
+                    }
+
+                    result = {
+                        'NewNetworkConfiguration': new_network_config,
+                        'RemovedSubnet': subnet_to_remove,
+                        'RemainingSubnets': new_subnets,
+                        'CurrentSubnets': current_subnets
+                    }
+
+                    return json.dumps(result)
+              InputPayload:
+                ServiceDetails: '{{ GetCurrentServiceConfiguration.ServiceDetails }}'
+                SubnetId: '{{ SubnetId }}'
+            outputs:
+              - Name: ConfigurationResult
+                Selector: $.Payload
+                Type: String
+          - name: UpdateServiceConfiguration
+            description: Update ECS service with new subnet configuration
+            action: aws:executeScript
+            nextStep: WaitForServiceStable
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: update_service
+              Script: |
+                import boto3
+                import json
+
+                def update_service(events, context):
+                    ecs_client = boto3.client('ecs')
+                    cluster_name = events['ClusterName']
+                    service_name = events['ServiceName']
+                    config_result = json.loads(events['ConfigurationResult'])
+
+                    new_network_config = config_result['NewNetworkConfiguration']
+
+                    response = ecs_client.update_service(
+                        cluster=cluster_name,
+                        service=service_name,
+                        networkConfiguration={'awsvpcConfiguration': new_network_config}
+                    )
+
+                    return json.dumps({
+                        'UpdateStatus': 'SUCCESS',
+                        'ServiceArn': response['service']['serviceArn'],
+                        'TaskDefinition': response['service']['taskDefinition']
+                    })
+              InputPayload:
+                ClusterName: '{{ ClusterName }}'
+                ServiceName: '{{ ServiceName }}'
+                ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+            outputs:
+              - Name: UpdateResult
+                Selector: $.Payload
+                Type: String
+          - name: WaitForServiceStable
+            description: Wait for service to reach stable state
+            action: aws:executeScript
+            nextStep: VerifySubnetRemoval
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: wait_for_stable
+              Script: |
+                import boto3
+                import time
+                import json
+
+                def wait_for_stable(events, context):
+                    ecs_client = boto3.client('ecs')
+                    cluster_name = events['ClusterName']
+                    service_name = events['ServiceName']
+
+                    max_wait_time = 600
+                    check_interval = 15
+                    elapsed_time = 0
+
+                    while elapsed_time < max_wait_time:
+                        response = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+                        service = response['services'][0]
+                        deployments = service['deployments']
+
+                        all_stable = all(
+                            deployment['status'] in ['PRIMARY', 'ACTIVE'] and
+                            deployment['runningCount'] == deployment['desiredCount']
+                            for deployment in deployments
+                        )
+
+                        if all_stable:
+                            return json.dumps({'Status': 'STABLE', 'Message': 'Service has reached stable state', 'ElapsedTime': elapsed_time})
+
+                        time.sleep(check_interval)
+                        elapsed_time += check_interval
+
+                    return json.dumps({'Status': 'TIMEOUT', 'Message': 'Service did not reach stable state within timeout period', 'ElapsedTime': elapsed_time})
+              InputPayload:
+                ClusterName: '{{ ClusterName }}'
+                ServiceName: '{{ ServiceName }}'
+            outputs:
+              - Name: StabilityResult
+                Selector: $.Payload
+                Type: String
+          - name: VerifySubnetRemoval
+            description: Verify that subnet has been successfully removed
+            action: aws:executeAwsApi
+            nextStep: GenerateReport
+            isEnd: false
+            inputs:
+              Service: ecs
+              Api: DescribeServices
+              cluster: '{{ ClusterName }}'
+              services:
+                - '{{ ServiceName }}'
+            outputs:
+              - Name: FinalServiceDetails
+                Selector: $.services[0]
+                Type: StringMap
+          - name: GenerateReport
+            description: Generate execution report
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Runtime: python3.11
+              Handler: generate_report
+              Script: |
+                import json
+
+                def generate_report(events, context):
+                    subnet_to_remove = events['SubnetId']
+                    config_result = json.loads(events['ConfigurationResult'])
+
+                    final_service = events.get('FinalServiceDetails')
+                    if final_service:
+                        current_subnets = final_service['networkConfiguration']['awsvpcConfiguration']['subnets']
+                        success = subnet_to_remove not in current_subnets
+                        return json.dumps({
+                            'ExecutionType': 'ACTUAL',
+                            'Success': success,
+                            'RemovedSubnet': subnet_to_remove,
+                            'CurrentSubnets': current_subnets,
+                            'Message': 'Subnet successfully removed' if success else 'Subnet removal failed'
+                        })
+                    return json.dumps({'ExecutionType': 'ACTUAL', 'Success': True, 'RemovedSubnet': subnet_to_remove, 'Message': 'Subnet removal completed'})
+              InputPayload:
+                SubnetId: '{{ SubnetId }}'
+                ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+                FinalServiceDetails: '{{ VerifySubnetRemoval.FinalServiceDetails }}'
+            outputs:
+              - Name: ExecutionReport
+                Selector: $.Payload
+                Type: String
+        outputs:
+          - GenerateReport.ExecutionReport
+
+  # SSM Automation Document - Add Subnet
+  AddSubnetAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: 'ecs-fargate-az-impairment-add-subnet-automation'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: Add a subnet to ECS Fargate service configuration for AZ impairment recovery
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: IAM role for automation execution
+            default: ''
+          ClusterName:
+            type: String
+            description: Name of the ECS cluster
+          ServiceName:
+            type: String
+            description: Name of the ECS service
+          SubnetId:
+            type: String
+            description: Subnet ID to add to the service configuration
+        mainSteps:
+          - name: ValidateInputs
+            description: Validate input parameters
+            action: aws:executeScript
+            nextStep: GetCurrentServiceConfiguration
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: validate_inputs
+              Script: |
+                import boto3
+                import re
+
+                def validate_inputs(events, context):
+                    cluster_name = events['ClusterName']
+                    service_name = events['ServiceName']
+                    subnet_id = events['SubnetId']
+
+                    if not re.match(r'^subnet-[a-f0-9]{8,17}$', subnet_id):
+                        raise ValueError(f"Invalid subnet ID format: {subnet_id}")
+
+                    if not cluster_name or not service_name:
+                        raise ValueError("Cluster name and service name cannot be empty")
+
+                    return "Validation completed successfully"
+              InputPayload:
+                ClusterName: '{{ ClusterName }}'
+                ServiceName: '{{ ServiceName }}'
+                SubnetId: '{{ SubnetId }}'
+            outputs:
+              - Name: ValidationResult
+                Selector: $.Payload
+                Type: String
+          - name: GetCurrentServiceConfiguration
+            description: Get current ECS service configuration
+            action: aws:executeAwsApi
+            nextStep: CheckSubnetAndPrepareConfig
+            isEnd: false
+            inputs:
+              Service: ecs
+              Api: DescribeServices
+              cluster: '{{ ClusterName }}'
+              services:
+                - '{{ ServiceName }}'
+            outputs:
+              - Name: ServiceDetails
+                Selector: $.services[0]
+                Type: StringMap
+          - name: CheckSubnetAndPrepareConfig
+            description: Check subnet and prepare new configuration
+            action: aws:executeScript
+            nextStep: UpdateServiceConfiguration
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: check_and_prepare
+              Script: |
+                import boto3
+                import json
+
+                def check_and_prepare(events, context):
+                    ec2_client = boto3.client('ec2')
+                    service_details = events['ServiceDetails']
+                    subnet_to_add = events['SubnetId']
+
+                    try:
+                        subnet_response = ec2_client.describe_subnets(SubnetIds=[subnet_to_add])
+                        subnet = subnet_response['Subnets'][0]
+                        subnet_vpc_id = subnet['VpcId']
+                    except Exception as e:
+                        raise ValueError(f"Subnet {subnet_to_add} not found: {str(e)}")
+
+                    if 'networkConfiguration' not in service_details:
+                        raise ValueError('Service has no network configuration')
+
+                    network_config = service_details['networkConfiguration']
+                    if 'awsvpcConfiguration' not in network_config:
+                        raise ValueError('Service has no VPC configuration')
+
+                    current_subnets = network_config['awsvpcConfiguration'].get('subnets', [])
+
+                    if subnet_to_add in current_subnets:
+                        new_network_config = {
+                            'subnets': current_subnets,
+                            'securityGroups': network_config['awsvpcConfiguration'].get('securityGroups', []),
+                            'assignPublicIp': network_config['awsvpcConfiguration'].get('assignPublicIp', 'DISABLED')
+                        }
+                        return json.dumps({
+                            'NewNetworkConfiguration': new_network_config,
+                            'AddedSubnet': subnet_to_add,
+                            'CurrentSubnets': current_subnets,
+                            'AlreadyExists': True
+                        })
+
+                    if current_subnets:
+                        existing_subnet_response = ec2_client.describe_subnets(SubnetIds=[current_subnets[0]])
+                        existing_vpc_id = existing_subnet_response['Subnets'][0]['VpcId']
+                        if subnet_vpc_id != existing_vpc_id:
+                            raise ValueError(f'Subnet VPC mismatch')
+
+                    new_subnets = current_subnets + [subnet_to_add]
+                    new_network_config = {
+                        'subnets': new_subnets,
+                        'securityGroups': network_config['awsvpcConfiguration'].get('securityGroups', []),
+                        'assignPublicIp': network_config['awsvpcConfiguration'].get('assignPublicIp', 'DISABLED')
+                    }
+
+                    return json.dumps({
+                        'NewNetworkConfiguration': new_network_config,
+                        'AddedSubnet': subnet_to_add,
+                        'PreviousSubnets': current_subnets,
+                        'NewSubnets': new_subnets,
+                        'AlreadyExists': False
+                    })
+              InputPayload:
+                ServiceDetails: '{{ GetCurrentServiceConfiguration.ServiceDetails }}'
+                SubnetId: '{{ SubnetId }}'
+            outputs:
+              - Name: ConfigurationResult
+                Selector: $.Payload
+                Type: String
+          - name: UpdateServiceConfiguration
+            description: Update ECS service with new subnet configuration
+            action: aws:executeScript
+            nextStep: WaitForServiceStable
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: update_service
+              Script: |
+                import boto3
+                import json
+
+                def update_service(events, context):
+                    ecs_client = boto3.client('ecs')
+                    cluster_name = events['ClusterName']
+                    service_name = events['ServiceName']
+                    config_result = json.loads(events['ConfigurationResult'])
+
+                    new_network_config = config_result['NewNetworkConfiguration']
+
+                    response = ecs_client.update_service(
+                        cluster=cluster_name,
+                        service=service_name,
+                        networkConfiguration={'awsvpcConfiguration': new_network_config}
+                    )
+
+                    return json.dumps({
+                        'UpdateStatus': 'SUCCESS',
+                        'ServiceArn': response['service']['serviceArn'],
+                        'TaskDefinition': response['service']['taskDefinition']
+                    })
+              InputPayload:
+                ClusterName: '{{ ClusterName }}'
+                ServiceName: '{{ ServiceName }}'
+                ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+            outputs:
+              - Name: UpdateResult
+                Selector: $.Payload
+                Type: String
+          - name: WaitForServiceStable
+            description: Wait for service to reach stable state
+            action: aws:executeScript
+            nextStep: VerifySubnetAddition
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: wait_for_stable
+              Script: |
+                import boto3
+                import time
+                import json
+
+                def wait_for_stable(events, context):
+                    ecs_client = boto3.client('ecs')
+                    cluster_name = events['ClusterName']
+                    service_name = events['ServiceName']
+
+                    max_wait_time = 600
+                    check_interval = 15
+                    elapsed_time = 0
+
+                    while elapsed_time < max_wait_time:
+                        response = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+                        service = response['services'][0]
+                        deployments = service['deployments']
+
+                        all_stable = all(
+                            deployment['status'] in ['PRIMARY', 'ACTIVE'] and
+                            deployment['runningCount'] == deployment['desiredCount']
+                            for deployment in deployments
+                        )
+
+                        if all_stable:
+                            return json.dumps({'Status': 'STABLE', 'Message': 'Service has reached stable state', 'ElapsedTime': elapsed_time})
+
+                        time.sleep(check_interval)
+                        elapsed_time += check_interval
+
+                    return json.dumps({'Status': 'TIMEOUT', 'Message': 'Service did not reach stable state within timeout period', 'ElapsedTime': elapsed_time})
+              InputPayload:
+                ClusterName: '{{ ClusterName }}'
+                ServiceName: '{{ ServiceName }}'
+            outputs:
+              - Name: StabilityResult
+                Selector: $.Payload
+                Type: String
+          - name: VerifySubnetAddition
+            description: Verify that subnet has been successfully added
+            action: aws:executeAwsApi
+            nextStep: GenerateReport
+            isEnd: false
+            inputs:
+              Service: ecs
+              Api: DescribeServices
+              cluster: '{{ ClusterName }}'
+              services:
+                - '{{ ServiceName }}'
+            outputs:
+              - Name: FinalServiceDetails
+                Selector: $.services[0]
+                Type: StringMap
+          - name: GenerateReport
+            description: Generate execution report
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Runtime: python3.11
+              Handler: generate_report
+              Script: |
+                import json
+
+                def generate_report(events, context):
+                    subnet_to_add = events['SubnetId']
+                    config_result = json.loads(events['ConfigurationResult'])
+
+                    final_service = events.get('FinalServiceDetails')
+                    if final_service:
+                        current_subnets = final_service['networkConfiguration']['awsvpcConfiguration']['subnets']
+                        success = subnet_to_add in current_subnets
+                        return json.dumps({
+                            'ExecutionType': 'ACTUAL',
+                            'Success': success,
+                            'AddedSubnet': subnet_to_add,
+                            'CurrentSubnets': current_subnets,
+                            'AlreadyExisted': config_result.get('AlreadyExists', False),
+                            'Message': 'Subnet successfully added' if success else 'Subnet addition failed'
+                        })
+
+                    return json.dumps({'ExecutionType': 'ACTUAL', 'Success': True, 'AddedSubnet': subnet_to_add, 'Message': 'Subnet addition completed'})
+              InputPayload:
+                SubnetId: '{{ SubnetId }}'
+                ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+                FinalServiceDetails: '{{ VerifySubnetAddition.FinalServiceDetails }}'
+            outputs:
+              - Name: ExecutionReport
+                Selector: $.Payload
+                Type: String
+        outputs:
+          - GenerateReport.ExecutionReport
+
+  # IAM Role for FIS Experiment
+  # Managed Policy for FIS Experiment Role
+  FISECSAZImpairmentPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'fis-ecs-az-impairment-policy-${AWS::StackName}'
+      Description: 'Policy for FIS ECS AZ Impairment experiment execution'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ECSPermissions
+            Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:ListServices
+              - ecs:DescribeTasks
+              - ecs:ListTasks
+              - ecs:StopTask
+              - ecs:UpdateService
+            Resource: '*'
+          - Sid: SSMPermissions
+            Effect: Allow
+            Action:
+              - ssm:StartAutomationExecution
+              - ssm:GetAutomationExecution
+              - ssm:DescribeAutomationExecutions
+              - ssm:DescribeAutomationStepExecutions
+            Resource: '*'
+          - Sid: EC2Permissions
+            Effect: Allow
+            Action:
+              - ec2:DescribeSubnets
+              - ec2:DescribeNetworkInterfaces
+            Resource: '*'
+
+  # Managed Policy for SSM Automation Role
+  SSMECSUpdatePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'ssm-ecs-update-policy-${AWS::StackName}'
+      Description: 'Policy for SSM Automation to update ECS services'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ECSPermissions
+            Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:UpdateService
+              - ecs:DescribeClusters
+            Resource: '*'
+          - Sid: EC2Permissions
+            Effect: Allow
+            Action:
+              - ec2:DescribeSubnets
+              - ec2:DescribeNetworkInterfaces
+            Resource: '*'
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+
+  # IAM Role for FIS Experiment
+  FISExperimentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'fis-ecs-az-impairment-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorECSAccess
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorSSMAccess
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorNetworkAccess
+        - !Ref FISECSAZImpairmentPolicy
+
+  # IAM Policy for PassRole (must reference SSMAutomationRole, so separate)
+  FISPassRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'fis-passrole-policy-${AWS::StackName}'
+      Description: 'Policy to allow FIS to pass role to SSM Automation'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: IAMPassRole
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !GetAtt SSMAutomationRole.Arn
+      Roles:
+        - !Ref FISExperimentRole
+
+  # IAM Role for SSM Automation
+  SSMAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ssm-ecs-az-impairment-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref SSMECSUpdatePolicy
+
+  # FIS Experiment Template with placeholder values - update before running
+  FISExperimentTemplate:
+    Type: AWS::FIS::ExperimentTemplate
+    # Note: Implicit dependency exists via !Sub references to SSM documents
+    Properties:
+      Description: 'ECS Fargate AZ Impairment - UPDATE PARAMETERS BEFORE RUNNING. Simulates AZ failure with task stop, subnet removal, and network packet loss.'
+      RoleArn: !GetAtt FISExperimentRole.Arn
+      Actions:
+        StopTasksInAZ:
+          ActionId: 'aws:ecs:stop-task'
+          Description: 'Stop all ECS Fargate tasks in the target availability zone'
+          Targets:
+            Tasks: ECSTasksForStop
+
+        RemoveSubnetFromService:
+          ActionId: 'aws:ssm:start-automation-execution'
+          Description: 'Remove subnet from ECS service configuration to simulate AZ loss'
+          Parameters:
+            documentArn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${RemoveSubnetAutomationDocument}'
+            documentParameters: !Sub |
+              {
+                "AutomationAssumeRole": "${SSMAutomationRole.Arn}",
+                "ClusterName": "<YOUR ECS CLUSTER>",
+                "ServiceName": "<YOUR ECS SERVICE>",
+                "SubnetId": "<YOUR SUBNET ID>"
+              }
+            maxDuration: 'PT10M'
+
+        InjectNetworkPacketLoss:
+          ActionId: 'aws:ecs:task-network-packet-loss'
+          Description: 'Inject network packet loss for ECS tasks in the target availability zone'
+          Parameters:
+            duration: 'PT15M'
+            lossPercent: '100'
+            sources: '0.0.0.0/0'
+            useEcsFaultInjectionEndpoints: 'true'
+          Targets:
+            Tasks: ECSTasksForPacketLoss
+
+        RestoreSubnetToService:
+          ActionId: 'aws:ssm:start-automation-execution'
+          Description: 'Restore subnet to ECS service configuration'
+          Parameters:
+            documentArn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${AddSubnetAutomationDocument}'
+            documentParameters: !Sub |
+              {
+                "AutomationAssumeRole": "${SSMAutomationRole.Arn}",
+                "ClusterName": "<YOUR ECS CLUSTER>",
+                "ServiceName": "<YOUR ECS SERVICE>",
+                "SubnetId": "<YOUR SUBNET ID>"
+              }
+            maxDuration: 'PT10M'
+          StartAfter:
+            - InjectNetworkPacketLoss
+            - RemoveSubnetFromService
+
+      StopConditions:
+        - Source: 'none'
+
+      Targets:
+        ECSTasksForStop:
+          ResourceType: 'aws:ecs:task'
+          ResourceTags:
+            FIS-Ready: 'True'
+          Filters:
+            - Path: 'AvailabilityZone'
+              Values:
+                - 'us-east-1a'
+          SelectionMode: 'ALL'
+
+        ECSTasksForPacketLoss:
+          ResourceType: 'aws:ecs:task'
+          ResourceTags:
+            FIS-Ready: 'True'
+          Filters:
+            - Path: 'AvailabilityZone'
+              Values:
+                - 'us-east-1a'
+          SelectionMode: 'ALL'
+
+      Tags:
+        Name: 'ecs-fargate-az-impairment'
+        Environment: 'test'
+        Purpose: 'chaos-engineering'
+
+      ExperimentOptions:
+        AccountTargeting: 'single-account'
+        EmptyTargetResolutionMode: 'skip'
+
+Outputs:
+  ExperimentTemplateId:
+    Description: 'FIS Experiment Template ID - Update parameters in the console before running'
+    Value: !Ref FISExperimentTemplate
+  
+  FISRoleArn:
+    Description: 'FIS Execution Role ARN'
+    Value: !GetAtt FISExperimentRole.Arn
+
+  SSMAutomationRoleArn:
+    Description: 'SSM Automation Role ARN'
+    Value: !GetAtt SSMAutomationRole.Arn
+
+  RemoveSubnetDocumentName:
+    Description: 'SSM Document for removing subnet'
+    Value: !Ref RemoveSubnetAutomationDocument
+
+  AddSubnetDocumentName:
+    Description: 'SSM Document for adding subnet'
+    Value: !Ref AddSubnetAutomationDocument
+
+  NextSteps:
+    Description: 'After deployment, update the experiment template with your values'
+    Value: 'Go to FIS Console > Experiment Templates > Select this template > Update: ClusterName, ServiceName, SubnetId (default AZ: us-east-1a)'
