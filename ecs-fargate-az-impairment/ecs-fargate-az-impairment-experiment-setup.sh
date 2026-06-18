@@ -143,7 +143,7 @@ sed -e "s/<YOUR AWS ACCOUNT>/${AWS_ACCOUNT_ID}/g" \
     -e "s/<YOUR REGION>/${AWS_REGION}/g" \
     -e "s/<YOUR ROLE NAME>/fis-ecs-az-impairment-role/g" \
     -e "s/<YOUR SSM ROLE NAME>/ssm-ecs-az-impairment-role/g" \
-    ecs-fargate-az-impairment-experiment-template.json > "$TEMP_TEMPLATE"
+    ecs-fargate-az-impairment-template.json > "$TEMP_TEMPLATE"
 
 echo "  Creating FIS experiment template..."
 EXPERIMENT_TEMPLATE_ID=$(aws fis create-experiment-template \

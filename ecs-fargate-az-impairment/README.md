@@ -2,7 +2,10 @@
 
 This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
-> **⚠️ WARNING:** THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Hypothesis
 
@@ -111,7 +114,7 @@ Before running the experiment, update these placeholder values:
 
 The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 30-45 minutes total).
 
-## Observability and Stop Conditions
+## Observability and stop conditions
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
@@ -148,6 +151,10 @@ As you adapt this scenario to your needs, we recommend:
 8. Documenting the expected behavior and actual results to build a runbook for real AZ failures.
 9. Gradually increasing the scope of the experiment (e.g., longer duration, multiple services) as confidence grows.
 
+## Import Experiment
+
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+
 ## Deployment
 
 ### Option 1: CloudFormation (Recommended)
@@ -169,11 +176,7 @@ After deployment, update the experiment template in the FIS console with your ac
 ./ecs-fargate-az-impairment-experiment-setup.sh
 ```
 
-> **Note:** Before running the above command, update all placeholder values (`<YOUR ...>`) in `ecs-fargate-az-impairment-experiment-template.json` with your actual resource identifiers. Alternatively you can update the experiment template in the Console later.
-
-## Import Experiment
-
-You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+> **Note:** Before running the above command, update all placeholder values (`<YOUR ...>`) in `ecs-fargate-az-impairment-template.json` with your actual resource identifiers. Alternatively you can update the experiment template in the Console later.
 
 ## Files in This Directory
 
@@ -181,7 +184,7 @@ You can import the json experiment template into your AWS account via cli or aws
 |------|-------------|
 | `README.md` | This documentation file |
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
-| `ecs-fargate-az-impairment-experiment-template.json` | FIS experiment template definition |
+| `ecs-fargate-az-impairment-template.json` | FIS experiment template definition |
 | `ecs-fargate-az-impairment-iam-policy.json` | IAM policy for FIS and SSM execution |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ecs-fargate-az-impairment-ssm-trust-relationship.json` | Trust policy for SSM service |
