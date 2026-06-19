@@ -32,30 +32,35 @@ Before running this experiment, ensure that:
 
 ## How It Works
 
-This experiment simulates a complete Availability Zone impairment by executing multiple fault injection actions in parallel. The SSM automation document manages the full subnet impairment lifecycle (remove → wait → restore) with built-in cleanup on cancel or failure:
+This experiment simulates a complete Availability Zone impairment using a sequenced approach that mirrors real-world AZ failures. Network degradation begins first, followed by a hard task stop — making the failure more realistic and catastrophic than simply stopping tasks. The SSM automation document manages the subnet impairment lifecycle (remove → wait → restore) with built-in cleanup on cancel or failure:
 
 ### Experiment Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PARALLEL ACTIONS (Start)                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
-│  │  stop-tasks-in-az   │  │  impair-subnet-in-  │  │ inject-network-     │  │
-│  │  (aws:ecs:stop-task)│  │  az (SSM lifecycle) │  │ packet-loss         │  │
-│  │                     │  │  remove → wait →    │  │ Duration: 15min     │  │
-│  │                     │  │  restore (40m max)  │  │                     │  │
-│  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+T+0     ┌─────────────────────────────────────────────────────────────────────┐
+        │  inject-network-packet-loss (100% packet loss, 15 min)              │
+        │  wait-before-stop (1 min delay)                                     │
+        └─────────────────────────────────────────────────────────────────────┘
+                          │
+T+1m                      ▼
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │  stop-tasks-in-az (force stop all tasks in target AZ)               │
+        │  impair-subnet-in-az (SSM: remove subnet → wait → restore)         │
+        └─────────────────────────────────────────────────────────────────────┘
+                          │
+T+15m                     ▼  Packet loss duration ends
+T+17m                     ▼  SSM automation restores subnet
+                          ▼  ECS rebalances tasks across AZs
 ```
 
 ### Actions Detail
 
-| Action | Action ID | Description | Duration |
-|--------|-----------|-------------|----------|
-| `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | Immediate |
-| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet, waits for duration, then restores. Cleans up on cancel/failure. | 40 min max |
-| `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | 15 minutes |
+| Action | Action ID | Description | Starts | Duration |
+|--------|-----------|-------------|--------|----------|
+| `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | T+0 | 15 minutes |
+| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet, waits for duration, then restores. Cleans up on cancel/failure. | T+0 | 40 min max |
+| `wait-before-stop` | `aws:fis:wait` | Delay to let packet loss take effect before hard stop | T+0 | 1 minute |
+| `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
 
 ### SSM Automation Document
 

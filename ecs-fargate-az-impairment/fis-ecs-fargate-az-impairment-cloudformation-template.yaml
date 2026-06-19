@@ -403,11 +403,19 @@ Resources:
       Description: 'ECS Fargate AZ Impairment - UPDATE PARAMETERS BEFORE RUNNING. Simulates AZ failure with task stop, subnet removal, and network packet loss.'
       RoleArn: !GetAtt FISExperimentRole.Arn
       Actions:
+        WaitBeforeStop:
+          ActionId: 'aws:fis:wait'
+          Description: 'Wait 1 minute for packet loss to take effect before stopping tasks'
+          Parameters:
+            duration: 'PT1M'
+
         StopTasksInAZ:
           ActionId: 'aws:ecs:stop-task'
           Description: 'Stop all ECS Fargate tasks in the target availability zone'
           Targets:
             Tasks: ECSTasksForStop
+          StartAfter:
+            - WaitBeforeStop
 
         ImpairSubnetInAZ:
           ActionId: 'aws:ssm:start-automation-execution'
@@ -423,6 +431,8 @@ Resources:
                 "Duration": "PT15M"
               }
             maxDuration: 'PT40M'
+          StartAfter:
+            - WaitBeforeStop
 
         InjectNetworkPacketLoss:
           ActionId: 'aws:ecs:task-network-packet-loss'

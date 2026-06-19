@@ -2,12 +2,20 @@
     "description": "ECS Fargate AZ Impairment - Simulates availability zone failure with task stop, subnet removal, and network packet loss",
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
     "actions": {
+        "wait-before-stop": {
+            "actionId": "aws:fis:wait",
+            "description": "Wait 1 minute for packet loss to take effect before stopping tasks",
+            "parameters": {
+                "duration": "PT1M"
+            }
+        },
         "stop-tasks-in-az": {
             "actionId": "aws:ecs:stop-task",
             "description": "Stop all ECS Fargate tasks in the target availability zone",
             "targets": {
                 "Tasks": "ecs-tasks-for-stop"
-            }
+            },
+            "startAfter": ["wait-before-stop"]
         },
         "impair-subnet-in-az": {
             "actionId": "aws:ssm:start-automation-execution",
@@ -16,7 +24,8 @@
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-subnet-automation",
                 "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\", \"ClusterName\": \"<YOUR ECS CLUSTER>\", \"ServiceName\": \"<YOUR ECS SERVICE>\", \"SubnetId\": \"<YOUR SUBNET ID>\", \"Duration\": \"PT15M\"}",
                 "maxDuration": "PT40M"
-            }
+            },
+            "startAfter": ["wait-before-stop"]
         },
         "inject-network-packet-loss": {
             "actionId": "aws:ecs:task-network-packet-loss",
