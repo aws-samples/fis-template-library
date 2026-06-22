@@ -22,7 +22,7 @@
             "description": "Remove subnet from ECS service, wait for impairment duration, then restore. Handles cleanup on cancel/failure.",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-subnet-automation",
-                "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\", \"ClusterName\": \"<YOUR ECS CLUSTER>\", \"ServiceName\": \"<YOUR ECS SERVICE>\", \"SubnetId\": \"<YOUR SUBNET ID>\", \"Duration\": \"PT15M\"}",
+                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\",\"ClusterName\":\"<YOUR ECS CLUSTER>\",\"ServiceName\":\"<YOUR ECS SERVICE>\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"Duration\":\"PT15M\"}",
                 "maxDuration": "PT40M"
             },
             "startAfter": ["wait-before-stop"]

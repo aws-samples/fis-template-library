@@ -422,14 +422,7 @@ Resources:
           Description: 'Remove subnet from ECS service, wait for impairment duration, then restore. Handles cleanup on cancel/failure.'
           Parameters:
             documentArn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${SubnetAutomationDocument}'
-            documentParameters: !Sub |
-              {
-                "AutomationAssumeRole": "${SSMAutomationRole.Arn}",
-                "ClusterName": "<YOUR ECS CLUSTER>",
-                "ServiceName": "<YOUR ECS SERVICE>",
-                "SubnetId": "<YOUR SUBNET ID>",
-                "Duration": "PT15M"
-              }
+            documentParameters: !Sub '{"AutomationAssumeRole":"${SSMAutomationRole.Arn}","ClusterName":"<YOUR ECS CLUSTER>","ServiceName":"<YOUR ECS SERVICE>","SubnetId":"<YOUR SUBNET ID>","Duration":"PT15M"}'
             maxDuration: 'PT40M'
           StartAfter:
             - WaitBeforeStop
