@@ -1,0 +1,30 @@
+{
+    "description": "Reboot an Amazon MSK broker to test cluster resilience and partition leader failover",
+    "targets": {},
+    "actions": {
+        "rebootMSKBroker": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Reboot a single MSK broker via SSM Automation and monitor recovery",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/msk-broker-reboot-automation",
+                "documentParameters": "{\"tagKey\":\"FIS-Ready\",\"tagValue\":\"True\",\"brokerSelection\":\"random\",\"region\":\"<YOUR REGION>\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\"}",
+                "maxDuration": "PT21M"
+            },
+            "targets": {}
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "msk-broker-reboot",
+        "Purpose": "chaos-engineering"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}
