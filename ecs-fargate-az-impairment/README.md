@@ -22,7 +22,7 @@ When an Availability Zone experiences an impairment affecting an ECS Fargate ser
 Before running this experiment, ensure that:
 
 1. You have the necessary permissions to execute the FIS experiment and perform ECS service updates, SSM automation executions, and EC2 network operations.
-2. The IAM roles have been deployed via the CloudFormation template or manually created with the required permissions from `ecs-fargate-az-impairment-iam-policy.json`.
+2. The IAM roles have been created with the required permissions from `ecs-fargate-az-impairment-fis-role-iam-policy.json` (FIS execution role) and `ecs-fargate-az-impairment-ssm-automation-role-iam-policy.json` (SSM automation role).
 3. The ECS cluster and service you want to target have the `FIS-Ready=True` tag applied.
 4. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required - the experiment cannot remove the last subnet).
 5. The SSM automation document (`ecs-fargate-az-impairment-subnet-automation`) has been deployed to your account.
@@ -58,7 +58,7 @@ T+17m                     ▼  SSM automation restores subnet
 | Action | Action ID | Description | Starts | Duration |
 |--------|-----------|-------------|--------|----------|
 | `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | T+0 | 15 minutes |
-| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet, waits for duration, then restores. Cleans up on cancel/failure. | T+0 | 40 min max |
+| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet, waits for duration, then restores. Cleans up on cancel/failure. | T+1m | 40 min max |
 | `wait-before-stop` | `aws:fis:wait` | Delay to let packet loss take effect before hard stop | T+0 | 1 minute |
 | `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
 
@@ -80,7 +80,8 @@ Steps 4–6 have `onFailure` and `onCancel` routing to the restore step, ensurin
 
 | Target Name | Resource Type | Selection Mode | Description |
 |-------------|---------------|----------------|-------------|
-| `ecs-tasks-in-target-az` | `aws:ecs:task` | ALL | All ECS tasks in the specified cluster/service within the target AZ |
+| `ecs-tasks-for-stop` | `aws:ecs:task` | ALL | ECS tasks in the target AZ to be stopped |
+| `ecs-tasks-for-packet-loss` | `aws:ecs:task` | ALL | ECS tasks in the target AZ to receive packet loss injection |
 
 ### Target Requirements
 - Tasks must have the `FIS-Ready=True` tag
@@ -149,29 +150,6 @@ As you adapt this scenario to your needs, we recommend:
 
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
 
-## Deployment
-
-### Option 1: CloudFormation (Recommended)
-
-Deploy all resources including SSM documents, IAM roles, and FIS experiment template:
-
-```bash
-aws cloudformation deploy \
-  --template-file fis-ecs-fargate-az-impairment-cloudformation-template.yaml \
-  --stack-name ecs-fargate-az-impairment \
-  --capabilities CAPABILITY_NAMED_IAM
-```
-
-After deployment, update the experiment template in the FIS console with your actual parameter values.
-
-### Option 2: Manual Deployment
-
-```bash
-./ecs-fargate-az-impairment-experiment-setup.sh
-```
-
-> **Note:** Before running the above command, update all placeholder values (`<YOUR ...>`) in `ecs-fargate-az-impairment-template.json` with your actual resource identifiers. Alternatively you can update the experiment template in the Console later.
-
 ## Files in This Directory
 
 | File | Description |
@@ -179,9 +157,8 @@ After deployment, update the experiment template in the FIS console with your ac
 | `README.md` | This documentation file |
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
 | `ecs-fargate-az-impairment-template.json` | FIS experiment template definition |
-| `ecs-fargate-az-impairment-iam-policy.json` | IAM policy for FIS and SSM execution |
+| `ecs-fargate-az-impairment-fis-role-iam-policy.json` | IAM policy for the FIS execution role |
+| `ecs-fargate-az-impairment-ssm-automation-role-iam-policy.json` | IAM policy for the SSM automation role |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
-| `ecs-fargate-az-impairment-ssm-trust-relationship.json` | Trust policy for SSM service |
+| `ssm-iam-trust-relationship.json` | Trust policy for SSM service |
 | `ecs-fargate-az-impairment-subnet-automation.yaml` | SSM Automation document (remove, wait, restore with cleanup on cancel/failure) |
-| `fis-ecs-fargate-az-impairment-cloudformation-template.yaml` | CloudFormation template for full deployment |
-| `ecs-fargate-az-impairment-experiment-setup.sh` | Manual deployment script |

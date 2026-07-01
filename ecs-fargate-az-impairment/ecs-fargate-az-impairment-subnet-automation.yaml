@@ -256,7 +256,7 @@ mainSteps:
                 )
                 return json.dumps({'Status': 'RESTORED', 'Subnets': new_subnets})
             except Exception as e:
-                return json.dumps({'Status': 'ERROR', 'Message': str(e)})
+                raise RuntimeError(f"Failed to restore subnet {subnet} to service {service}: {e}") from e
       InputPayload:
         ClusterName: '{{ ClusterName }}'
         ServiceName: '{{ ServiceName }}'
