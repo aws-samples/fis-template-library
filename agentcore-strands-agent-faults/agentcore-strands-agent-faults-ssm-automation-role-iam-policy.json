@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowChaosParameterWrites",
+      "Effect": "Allow",
+      "Action": [ "ssm:PutParameter" ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:parameter/chaos/*"
+    },
+    {
+      "Sid": "AllowChaosParameterCleanup",
+      "Effect": "Allow",
+      "Action": [ "ssm:DeleteParameters" ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:parameter/chaos/*"
+    }
+  ]
+}

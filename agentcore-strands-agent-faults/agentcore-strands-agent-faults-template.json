@@ -1,0 +1,29 @@
+{
+    "description": "Strands agent chaos experiment - {runtime_id}",
+    "targets": {},
+    "actions": {
+        "Agent-Chaos-Injection": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Enable/hold/disable agent chaos via SSM doc",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ChaosExperiment",
+                "documentParameters": "{\"RuntimeId\":\"agent_id1234\",\"FaultRate\":\"0.5\",\"FaultInjections\":\"{\\\"get_move\\\":[{\\\"effect_type\\\":\\\"timeout\\\"}],\\\"get_pokemon\\\":[{\\\"effect_type\\\":\\\"truncate_fields\\\",\\\"max_length\\\":200}]}\",\"DurationSeconds\":\"900\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/ChaosExperiment-SSM-Automation-Role\"}",
+                "maxDuration": "PT20M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/ChaosExperiment-FIS-Role",
+    "tags": {
+        "Name": "Agent-Chaos-Injection",
+        "ExperimentType": "AgentChaosInjection"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

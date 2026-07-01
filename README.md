@@ -10,6 +10,7 @@ Browse the experiment directories to find templates for various fault injection 
 - **Database Resilience**: `aurora-cluster-failover/`, `sap-ebs-pause-database-data/`
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
 - **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
+- **AI Agents (Amazon Bedrock AgentCore)**: `agentcore-strands-agent-faults/`
 
 Each experiment directory contains:
 - Complete FIS experiment template (JSON)
