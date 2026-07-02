@@ -1,0 +1,85 @@
+{
+    "description": "ECS Fargate AZ Impairment - Simulates availability zone failure with task stop, subnet removal, and network packet loss",
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "actions": {
+        "wait-before-stop": {
+            "actionId": "aws:fis:wait",
+            "description": "Wait 1 minute for packet loss to take effect before stopping tasks",
+            "parameters": {
+                "duration": "PT1M"
+            }
+        },
+        "stop-tasks-in-az": {
+            "actionId": "aws:ecs:stop-task",
+            "description": "Stop all ECS Fargate tasks in the target availability zone",
+            "targets": {
+                "Tasks": "ecs-tasks-for-stop"
+            },
+            "startAfter": ["wait-before-stop"]
+        },
+        "impair-subnet-in-az": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Remove subnet from ECS service at T+0, wait for impairment duration, then restore. Starting before stop-tasks-in-az ensures the subnet is already removed before ECS tries to reschedule stopped tasks. Handles cleanup on cancel/failure.",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-subnet-automation",
+                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\",\"ClusterName\":\"<YOUR ECS CLUSTER>\",\"ServiceName\":\"<YOUR ECS SERVICE>\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"Duration\":\"PT15M\"}",
+                "maxDuration": "PT40M"
+            }
+        },
+        "inject-network-packet-loss": {
+            "actionId": "aws:ecs:task-network-packet-loss",
+            "description": "Inject network packet loss for ECS tasks in the target availability zone",
+            "parameters": {
+                "duration": "PT15M",
+                "lossPercent": "100",
+                "sources": "0.0.0.0/0",
+                "useEcsFaultInjectionEndpoints": "true"
+            },
+            "targets": {
+                "Tasks": "ecs-tasks-for-packet-loss"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "targets": {
+        "ecs-tasks-for-stop": {
+            "resourceType": "aws:ecs:task",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "filters": [
+                {
+                    "path": "AvailabilityZone",
+                    "values": ["<YOUR TARGET AZ>"]
+                }
+            ],
+            "selectionMode": "ALL"
+        },
+        "ecs-tasks-for-packet-loss": {
+            "resourceType": "aws:ecs:task",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "filters": [
+                {
+                    "path": "AvailabilityZone",
+                    "values": ["<YOUR TARGET AZ>"]
+                }
+            ],
+            "selectionMode": "ALL"
+        }
+    },
+    "tags": {
+        "Name": "ecs-fargate-az-impairment",
+        "Purpose": "chaos-engineering",
+        "Environment": "test"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

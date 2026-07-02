@@ -1,0 +1,269 @@
+schemaVersion: '0.3'
+description: Remove a subnet from ECS Fargate service configuration to simulate AZ impairment, wait for specified duration, then restore the subnet. Handles cleanup on cancel or failure.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role for automation execution
+    default: ''
+  ClusterName:
+    type: String
+    description: Name of the ECS cluster
+  ServiceName:
+    type: String
+    description: Name of the ECS service
+  SubnetId:
+    type: String
+    description: Subnet ID to remove and restore from the service configuration
+  Duration:
+    type: String
+    description: Duration of the impairment in ISO 8601 format
+    default: 'PT15M'
+mainSteps:
+  - name: ValidateInputs
+    description: Validate input parameters
+    action: aws:executeScript
+    nextStep: GetCurrentServiceConfiguration
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: validate_inputs
+      Script: |
+        import re
+
+        def validate_inputs(events, context):
+            cluster_name = events['ClusterName']
+            service_name = events['ServiceName']
+            subnet_id = events['SubnetId']
+
+            if not re.match(r'^subnet-[a-f0-9]{8,17}$', subnet_id):
+                raise ValueError(f"Invalid subnet ID format: {subnet_id}")
+
+            if not cluster_name or not service_name:
+                raise ValueError("Cluster name and service name cannot be empty")
+
+            return "Validation completed successfully"
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+        SubnetId: '{{ SubnetId }}'
+    outputs:
+      - Name: ValidationResult
+        Selector: $.Payload
+        Type: String
+  - name: GetCurrentServiceConfiguration
+    description: Get current ECS service configuration
+    action: aws:executeAwsApi
+    nextStep: CheckSubnetAndPrepareConfig
+    isEnd: false
+    inputs:
+      Service: ecs
+      Api: DescribeServices
+      cluster: '{{ ClusterName }}'
+      services:
+        - '{{ ServiceName }}'
+    outputs:
+      - Name: ServiceDetails
+        Selector: $.services[0]
+        Type: StringMap
+  - name: CheckSubnetAndPrepareConfig
+    description: Check subnet exists in configuration and prepare new config with subnet removed
+    action: aws:executeScript
+    nextStep: RemoveSubnetFromService
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: check_and_prepare
+      Script: |
+        import json
+
+        def check_and_prepare(events, context):
+            service_details = events['ServiceDetails']
+            subnet_to_remove = events['SubnetId']
+
+            if 'networkConfiguration' not in service_details:
+                raise ValueError('Service has no network configuration')
+
+            network_config = service_details['networkConfiguration']
+            if 'awsvpcConfiguration' not in network_config:
+                raise ValueError('Service has no VPC configuration')
+
+            current_subnets = network_config['awsvpcConfiguration'].get('subnets', [])
+
+            if subnet_to_remove not in current_subnets:
+                raise ValueError(f'Subnet {subnet_to_remove} not found in current configuration')
+
+            if len(current_subnets) <= 1:
+                raise ValueError('Cannot remove the last subnet from service configuration')
+
+            new_subnets = [subnet for subnet in current_subnets if subnet != subnet_to_remove]
+
+            new_network_config = {
+                'subnets': new_subnets,
+                'securityGroups': network_config['awsvpcConfiguration'].get('securityGroups', []),
+                'assignPublicIp': network_config['awsvpcConfiguration'].get('assignPublicIp', 'DISABLED')
+            }
+
+            result = {
+                'NewNetworkConfiguration': new_network_config,
+                'RemovedSubnet': subnet_to_remove,
+                'RemainingSubnets': new_subnets,
+                'CurrentSubnets': current_subnets
+            }
+
+            return json.dumps(result)
+      InputPayload:
+        ServiceDetails: '{{ GetCurrentServiceConfiguration.ServiceDetails }}'
+        SubnetId: '{{ SubnetId }}'
+    outputs:
+      - Name: ConfigurationResult
+        Selector: $.Payload
+        Type: String
+  - name: RemoveSubnetFromService
+    description: Update ECS service to remove the target subnet
+    action: aws:executeScript
+    nextStep: WaitForServiceStableAfterRemoval
+    isEnd: false
+    onFailure: 'step:RestoreSubnetToService'
+    onCancel: 'step:RestoreSubnetToService'
+    inputs:
+      Runtime: python3.11
+      Handler: remove_subnet
+      Script: |
+        import boto3
+        import json
+
+        def remove_subnet(events, context):
+            ecs_client = boto3.client('ecs')
+            cluster_name = events['ClusterName']
+            service_name = events['ServiceName']
+            config_result = json.loads(events['ConfigurationResult'])
+
+            new_network_config = config_result['NewNetworkConfiguration']
+
+            response = ecs_client.update_service(
+                cluster=cluster_name,
+                service=service_name,
+                networkConfiguration={'awsvpcConfiguration': new_network_config}
+            )
+
+            return json.dumps({
+                'Status': 'SUBNET_REMOVED',
+                'ServiceArn': response['service']['serviceArn'],
+                'RemainingSubnets': new_network_config['subnets']
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+        ConfigurationResult: '{{ CheckSubnetAndPrepareConfig.ConfigurationResult }}'
+    outputs:
+      - Name: RemoveResult
+        Selector: $.Payload
+        Type: String
+  - name: WaitForServiceStableAfterRemoval
+    description: Wait for service to reach stable state after subnet removal
+    action: aws:executeScript
+    nextStep: WaitForDuration
+    isEnd: false
+    onFailure: 'step:RestoreSubnetToService'
+    onCancel: 'step:RestoreSubnetToService'
+    inputs:
+      Runtime: python3.11
+      Handler: wait_for_stable
+      Script: |
+        import boto3
+        import time
+        import json
+
+        def wait_for_stable(events, context):
+            ecs_client = boto3.client('ecs')
+            cluster_name = events['ClusterName']
+            service_name = events['ServiceName']
+
+            max_wait_time = 600
+            check_interval = 15
+            elapsed_time = 0
+
+            while elapsed_time < max_wait_time:
+                response = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
+                service = response['services'][0]
+                deployments = service['deployments']
+
+                all_stable = all(
+                    deployment['status'] in ['PRIMARY', 'ACTIVE'] and
+                    deployment['runningCount'] == deployment['desiredCount']
+                    for deployment in deployments
+                )
+
+                if all_stable:
+                    return json.dumps({'Status': 'STABLE', 'ElapsedTime': elapsed_time})
+
+                time.sleep(check_interval)
+                elapsed_time += check_interval
+
+            raise RuntimeError(f'Service did not reach stable state within {max_wait_time} seconds')
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+    outputs:
+      - Name: StabilityResult
+        Selector: $.Payload
+        Type: String
+  - name: WaitForDuration
+    description: Wait for the specified impairment duration
+    action: aws:sleep
+    nextStep: RestoreSubnetToService
+    isEnd: false
+    onFailure: 'step:RestoreSubnetToService'
+    onCancel: 'step:RestoreSubnetToService'
+    inputs:
+      Duration: '{{ Duration }}'
+  - name: RestoreSubnetToService
+    description: Restore the subnet to the ECS service configuration
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: restore_subnet
+      Script: |
+        import boto3
+        import json
+
+        def restore_subnet(events, context):
+            cluster = events['ClusterName']
+            service = events['ServiceName']
+            subnet = events['SubnetId']
+
+            try:
+                ecs_client = boto3.client('ecs')
+                response = ecs_client.describe_services(cluster=cluster, services=[service])
+                svc = response['services'][0]
+                net_config = svc['networkConfiguration']['awsvpcConfiguration']
+                current_subnets = net_config.get('subnets', [])
+
+                if subnet in current_subnets:
+                    return json.dumps({'Status': 'ALREADY_PRESENT', 'Subnets': current_subnets})
+
+                new_subnets = current_subnets + [subnet]
+                ecs_client.update_service(
+                    cluster=cluster,
+                    service=service,
+                    networkConfiguration={'awsvpcConfiguration': {
+                        'subnets': new_subnets,
+                        'securityGroups': net_config.get('securityGroups', []),
+                        'assignPublicIp': net_config.get('assignPublicIp', 'DISABLED')
+                    }}
+                )
+                return json.dumps({'Status': 'RESTORED', 'Subnets': new_subnets})
+            except Exception as e:
+                raise RuntimeError(f"Failed to restore subnet {subnet} to service {service}: {e}") from e
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        ServiceName: '{{ ServiceName }}'
+        SubnetId: '{{ SubnetId }}'
+    outputs:
+      - Name: RestoreResult
+        Selector: $.Payload
+        Type: String
+outputs:
+  - RestoreSubnetToService.RestoreResult
