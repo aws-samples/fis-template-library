@@ -19,13 +19,13 @@
         "ecs:DescribeTasks",
         "ecs:StopTask"
       ],
-      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task//*"
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/*/*"
     },
     {
       "Sid": "AllowECSDescribeContainerInstances",
       "Effect": "Allow",
       "Action": "ecs:DescribeContainerInstances",
-      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:container-instance//*"
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:container-instance/*/*"
     },
     {
       "Sid": "AllowECSListTasks",
