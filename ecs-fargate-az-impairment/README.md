@@ -37,8 +37,7 @@ Before running this experiment, ensure that:
    - Disable ECS Exec (`enableExecuteCommand: false`) — it conflicts with the SSM agent registration
    - Include an SSM agent sidecar container that registers each task as a managed instance tagged with `ECS_TASK_ARN`
    - See [Use the AWS FIS aws:ecs:task actions](https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html) for the full sidecar setup guide.
-8. **Network connectivity for `inject-network-packet-loss`**: Tasks must be able to reach the ECS fault injection endpoint. For tasks in private subnets without NAT, add a VPC endpoint for `com.amazonaws.<region>.ecs-fault-injection`. The task security group must allow outbound HTTPS (port 443) to this endpoint.
-9. **Task role and managed-instance role for fault injection**: The SSM agent sidecar authenticates with the ECS **task role** (not the execution role) to register each task as a managed instance. The **task role** needs:
+8. **Task role and managed-instance role for fault injection**: The SSM agent sidecar authenticates with the ECS **task role** (not the execution role) to register each task as a managed instance. The **task role** needs:
    ```json
    {
      "Action": ["ssm:CreateActivation", "ssm:AddTagsToResource", "iam:PassRole"],
@@ -53,7 +52,7 @@ Before running this experiment, ensure that:
    }
    ```
    See [Use the AWS FIS aws:ecs:task actions](https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html) for the full role setup.
-10. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
+9. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
 ## How It Works
 
