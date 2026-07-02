@@ -23,12 +23,22 @@ Before running this experiment, ensure that:
 
 1. You have the necessary permissions to execute the FIS experiment and perform ECS service updates, SSM automation executions, and EC2 network operations.
 2. The IAM roles have been created with the required permissions from `ecs-fargate-az-impairment-fis-role-iam-policy.json` (FIS execution role) and `ecs-fargate-az-impairment-ssm-automation-role-iam-policy.json` (SSM automation role).
-3. The ECS cluster and service you want to target have the `FIS-Ready=True` tag applied.
+3. The ECS cluster and service you want to target have the `FIS-Ready=True` tag applied to both the service **and propagated to tasks** at launch time (`propagateTags: SERVICE` or `TASK_DEFINITION` in the service definition). You can verify with:
+   ```bash
+   aws ecs describe-tasks --cluster <cluster> --tasks $(aws ecs list-tasks --cluster <cluster> --service-name <service> --query 'taskArns[0]' --output text) --query 'tasks[0].tags'
+   ```
 4. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required - the experiment cannot remove the last subnet).
 5. The SSM automation document (`ecs-fargate-az-impairment-subnet-automation`) has been deployed to your account.
 6. Your service has sufficient capacity in remaining AZs to handle the workload during the 15-minute experiment duration.
-7. SSM Agent connectivity is available for the automation documents to execute.
-8. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
+7. **Network connectivity for `inject-network-packet-loss`**: Tasks must be able to reach the ECS fault injection endpoint. For tasks in private subnets without NAT, add a VPC endpoint for `com.amazonaws.<region>.ecs-fault-injection`. The task security group must allow outbound HTTPS (port 443) to this endpoint.
+8. **Task execution role for fault injection**: The ECS task execution role needs the following permissions to allow the FIS agent inside the task to register as a managed instance:
+   ```json
+   {
+     "Action": ["ssm:RegisterManagedInstance", "ssm:DescribeInstanceInformation", "ssm:UpdateInstanceInformation"],
+     "Resource": "*"
+   }
+   ```
+9. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
 ## How It Works
 
@@ -40,26 +50,32 @@ This experiment simulates a complete Availability Zone impairment using a sequen
 T+0     ┌─────────────────────────────────────────────────────────────────────┐
         │  inject-network-packet-loss (100% packet loss, 15 min)              │
         │  wait-before-stop (1 min delay)                                     │
+        │  impair-subnet-in-az (SSM: remove subnet → wait → restore)         │
         └─────────────────────────────────────────────────────────────────────┘
+                          │
+T+~30s  SSM automation removes subnet from ECS service network config
+        ECS can no longer reschedule tasks into the impaired AZ
                           │
 T+1m                      ▼
         ┌─────────────────────────────────────────────────────────────────────┐
         │  stop-tasks-in-az (force stop all tasks in target AZ)               │
-        │  impair-subnet-in-az (SSM: remove subnet → wait → restore)         │
         └─────────────────────────────────────────────────────────────────────┘
+        ECS reschedules stopped tasks into surviving subnets only ✓
                           │
 T+15m                     ▼  Packet loss duration ends
 T+17m                     ▼  SSM automation restores subnet
                           ▼  ECS rebalances tasks across AZs
 ```
 
+**Why `impair-subnet-in-az` starts at T+0:** ECS does not evict running tasks when a subnet is removed from the service network config — only new task placements are blocked. If the subnet removal runs concurrently with or after the task stop, ECS can reschedule the just-stopped tasks back into the impaired AZ before the SSM automation has updated the service. Starting the SSM automation at T+0 ensures the subnet is fully removed (~30 seconds of SSM startup + API call) before `stop-tasks-in-az` fires at T+1m, giving ECS no healthy subnet to place replacements in for that AZ.
+
 ### Actions Detail
 
 | Action | Action ID | Description | Starts | Duration |
 |--------|-----------|-------------|--------|----------|
 | `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | T+0 | 15 minutes |
-| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet, waits for duration, then restores. Cleans up on cancel/failure. | T+1m | 40 min max |
-| `wait-before-stop` | `aws:fis:wait` | Delay to let packet loss take effect before hard stop | T+0 | 1 minute |
+| `wait-before-stop` | `aws:fis:wait` | Delay to let packet loss and subnet removal take effect before hard stop | T+0 | 1 minute |
+| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet at T+0, waits for duration, then restores. Cleans up on cancel/failure. | T+0 | 40 min max |
 | `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
 
 ### SSM Automation Document

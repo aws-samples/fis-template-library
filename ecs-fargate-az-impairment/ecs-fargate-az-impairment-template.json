@@ -19,13 +19,12 @@
         },
         "impair-subnet-in-az": {
             "actionId": "aws:ssm:start-automation-execution",
-            "description": "Remove subnet from ECS service, wait for impairment duration, then restore. Handles cleanup on cancel/failure.",
+            "description": "Remove subnet from ECS service at T+0, wait for impairment duration, then restore. Starting before stop-tasks-in-az ensures the subnet is already removed before ECS tries to reschedule stopped tasks. Handles cleanup on cancel/failure.",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-subnet-automation",
                 "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\",\"ClusterName\":\"<YOUR ECS CLUSTER>\",\"ServiceName\":\"<YOUR ECS SERVICE>\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"Duration\":\"PT15M\"}",
                 "maxDuration": "PT40M"
-            },
-            "startAfter": ["wait-before-stop"]
+            }
         },
         "inject-network-packet-loss": {
             "actionId": "aws:ecs:task-network-packet-loss",

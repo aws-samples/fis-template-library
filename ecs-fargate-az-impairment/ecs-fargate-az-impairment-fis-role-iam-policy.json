@@ -13,6 +13,43 @@
       "Resource": "*"
     },
     {
+      "Sid": "AllowECSTargetResolution",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeTasks",
+        "ecs:ListTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowECSStopTask",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:StopTask"
+      ],
+      "Resource": [
+        "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/<YOUR ECS CLUSTER>/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    },
+    {
+      "Sid": "AllowECSNetworkFaultInjection",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RunTask"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ecs:cluster": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster/<YOUR ECS CLUSTER>"
+        }
+      }
+    },
+    {
       "Sid": "AllowSSMDocumentExecution",
       "Effect": "Allow",
       "Action": [
