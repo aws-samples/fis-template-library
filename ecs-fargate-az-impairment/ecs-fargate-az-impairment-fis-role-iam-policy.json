@@ -13,41 +13,59 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowECSTargetResolution",
+      "Sid": "AllowECSTaskActions",
       "Effect": "Allow",
       "Action": [
         "ecs:DescribeTasks",
-        "ecs:ListTasks"
+        "ecs:StopTask"
+      ],
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task//*"
+    },
+    {
+      "Sid": "AllowECSDescribeContainerInstances",
+      "Effect": "Allow",
+      "Action": "ecs:DescribeContainerInstances",
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:container-instance//*"
+    },
+    {
+      "Sid": "AllowECSListTasks",
+      "Effect": "Allow",
+      "Action": "ecs:ListTasks",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowEC2Describe",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeSubnets"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "AllowECSStopTask",
+      "Sid": "AllowSSMSendCommand",
       "Effect": "Allow",
-      "Action": [
-        "ecs:StopTask"
-      ],
+      "Action": "ssm:SendCommand",
       "Resource": [
-        "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/<YOUR ECS CLUSTER>/*"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/FIS-Ready": "True"
-        }
-      }
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:managed-instance/*",
+        "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-ECS",
+        "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-Sources"
+      ]
     },
     {
-      "Sid": "AllowECSNetworkFaultInjection",
+      "Sid": "AllowSSMCommandStatus",
       "Effect": "Allow",
       "Action": [
-        "ecs:RunTask"
+        "ssm:ListCommands",
+        "ssm:CancelCommand"
       ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "ecs:cluster": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster/<YOUR ECS CLUSTER>"
-        }
-      }
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowTargetResolutionByTags",
+      "Effect": "Allow",
+      "Action": "tag:GetResources",
+      "Resource": "*"
     },
     {
       "Sid": "AllowSSMDocumentExecution",
@@ -67,7 +85,7 @@
       "Sid": "AllowPassRole",
       "Effect": "Allow",
       "Action": ["iam:PassRole"],
-      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE>"]
+      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>"]
     }
   ]
 }

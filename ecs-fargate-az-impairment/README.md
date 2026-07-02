@@ -23,22 +23,29 @@ Before running this experiment, ensure that:
 
 1. You have the necessary permissions to execute the FIS experiment and perform ECS service updates, SSM automation executions, and EC2 network operations.
 2. The IAM roles have been created with the required permissions from `ecs-fargate-az-impairment-fis-role-iam-policy.json` (FIS execution role) and `ecs-fargate-az-impairment-ssm-automation-role-iam-policy.json` (SSM automation role).
-3. The ECS cluster and service you want to target have the `FIS-Ready=True` tag applied to both the service **and propagated to tasks** at launch time (`propagateTags: SERVICE` or `TASK_DEFINITION` in the service definition). You can verify with:
+3. The ECS cluster, **service**, and tasks all have the `FIS-Ready=True` tag. The service must be tagged directly (required by the SSM automation role policy — `ecs:DescribeServices` and `ecs:UpdateService` are conditioned on `aws:ResourceTag/FIS-Ready: True`; an untagged service causes AccessDenied at the first automation step before any subnet is removed). Tags must also propagate to tasks at launch time (`propagateTags: SERVICE` or `TASK_DEFINITION` in the service definition). You can verify with:
    ```bash
    aws ecs describe-tasks --cluster <cluster> --tasks $(aws ecs list-tasks --cluster <cluster> --service-name <service> --query 'taskArns[0]' --output text) --query 'tasks[0].tags'
    ```
 4. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required - the experiment cannot remove the last subnet).
 5. The SSM automation document (`ecs-fargate-az-impairment-subnet-automation`) has been deployed to your account.
 6. Your service has sufficient capacity in remaining AZs to handle the workload during the 15-minute experiment duration.
-7. **Network connectivity for `inject-network-packet-loss`**: Tasks must be able to reach the ECS fault injection endpoint. For tasks in private subnets without NAT, add a VPC endpoint for `com.amazonaws.<region>.ecs-fault-injection`. The task security group must allow outbound HTTPS (port 443) to this endpoint.
-8. **Task execution role for fault injection**: The ECS task execution role needs the following permissions to allow the FIS agent inside the task to register as a managed instance:
+7. **Task definition requirements for `inject-network-packet-loss`**: The `aws:ecs:task-network-packet-loss` action uses an SSM agent sidecar inside each task to inject faults. Without it, the action fails with `"At least one ECS Task is not registered as a SSM managed instance."` Your task definition must:
+   - Set `pidMode: task` (required for the sidecar to access the task's network namespace)
+   - Use `networkMode: awsvpc` (not `bridge`)
+   - Set `enableFaultInjection: true` in the task definition
+   - Disable ECS Exec (`enableExecuteCommand: false`) — it conflicts with the SSM agent registration
+   - Include an SSM agent sidecar container that registers each task as a managed instance tagged with `ECS_TASK_ARN`
+   - See [Use the AWS FIS aws:ecs:task actions](https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html) for the full sidecar setup guide.
+8. **Network connectivity for `inject-network-packet-loss`**: Tasks must be able to reach the ECS fault injection endpoint. For tasks in private subnets without NAT, add a VPC endpoint for `com.amazonaws.<region>.ecs-fault-injection`. The task security group must allow outbound HTTPS (port 443) to this endpoint.
+9. **Task execution role for fault injection**: The ECS task execution role needs the following permissions to allow the SSM agent sidecar to register each task as a managed instance:
    ```json
    {
      "Action": ["ssm:RegisterManagedInstance", "ssm:DescribeInstanceInformation", "ssm:UpdateInstanceInformation"],
      "Resource": "*"
    }
    ```
-9. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
+10. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
 ## How It Works
 
