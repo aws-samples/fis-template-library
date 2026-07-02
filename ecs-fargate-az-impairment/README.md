@@ -38,13 +38,21 @@ Before running this experiment, ensure that:
    - Include an SSM agent sidecar container that registers each task as a managed instance tagged with `ECS_TASK_ARN`
    - See [Use the AWS FIS aws:ecs:task actions](https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html) for the full sidecar setup guide.
 8. **Network connectivity for `inject-network-packet-loss`**: Tasks must be able to reach the ECS fault injection endpoint. For tasks in private subnets without NAT, add a VPC endpoint for `com.amazonaws.<region>.ecs-fault-injection`. The task security group must allow outbound HTTPS (port 443) to this endpoint.
-9. **Task execution role for fault injection**: The ECS task execution role needs the following permissions to allow the SSM agent sidecar to register each task as a managed instance:
+9. **Task role and managed-instance role for fault injection**: The SSM agent sidecar authenticates with the ECS **task role** (not the execution role) to register each task as a managed instance. The **task role** needs:
    ```json
    {
-     "Action": ["ssm:RegisterManagedInstance", "ssm:DescribeInstanceInformation", "ssm:UpdateInstanceInformation"],
+     "Action": ["ssm:CreateActivation", "ssm:AddTagsToResource", "iam:PassRole"],
      "Resource": "*"
    }
    ```
+   The **managed-instance role** (the role passed via the `MANAGED_INSTANCE_ROLE_NAME` environment variable, which the sidecar registers instances against) needs the `AmazonSSMManagedInstanceCore` managed policy attached, plus:
+   ```json
+   {
+     "Action": ["ssm:DeleteActivation", "ssm:DeregisterManagedInstance"],
+     "Resource": "*"
+   }
+   ```
+   See [Use the AWS FIS aws:ecs:task actions](https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html) for the full role setup.
 10. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
 ## How It Works
