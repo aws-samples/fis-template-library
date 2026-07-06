@@ -50,7 +50,7 @@ from strands_evals.chaos.effects import ToolEffectUnion
 # Re-export the EXACT ContextVar object the reused ChaosPlugin reads. Importing
 # the name directly (rather than the module) makes an upstream rename fail loudly
 # at import time, rather than silently degrading to a controller that arms a
-# ContextVar the plugin never reads (Requirements 6.7, 6.8). The controller sets
+# ContextVar the plugin never reads. The controller sets
 # and reads this same object so a case it arms is the case the plugin observes
 # within the same invocation.
 from strands_evals.chaos._context import _current_chaos_case
@@ -116,7 +116,7 @@ _RUNTIME_ID_RE = re.compile(r"runtime/([^/]+)")
 def resolve_runtime_id() -> str:
     """Resolve this agent's AgentCore runtime ID by source precedence.
 
-    Resolution precedence (Requirement 5.3):
+    Resolution precedence:
       1. ``AGENT_RUNTIME_ID`` -- explicit operator-injected override (recommended:
          fully under operator control and portable to ECS/Lambda).
       2. ``AGENTCORE_RUNTIME_URL`` -- the runtime ARN is URL-encoded in this
@@ -133,8 +133,7 @@ def resolve_runtime_id() -> str:
         prefix and the FIS ``RuntimeId`` parameter.
 
     Raises:
-        RuntimeError: If none of the supported sources resolve (fail closed,
-            Requirement 5.4).
+        RuntimeError: If none of the supported sources resolve (fail closed).
     """
     # Source 1: explicit operator override.
     rid = os.environ.get("AGENT_RUNTIME_ID", "").strip()
@@ -157,7 +156,7 @@ def resolve_runtime_id() -> str:
     if match:
         return match.group(1)
 
-    # Fail closed: no source resolved (Requirement 5.4).
+    # Fail closed: no source resolved.
     raise RuntimeError(
         "cannot resolve AgentCore runtime id; set AGENT_RUNTIME_ID explicitly"
     )
@@ -233,8 +232,7 @@ class SSMConfigLoader:
 
     Holds a single cached ``RuntimeChaosConfig`` snapshot and a reusable boto3
     SSM client. ``get()`` returns the cache while it is fresh and otherwise
-    refetches, always failing closed to a no-op config rather than raising
-    (Requirements 1.4, 1.5, 7.1, 7.2, 8.1, 8.5).
+    refetches, always failing closed to a no-op config rather than raising.
 
     Attributes:
         prefix: The SSM path prefix, ``f"/chaos/{runtime_id}/"``.
@@ -280,11 +278,11 @@ class SSMConfigLoader:
         """
         now = time.monotonic()
 
-        # Cache hit: fresh config, no SSM call (Requirement 1.4).
+        # Cache hit: fresh config, no SSM call.
         if self._cached is not None and (now - self._cached.fetched_at) < self.ttl:
             return self._cached
 
-        # Cache miss / expiry: fetch from SSM (Requirement 1.5).
+        # Cache miss / expiry: fetch from SSM.
         try:
             resp = self.ssm.get_parameters_by_path(Path=self.prefix)
             params = {
@@ -292,7 +290,7 @@ class SSMConfigLoader:
                 for p in resp.get("Parameters", [])
             }
         except Exception:
-            # Fail closed on any SSM read failure (Requirement 7.1).
+            # Fail closed on any SSM read failure.
             logger.warning("ssm_read_failed for prefix %s", self.prefix, exc_info=True)
             self._cached = RuntimeChaosConfig.no_op(fetched_at=now)
             return self._cached
@@ -301,7 +299,7 @@ class SSMConfigLoader:
         try:
             cfg = self._build_config(params, now)
         except Exception as exc:
-            # Fail closed on any malformed/out-of-range value (Requirements 7.2, 8.5).
+            # Fail closed on any malformed/out-of-range value.
             logger.warning("ssm_config_invalid for prefix %s: %s", self.prefix, exc)
             cfg = RuntimeChaosConfig.no_op(fetched_at=now)
 
@@ -318,11 +316,11 @@ class SSMConfigLoader:
         ``fault_injections`` (propagated from ``build_chaos_case``).
         """
         # `active` parses case-insensitively to bool; absent/anything-but-true
-        # is false (Requirement 1.2).
+        # is false.
         active = params.get("active", "false").strip().lower() == "true"
 
-        # `fault_rate` parses to float; reject values outside [0.0, 1.0]
-        # (Requirement 8.5). A non-numeric value raises ValueError here.
+        # `fault_rate` parses to float; reject values outside [0.0, 1.0].
+        # A non-numeric value raises ValueError here.
         fault_rate = float(params.get("fault_rate", "0.0"))
         if not (0.0 <= fault_rate <= 1.0):
             raise ValueError(f"fault_rate out of range [0.0, 1.0]: {fault_rate}")
@@ -354,7 +352,7 @@ class RuntimeChaosController(Plugin):
     reused ``ChaosPlugin`` injects the configured tool-level faults. On the
     matching ``AfterInvocationEvent`` it resets the ContextVar.
 
-    Behaviour (Requirements 1.2, 1.3, 3.4, 3.5, 7.3, 7.4, 7.5, 8.2-8.4):
+    Behaviour:
     no-op when inactive or no case armed; ``random() < fault_rate`` sampling
     (r=0 never selects, r=1 always selects); fail-closed hook bodies that never
     propagate exceptions to the caller.
@@ -399,19 +397,19 @@ class RuntimeChaosController(Plugin):
         ``_current_chaos_case`` ContextVar, tracks the reset token by
         ``id(event)``, stamps the invocation state, and logs activation.
 
-        Never raises out of the hook (Requirement 7.3): any exception is caught
+        Never raises out of the hook: any exception is caught
         and the invocation proceeds with no chaos ContextVar set.
         """
         try:
             cfg = self.loader.get()
 
-            # Dormant: chaos inactive or no case armed (Requirements 1.2, 3.5).
+            # Dormant: chaos inactive or no case armed.
             if not cfg.active or cfg.case is None:
                 return
 
             # Per-invocation sampling: P(select) == fault_rate. Using strict "<"
             # means r=0 never selects (random() in [0,1) is never < 0) and r=1
-            # always selects (random() is always < 1) (Requirements 1.3, 8.2-8.4).
+            # always selects (random() is always < 1).
             if random.random() < cfg.fault_rate:
                 token = _current_chaos_case.set(cfg.case)
                 self._tokens[id(event)] = token
@@ -423,8 +421,8 @@ class RuntimeChaosController(Plugin):
                     list(cfg.case.tool_effects.keys()),
                 )
         except Exception:
-            # Fail closed: a controller failure must never break request handling
-            # (Requirement 7.3). The invocation proceeds without chaos armed.
+            # Fail closed: a controller failure must never break request handling.
+            # The invocation proceeds without chaos armed.
             logger.warning("on_before_invocation failed; skipping chaos", exc_info=True)
 
     @hook  # type: ignore[call-overload]
@@ -432,16 +430,15 @@ class RuntimeChaosController(Plugin):
         """Reset the chaos ContextVar armed for the matching invocation.
 
         Resets the ContextVar using the token stored for ``id(event)`` so chaos
-        state never leaks into a subsequent invocation (Requirement 7.4). If no
-        token was stored (the invocation was never armed), this is a no-op
-        (Requirement 7.5).
+        state never leaks into a subsequent invocation. If no token was stored
+        (the invocation was never armed), this is a no-op.
 
-        Never raises out of the hook (Requirement 7.3).
+        Never raises out of the hook.
         """
         try:
             token = self._tokens.pop(id(event), None)
             if token is None:
-                # This invocation never armed the ContextVar (Requirement 7.5).
+                # This invocation never armed the ContextVar.
                 return
             _current_chaos_case.reset(token)
         except Exception:
@@ -462,7 +459,7 @@ def chaos_plugins() -> list[Plugin]:
 
     Inclusion of these plugins in a build is the coarse "chaos is loaded" intent;
     SSM Parameter Store is the fine per-invocation switch. Every invocation is a
-    no-op until SSM reports ``active=true`` (Requirement 6.1).
+    no-op until SSM reports ``active=true``.
 
     Note:
         ``RuntimeChaosController()`` resolves the runtime ID at construction via
