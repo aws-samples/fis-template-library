@@ -178,8 +178,8 @@ mainSteps:
 
   - name: LaunchLoadGenerator
     action: 'aws:runInstances'
-    onFailure: 'step:CleanupSecurityGroup'
-    onCancel: 'step:CleanupSecurityGroup'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:TerminateInstance'
     inputs:
       ImageId: '{{ LatestAmiId }}'
       InstanceType: '{{ InstanceType }}'
@@ -189,6 +189,8 @@ mainSteps:
       SecurityGroupIds:
         - '{{ CreateSecurityGroup.SecurityGroupId }}'
       IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
       TagSpecifications:
         - ResourceType: 'instance'
           Tags:
@@ -591,6 +593,8 @@ mainSteps:
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
     inputs:
       InstanceIds:
         - '{{ LaunchLoadGenerator.InstanceId }}'
@@ -599,8 +603,8 @@ mainSteps:
   - name: WaitForInstanceTermination
     action: 'aws:waitForAwsResourceProperty'
     timeoutSeconds: 300
-    onFailure: 'Continue'
-    onCancel: 'Abort'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
     inputs:
       Service: ec2
       Api: DescribeInstances
@@ -612,8 +616,8 @@ mainSteps:
 
   - name: RevokeInboundFromLoadGenerator
     action: 'aws:executeScript'
-    onFailure: 'Continue'
-    onCancel: 'Abort'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
     inputs:
       Runtime: python3.11
       Handler: revoke_ingress
