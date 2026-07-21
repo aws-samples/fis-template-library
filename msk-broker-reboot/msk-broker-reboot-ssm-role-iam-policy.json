@@ -1,0 +1,28 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowMSKClusterDiscovery",
+            "Effect": "Allow",
+            "Action": [
+                "kafka:ListClustersV2",
+                "kafka:ListNodes",
+                "kafka:DescribeClusterV2",
+                "kafka:DescribeCluster",
+                "kafka:DescribeClusterOperation"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowMSKRebootBrokerOnFISReadyClusters",
+            "Effect": "Allow",
+            "Action": "kafka:RebootBroker",
+            "Resource": "arn:aws:kafka:*:*:cluster/*/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        }
+    ]
+}

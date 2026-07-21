@@ -1,0 +1,181 @@
+description: "Reboot an Amazon MSK broker to test cluster resilience, then monitor recovery until the cluster returns to ACTIVE."
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  tagKey:
+    type: String
+    description: "Tag key used to identify the MSK cluster to target"
+    default: "FIS-Ready"
+  tagValue:
+    type: String
+    description: "Tag value used to identify the MSK cluster to target"
+    default: "True"
+  brokerSelection:
+    type: String
+    description: "Which broker to reboot: a specific broker ID (e.g. '1') or 'random' to pick one of the cluster's brokers"
+    default: "random"
+    allowedPattern: "^(random|[0-9]{1,4})$"
+  region:
+    type: String
+    description: "AWS Region of the MSK cluster"
+    default: "{{global:REGION}}"
+  AutomationAssumeRole:
+    type: String
+    description: "IAM role for the automation execution"
+    default: ""
+
+mainSteps:
+  - name: rebootBroker
+    action: aws:executeScript
+    description: "Discover the tagged MSK cluster and reboot a single broker"
+    onFailure: Abort
+    timeoutSeconds: 300
+    inputs:
+      Runtime: python3.11
+      Handler: reboot_broker
+      Script: |
+        import boto3
+
+        def reboot_broker(events, context):
+            region = events["region"]
+            tag_key = events["tagKey"]
+            tag_value = events["tagValue"]
+            broker_selection = str(events["brokerSelection"])
+
+            kafka = boto3.client("kafka", region_name=region)
+
+            # Discover the first ACTIVE, PROVISIONED cluster carrying the target tag.
+            target_arn = None
+            paginator = kafka.get_paginator("list_clusters_v2")
+            for page in paginator.paginate():
+                for cluster in page["ClusterInfoList"]:
+                    if cluster.get("State") != "ACTIVE":
+                        continue
+                    if cluster.get("ClusterType") != "PROVISIONED":
+                        continue
+                    tags = cluster.get("Tags", {})
+                    if tags.get(tag_key) == tag_value:
+                        target_arn = cluster["ClusterArn"]
+                        break
+                if target_arn:
+                    break
+
+            if not target_arn:
+                raise ValueError(
+                    "No ACTIVE provisioned MSK cluster found with tag {}={}".format(tag_key, tag_value)
+                )
+
+            # Determine the broker to reboot. RebootBroker accepts exactly one broker ID.
+            node_ids = []
+            node_paginator = kafka.get_paginator("list_nodes")
+            for page in node_paginator.paginate(ClusterArn=target_arn):
+                for node in page["NodeInfoList"]:
+                    broker_info = node.get("BrokerNodeInfo")
+                    if broker_info and "BrokerId" in broker_info:
+                        node_ids.append(str(int(broker_info["BrokerId"])))
+
+            if not node_ids:
+                raise ValueError("No broker nodes found for cluster {}".format(target_arn))
+
+            if broker_selection == "random":
+                # Deterministic, dependency-free choice: lowest broker ID.
+                broker_id = sorted(node_ids, key=lambda x: int(x))[0]
+            else:
+                if broker_selection not in node_ids:
+                    raise ValueError(
+                        "Requested broker {} not in cluster brokers {}".format(broker_selection, node_ids)
+                    )
+                broker_id = broker_selection
+
+            response = kafka.reboot_broker(ClusterArn=target_arn, BrokerIds=[broker_id])
+
+            return {
+                "ClusterArn": target_arn,
+                "BrokerId": broker_id,
+                "ClusterOperationArn": response["ClusterOperationArn"],
+            }
+      InputPayload:
+        region: "{{ region }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+        brokerSelection: "{{ brokerSelection }}"
+    outputs:
+      - Name: ClusterArn
+        Selector: $.Payload.ClusterArn
+        Type: String
+      - Name: BrokerId
+        Selector: $.Payload.BrokerId
+        Type: String
+      - Name: ClusterOperationArn
+        Selector: $.Payload.ClusterOperationArn
+        Type: String
+    nextStep: monitorRecovery
+
+  - name: monitorRecovery
+    action: aws:executeScript
+    description: "Poll the reboot operation until it reaches a terminal state and the cluster is ACTIVE"
+    onFailure: Abort
+    timeoutSeconds: 600
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: monitor_recovery
+      Script: |
+        import boto3
+        import time
+
+        def monitor_recovery(events, context):
+            region = events["region"]
+            cluster_arn = events["ClusterArn"]
+            operation_arn = events["ClusterOperationArn"]
+            broker_id = events["BrokerId"]
+
+            kafka = boto3.client("kafka", region_name=region)
+
+            # The aws:executeScript runtime enforces a hard 600s handler timeout,
+            # so keep the total wait safely below that.
+            max_wait_time = 540
+            check_interval = 15
+            elapsed = 0
+
+            while elapsed < max_wait_time:
+                op = kafka.describe_cluster_operation(ClusterOperationArn=operation_arn)
+                state = op["ClusterOperationInfo"]["OperationState"]
+
+                # MSK reboot operations terminate in REBOOT_COMPLETE; treat any
+                # *_COMPLETE state as success and any *_FAILED state as failure.
+                if state.endswith("COMPLETE"):
+                    cluster = kafka.describe_cluster_v2(ClusterArn=cluster_arn)
+                    cluster_state = cluster["ClusterInfo"]["State"]
+                    return {
+                        "Status": "RECOVERED",
+                        "BrokerId": broker_id,
+                        "OperationState": state,
+                        "ClusterState": cluster_state,
+                        "RecoverySeconds": elapsed,
+                    }
+                if state.endswith("FAILED"):
+                    raise RuntimeError(
+                        "Broker {} reboot operation reported state {}".format(broker_id, state)
+                    )
+
+                time.sleep(check_interval)
+                elapsed += check_interval
+
+            raise RuntimeError(
+                "Broker {} reboot did not reach a terminal state within {} seconds".format(
+                    broker_id, max_wait_time
+                )
+            )
+      InputPayload:
+        region: "{{ region }}"
+        ClusterArn: "{{ rebootBroker.ClusterArn }}"
+        ClusterOperationArn: "{{ rebootBroker.ClusterOperationArn }}"
+        BrokerId: "{{ rebootBroker.BrokerId }}"
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+      - Name: RecoverySeconds
+        Selector: $.Payload.RecoverySeconds
+        Type: Integer
