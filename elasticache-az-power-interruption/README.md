@@ -14,7 +14,7 @@ When power is interrupted to all ElastiCache nodes in a target Availability Zone
 * Applications handle primary endpoint changes gracefully without manual intervention
 * Connection pool retry and reconnect logic functions correctly during AZ-level disruption
 * Cluster behavior under reduced replica capacity while an AZ remains impaired
-* CloudWatch alarms detect `ReplicationLag` spikes and `IsPrimary` role changes as expected
+* CloudWatch alarms detect `ReplicationLag` spikes and `IsMaster` role changes as expected
 
 ## Prerequisites
 
@@ -39,7 +39,7 @@ The experiment follows this sequence:
 3. **Reduced Capacity**: Replica replacements in the impaired AZ are blocked for the experiment duration (`PT10M` by default).
 4. **Recovery**: After the experiment ends, the impaired AZ is restored and nodes rejoin the replication group.
 
-> **Note**: Resource targeting for this action supports only `resourceTags`. The `resourceArns` and `filters` selection modes are not supported.
+> **Note**: Resource targeting for this action supports `resourceTags` and `filters`. Targeting by `resourceArns` is not supported and is rejected at template creation time.
 
 To verify the experiment is working, monitor the primary node role change:
 
@@ -66,7 +66,7 @@ As you adapt this scenario to your needs, we recommend:
 1. Reviewing the tag names you use to ensure they fit your specific use case.
 2. Updating `<YOUR AVAILABILITY ZONE>` to match the AZ where your primary node typically runs.
 3. Identifying business metrics tied to your cache layer, such as cache hit rates, connection counts, and application response times.
-4. Creating Amazon CloudWatch alarms on `ReplicationLag`, `IsPrimary`, and `CurrConnections` metrics to monitor failover impact.
+4. Creating Amazon CloudWatch alarms on `ReplicationLag`, `IsMaster`, and `CurrConnections` metrics to monitor failover impact.
 5. Adding a stop condition tied to a critical business alarm to automatically halt the experiment if needed.
 6. Verifying your application uses the **primary endpoint** (not node-specific endpoints) so it can reconnect after a role change.
 7. Testing your connection pool retry logic and reconnect timeout configuration.
