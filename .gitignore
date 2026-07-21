@@ -12,3 +12,5 @@ samconfig.toml
 .cdk.staging
 cdk.out
 .idea/
+
+test_harnesses/

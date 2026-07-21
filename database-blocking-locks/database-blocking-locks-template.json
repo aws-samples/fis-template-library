@@ -1,0 +1,29 @@
+{
+    "description": "Database Blocking Locks - Injects row-level blocking locks (single blocker, N waiters) into an RDS or Aurora database to rehearse detection, diagnosis, and recovery of blocking-lock incidents",
+    "targets": {},
+    "actions": {
+        "InjectBlockingLocks": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Inject row-level blocking locks against the target database",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DatabaseBlockingLocks-Automation",
+                "documentParameters": "{\"DatabaseEngine\":\"postgres\",\"DatabaseEndpoint\":\"<YOUR DATABASE ENDPOINT>\",\"DatabasePort\":\"5432\",\"DatabaseName\":\"postgres\",\"DatabaseUser\":\"postgres\",\"DatabasePasswordSecretArn\":\"<YOUR SECRET ARN>\",\"WaiterCount\":\"50\",\"ExperimentDuration\":\"PT10M\",\"RampTime\":\"PT1M\",\"RampSteps\":\"10\",\"VpcId\":\"<YOUR VPC ID>\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"DatabaseSecurityGroupId\":\"<YOUR DATABASE SECURITY GROUP ID>\",\"InstanceType\":\"t3.small\",\"TargetTableName\":\"fis_blocking_locks_target\"}",
+                "maxDuration": "PT180M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/DatabaseBlockingLocks-FIS-Role",
+    "tags": {
+        "Name": "database-blocking-locks",
+        "ExperimentType": "DatabaseBlockingLocks"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

@@ -1,0 +1,1422 @@
+schemaVersion: '0.3'
+description: 'Create load generator and inject blocking locks'
+assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/DatabaseBlockingLocks-SSM-Automation-Role'
+
+parameters:
+  DatabaseEngine:
+    type: String
+    description: 'Database engine type'
+    default: 'postgres'
+    allowedValues:
+      - postgres
+      - mysql
+      - sqlserver
+
+  DatabaseEndpoint:
+    type: String
+    description: 'Database endpoint hostname'
+
+  DatabasePort:
+    type: String
+    description: 'Database port number'
+    default: '5432'
+
+  DatabaseName:
+    type: String
+    description: 'User database the harness connects to. Must be a database the master user can create tables in (Synthetic_Mode creates fis_blocking_locks_target inside it). Do not target engine-managed system schemas (mysql, master). Default postgres works for RDS/Aurora PostgreSQL only; create a user database such as fis_test for MySQL or SQL Server.'
+    default: 'postgres'
+
+  DatabaseUser:
+    type: String
+    description: 'Database username'
+    default: 'postgres'
+
+  DatabasePasswordSecretArn:
+    type: String
+    description: 'ARN of Secrets Manager secret containing database password'
+
+  WaiterCount:
+    type: String
+    description: 'Total number of Waiter sessions to ramp to'
+    default: '50'
+
+  ExperimentDuration:
+    type: String
+    description: 'Total experiment duration in ISO8601 format (e.g., PT10M for 10 minutes, PT1H for 1 hour). Controls how long the Blocker holds the row lock.'
+    default: 'PT10M'
+
+  RampTime:
+    type: String
+    description: 'Time to ramp up to WaiterCount in ISO8601 format (e.g., PT1M for 1 minute, PT30S for 30 seconds, PT0S for immediate)'
+    default: 'PT1M'
+
+  RampSteps:
+    type: String
+    description: 'Number of steps to reach WaiterCount (e.g., 2=50% then 100%, 10=10% increments)'
+    default: '10'
+
+  VpcId:
+    type: String
+    description: 'VPC ID where the load generator will be launched'
+
+  SubnetId:
+    type: String
+    description: 'Subnet ID for load generator instance'
+
+  DatabaseSecurityGroupId:
+    type: String
+    description: 'Security group ID of the target database (for creating ingress rule)'
+
+  InstanceType:
+    type: String
+    description: 'EC2 instance type'
+    default: 't3.small'
+
+  LatestAmiId:
+    type: String
+    description: 'Amazon Linux 2023 AMI ID'
+    default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+
+  TargetTableName:
+    type: String
+    description: 'Target table for blocking locks'
+    default: 'fis_blocking_locks_target'
+
+mainSteps:
+  - name: CreateSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: CreateSecurityGroup
+      GroupName: 'FIS-DatabaseBlockingLocks-LoadGen-{{ automation:EXECUTION_ID }}'
+      Description: 'FIS database blocking locks experiment'
+      VpcId: '{{ VpcId }}'
+      TagSpecifications:
+        - ResourceType: 'security-group'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-DatabaseBlockingLocks-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseBlockingLocks'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: SecurityGroupId
+        Selector: '$.GroupId'
+        Type: String
+
+  - name: AuthorizeOutboundToDatabase
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_egress
+      Script: |
+        import boto3
+
+        def authorize_egress(events, context):
+            ec2 = boto3.client('ec2')
+
+            security_group_id = events['SecurityGroupId']
+            database_sg_id = events['DatabaseSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            response = ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': database_sg_id,
+                        'Description': 'Allow outbound to database'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        SecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: AuthorizeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_ingress
+      Script: |
+        import boto3
+
+        def authorize_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            response = ec2.authorize_security_group_ingress(
+                GroupId=database_sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': load_gen_sg_id,
+                        'Description': 'Allow inbound from FIS load generator'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: LaunchLoadGenerator
+    action: 'aws:runInstances'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      ImageId: '{{ LatestAmiId }}'
+      InstanceType: '{{ InstanceType }}'
+      MinInstanceCount: 1
+      MaxInstanceCount: 1
+      SubnetId: '{{ SubnetId }}'
+      SecurityGroupIds:
+        - '{{ CreateSecurityGroup.SecurityGroupId }}'
+      IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
+      TagSpecifications:
+        - ResourceType: 'instance'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-DatabaseBlockingLocks-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseBlockingLocks'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: InstanceId
+        Selector: '$.InstanceIds[0]'
+        Type: String
+
+  - name: WaitForSSMAgent
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.InstanceInformationList[0].PingStatus'
+      DesiredValues:
+        - Online
+
+  - name: InstallDatabaseClient
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            ENGINE="{{ DatabaseEngine }}"
+
+            echo "Installing database client for engine: $ENGINE"
+
+            if [ "$ENGINE" = "postgres" ]; then
+                # Install PostgreSQL client and Python PostgreSQL library
+                dnf install -y postgresql15 python3-pip
+                pip3 install psycopg2-binary
+                echo "PostgreSQL client installed"
+
+            elif [ "$ENGINE" = "mysql" ]; then
+                # Install MariaDB client (MySQL-compatible) and Python MySQL library
+                dnf install -y mariadb105 python3-pip
+                pip3 install mysql-connector-python
+                echo "MySQL client installed"
+
+            elif [ "$ENGINE" = "sqlserver" ]; then
+                # Install SQL Server tools and Python SQL Server library
+                curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
+                ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
+                pip3 install pyodbc
+                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+                source ~/.bashrc
+                echo "SQL Server tools installed"
+            else
+                echo "Unsupported database engine: $ENGINE"
+                exit 1
+            fi
+
+            # Install AWS CLI and boto3 for Secrets Manager access
+            dnf install -y aws-cli
+            pip3 install boto3
+
+            echo "Installation complete"
+
+  - name: InjectBlockingLocks
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 14400
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            # Write the blocking-locks harness to a local file.
+            cat > /tmp/blocking_locks_harness.py << 'PYTHON_EOF'
+            import json
+            import sys
+            import threading
+            import time
+            import traceback
+            from collections import namedtuple
+            from typing import Any, List, Optional, Tuple
+            import boto3
+
+            DEFAULT_SYNTHETIC_TABLE = "fis_blocking_locks_target"
+
+            TargetSpec = namedtuple(
+                "TargetSpec",
+                ["qualified_ref", "pk_columns", "pk_values", "created_table"],
+            )
+
+            def is_real_mode(target_table_name: str) -> bool:
+                return target_table_name != DEFAULT_SYNTHETIC_TABLE
+
+            def quote_identifier(engine: str, name: str) -> str:
+                if engine == "postgres":
+                    return '"' + name.replace('"', '""') + '"'
+                if engine == "mysql":
+                    return "`" + name.replace("`", "``") + "`"
+                if engine == "sqlserver":
+                    return "[" + name.replace("]", "]]") + "]"
+                raise ValueError("unsupported engine: %r" % engine)
+
+            def parse_qualified_table_name(engine: str, name: str) -> Tuple[Optional[str], str]:
+                if engine == "sqlserver":
+                    if "." in name:
+                        schema, table = name.split(".", 1)
+                        return (schema, table)
+                    return ("dbo", name)
+                return (None, name)
+
+            def build_quoted_table_ref(engine: str, schema: Optional[str], table: str) -> str:
+                if engine == "sqlserver":
+                    return (quote_identifier("sqlserver", schema) + "."
+                            + quote_identifier("sqlserver", table))
+                return quote_identifier(engine, table)
+
+            def build_pk_where_clause(engine: str, pk_columns: List[str]) -> str:
+                marker = "?" if engine == "sqlserver" else "%s"
+                quoted = [quote_identifier(engine, c) for c in pk_columns]
+                return " AND ".join("%s = %s" % (col, marker) for col in quoted)
+
+            def build_lock_query(engine: str, qualified_table_ref: str,
+                                 pk_columns: List[str]) -> str:
+                quoted_cols = ", ".join(quote_identifier(engine, c) for c in pk_columns)
+                where_clause = build_pk_where_clause(engine, pk_columns)
+                if engine == "sqlserver":
+                    return ("SELECT " + quoted_cols + " FROM " + qualified_table_ref
+                            + " WITH (UPDLOCK, HOLDLOCK) WHERE " + where_clause)
+                return ("SELECT " + quoted_cols + " FROM " + qualified_table_ref
+                        + " WHERE " + where_clause + " FOR UPDATE")
+
+            class BlockingLocksHarness:
+                """
+                Single-Blocker / N-Waiter row-lock contention harness.
+                """
+
+                TABLE_NAME = DEFAULT_SYNTHETIC_TABLE
+
+                _REAL_MODE_VALIDATION_DEADLINE_S = 10
+
+                def __init__(
+                    self,
+                    engine: str,
+                    endpoint: str,
+                    port: int,
+                    dbname: str,
+                    user: str,
+                    password: str,
+                    waiter_count: int,
+                    experiment_duration_s: int,
+                    ramp_time_s: int,
+                    ramp_steps: int,
+                    target_table_name: str,
+                ) -> None:
+                    # ``target_table_name`` from SSM: equal to
+                    # ``DEFAULT_SYNTHETIC_TABLE`` → Synthetic_Mode, else
+                    # Real_Mode.
+                    self.engine = engine
+                    self.endpoint = endpoint
+                    self.port = port
+                    self.dbname = dbname
+                    self.user = user
+                    self.password = password
+                    self.waiter_count = waiter_count
+                    self.experiment_duration_s = experiment_duration_s
+                    self.ramp_time_s = ramp_time_s
+                    self.ramp_steps = ramp_steps
+                    self.target_table_name = target_table_name
+
+                    self._created_table = False
+                    self._waiter_threads: List[threading.Thread] = []
+                    self._blocker_terminated_early = False
+
+                @staticmethod
+                def parse_iso8601_duration(duration: str, allow_zero: bool = False) -> int:
+                    """
+                    Parse an ISO 8601 duration of the PT[nH][nM][nS] form into seconds.
+                    Rejects malformed durations like 'PT10' (missing unit suffix)
+                    to prevent silent zero-second experiments.
+                    """
+                    if not duration or not duration.startswith("PT"):
+                        raise ValueError(
+                            "Duration must be an ISO 8601 PT-form string "
+                            "(e.g. PT10M, PT1H, PT30S), got: %r" % (duration,)
+                        )
+                    remaining = duration[2:]
+                    if not remaining:
+                        raise ValueError(
+                            "Duration 'PT' has no time component. "
+                            "Expected PT[nH][nM][nS] (e.g. PT10M), got: %r" % (duration,)
+                        )
+                    if remaining.isdigit():
+                        raise ValueError(
+                            "Duration %r has digits but no unit suffix (H, M, or S). "
+                            "Did you mean 'PT%sM' or 'PT%sS'?" % (duration, remaining, remaining)
+                        )
+                    seconds = 0
+                    if "H" in remaining:
+                        hours_str, remaining = remaining.split("H", 1)
+                        seconds += int(hours_str) * 3600
+                    if "M" in remaining:
+                        minutes_str, remaining = remaining.split("M", 1)
+                        seconds += int(minutes_str) * 60
+                    if "S" in remaining:
+                        secs_str = remaining.replace("S", "")
+                        if secs_str:
+                            seconds += int(secs_str)
+                    if seconds <= 0 and not allow_zero:
+                        raise ValueError(
+                            "Duration must be > 0 seconds (got %r = %d seconds). "
+                            "A zero-duration experiment injects no fault." % (duration, seconds)
+                        )
+                    return seconds
+
+                @staticmethod
+                def compute_ramp_schedule(
+                    waiter_count: int,
+                    ramp_steps: int,
+                    ramp_time_seconds: int,
+                    experiment_duration_seconds: int,
+                ) -> List[Tuple[int, int]]:
+                    """
+                    Compute the Waiter ramp schedule as (wait_before_s, waiters_to_start) tuples.
+                    """
+                    if waiter_count <= 0:
+                        return []
+
+                    if ramp_time_seconds > experiment_duration_seconds:
+                        ramp_time_seconds = experiment_duration_seconds
+
+                    if ramp_time_seconds <= 0 or ramp_steps <= 0:
+                        return [(0, waiter_count)]
+
+                    effective_steps = min(ramp_steps, waiter_count)
+                    if effective_steps <= 1:
+                        return [(0, waiter_count)]
+
+                    per_step = waiter_count // effective_steps
+                    remainder = waiter_count - per_step * effective_steps
+
+                    step_delay = ramp_time_seconds // effective_steps
+                    if step_delay <= 0:
+                        step_delay = 1
+
+                    schedule: List[Tuple[int, int]] = []
+                    for step_idx in range(effective_steps):
+                        wait_before = 0 if step_idx == 0 else step_delay
+                        waiters_this_step = per_step
+                        if step_idx == effective_steps - 1:
+                            waiters_this_step += remainder
+                        schedule.append((wait_before, waiters_this_step))
+
+                    assert sum(n for _, n in schedule) == waiter_count, (
+                        "compute_ramp_schedule invariant violated: "
+                        "sum(waiters_to_start)=%d != waiter_count=%d"
+                        % (sum(n for _, n in schedule), waiter_count)
+                    )
+                    return schedule
+
+                @staticmethod
+                def get_password(secret_arn: str, region: str) -> str:
+                    """
+                    Fetch the database password from Secrets Manager.
+                    """
+                    try:
+                        client = boto3.client("secretsmanager", region_name=region)
+                        response = client.get_secret_value(SecretId=secret_arn)
+                    except Exception as exc:  # noqa: BLE001 - broad by design
+                        sys.stderr.write("ERROR: SecretsManager get failed (SecretId=%s): %s: %s\n" % (secret_arn, type(exc).__name__, str(exc)))
+                        sys.exit(2)
+
+                    secret_string = response.get("SecretString")
+                    if secret_string is None:
+                        sys.stderr.write("ERROR: Secrets Manager response for SecretId=%s has no SecretString (binary secrets unsupported).\n" % (secret_arn,))
+                        sys.exit(2)
+
+                    try:
+                        parsed = json.loads(secret_string)
+                    except (ValueError, TypeError):
+                        return secret_string
+
+                    if isinstance(parsed, dict) and "password" in parsed:
+                        return parsed["password"]
+                    return secret_string
+
+                def _connect(self):
+                    """
+                    Open a new connection to the target database with autocommit off.
+                    """
+                    engine = self.engine
+                    try:
+                        if engine == "postgres":
+                            import psycopg2
+                            conn = psycopg2.connect(
+                                host=self.endpoint,
+                                port=self.port,
+                                database=self.dbname,
+                                user=self.user,
+                                password=self.password,
+                                connect_timeout=10,
+                            )
+                            conn.autocommit = False
+                            return conn
+                        if engine == "mysql":
+                            import mysql.connector
+                            conn = mysql.connector.connect(
+                                host=self.endpoint,
+                                port=self.port,
+                                database=self.dbname,
+                                user=self.user,
+                                password=self.password,
+                                connection_timeout=10,
+                                autocommit=False,
+                            )
+                            return conn
+                        if engine == "sqlserver":
+                            import pyodbc
+                            conn_str = (
+                                "DRIVER={ODBC Driver 18 for SQL Server};"
+                                "SERVER=%s,%d;DATABASE=%s;UID=%s;PWD=%s;"
+                                "TrustServerCertificate=yes"
+                                % (self.endpoint, self.port, self.dbname, self.user, self.password)
+                            )
+                            conn = pyodbc.connect(conn_str, timeout=10, autocommit=False)
+                            return conn
+                    except Exception as exc:  # noqa: BLE001
+                        sys.stderr.write("ERROR: connect failed to %s at %s:%d db=%s as %s: %s: %s\n" % (engine, self.endpoint, self.port, self.dbname, self.user, type(exc).__name__, str(exc)))
+                        sys.exit(3)
+
+                    sys.stderr.write("ERROR: Unsupported DatabaseEngine %r. Expected one of: postgres, mysql, sqlserver.\n" % (engine,))
+                    sys.exit(4)
+
+                def _connection_closed_exceptions(self) -> Tuple[type, ...]:
+                    """Return the tuple of exception classes that indicate the server has
+                    closed/aborted the connection or transaction for this engine."""
+                    if self.engine == "postgres":
+                        import psycopg2
+                        return (psycopg2.InterfaceError, psycopg2.OperationalError)
+                    if self.engine == "mysql":
+                        import mysql.connector
+                        return (
+                            mysql.connector.errors.OperationalError,
+                            mysql.connector.errors.InterfaceError,
+                        )
+                    if self.engine == "sqlserver":
+                        import pyodbc
+                        return (pyodbc.Error,)
+                    return ()
+
+                # ----- Target table lifecycle ----------------------------------------
+
+                def _table_exists(self, cursor) -> bool:
+                    engine = self.engine
+                    if engine == "postgres":
+                        cursor.execute(
+                            "SELECT 1 FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() "
+                            "AND table_name = %s", (self.TABLE_NAME,),
+                        )
+                        return cursor.fetchone() is not None
+                    if engine == "mysql":
+                        cursor.execute(
+                            "SELECT 1 FROM information_schema.tables "
+                            "WHERE table_schema = DATABASE() AND table_name = %s",
+                            (self.TABLE_NAME,),
+                        )
+                        return cursor.fetchone() is not None
+                    if engine == "sqlserver":
+                        cursor.execute(
+                            "SELECT 1 WHERE OBJECT_ID(?, 'U') IS NOT NULL",
+                            ("dbo." + self.TABLE_NAME,),
+                        )
+                        return cursor.fetchone() is not None
+                    return False
+
+                def ensure_table(self, conn) -> bool:
+                    """
+                    Create ``fis_blocking_locks_target`` if absent and seed
+                    ``id = 1``.
+
+                    Returns True if this run created the table, False if a
+                    matching table was already present. The caller uses this
+                    flag to decide whether to drop the table on cleanup.
+                    """
+                    cursor = conn.cursor()
+                    try:
+                        existed = self._table_exists(cursor)
+                        if self.engine == "postgres":
+                            cursor.execute(
+                                "CREATE TABLE IF NOT EXISTS " + self.TABLE_NAME +
+                                " (id INTEGER PRIMARY KEY)"
+                            )
+                            cursor.execute(
+                                "INSERT INTO " + self.TABLE_NAME +
+                                " (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
+                            )
+                        elif self.engine == "mysql":
+                            cursor.execute(
+                                "CREATE TABLE IF NOT EXISTS " + self.TABLE_NAME +
+                                " (id INT PRIMARY KEY)"
+                                " ENGINE=InnoDB"
+                            )
+                            cursor.execute(
+                                "INSERT IGNORE INTO " + self.TABLE_NAME +
+                                " (id) VALUES (1)"
+                            )
+                        elif self.engine == "sqlserver":
+                            cursor.execute(
+                                "IF OBJECT_ID('dbo." + self.TABLE_NAME + "', 'U') IS NULL "
+                                "CREATE TABLE dbo." + self.TABLE_NAME +
+                                " (id INT PRIMARY KEY)"
+                            )
+                            cursor.execute(
+                                "IF NOT EXISTS (SELECT 1 FROM dbo." + self.TABLE_NAME +
+                                " WHERE id = 1) "
+                                "INSERT INTO dbo." + self.TABLE_NAME +
+                                " (id) VALUES (1)"
+                            )
+                        conn.commit()
+                        return not existed
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                def _drop_table(self) -> None:
+                    """Best-effort DROP TABLE on a fresh connection."""
+                    try:
+                        conn = self._connect()
+                    except SystemExit:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        print("WARN: cleanup connection failed: %s: %s" % (type(exc).__name__, str(exc)))
+                        return
+                    try:
+                        cursor = conn.cursor()
+                        try:
+                            if self.engine == "sqlserver":
+                                cursor.execute(
+                                    "IF OBJECT_ID('dbo." + self.TABLE_NAME + "', 'U') "
+                                    "IS NOT NULL DROP TABLE dbo." + self.TABLE_NAME
+                                )
+                            else:
+                                cursor.execute("DROP TABLE IF EXISTS " + self.TABLE_NAME)
+                            conn.commit()
+                            print("Dropped %s" % self.TABLE_NAME)
+                        finally:
+                            try:
+                                cursor.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    except Exception as exc:  # noqa: BLE001
+                        print("WARN: DROP TABLE %s failed: %s: %s" % (self.TABLE_NAME, type(exc).__name__, str(exc)))
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                @staticmethod
+                def _is_relation_missing_error(engine: str, exc: BaseException) -> bool:
+                    """Heuristically detect 'relation does not exist' errors per engine."""
+                    msg = str(exc).lower()
+                    if engine == "postgres":
+                        return "does not exist" in msg
+                    if engine == "mysql":
+                        return "doesn't exist" in msg or "does not exist" in msg
+                    if engine == "sqlserver":
+                        return "invalid object name" in msg
+                    return False
+
+                @staticmethod
+                def _is_permission_denied_error(engine: str, exc: BaseException) -> bool:
+                    """Heuristically detect 'permission denied / access denied' per engine."""
+                    msg = str(exc).lower()
+                    if engine == "postgres":
+                        return "permission denied" in msg
+                    if engine == "mysql":
+                        return ("command denied" in msg
+                                or "access denied" in msg
+                                or "permission denied" in msg)
+                    if engine == "sqlserver":
+                        return ("permission was denied" in msg
+                                or "permission denied" in msg)
+                    return False
+
+                def _validate_target_table(
+                    self, conn, qualified_table_ref: str,
+                ) -> None:
+                    """
+                    Probe existence + SELECT-permission and non-emptiness.
+                    """
+                    deadline_s = self._REAL_MODE_VALIDATION_DEADLINE_S
+                    start = time.monotonic()
+
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            cursor.execute(
+                                "SELECT 1 FROM " + qualified_table_ref
+                                + " WHERE 1=0"
+                            )
+                            cursor.fetchall()
+                        except Exception as exc:  # noqa: BLE001
+                            if self._is_relation_missing_error(self.engine, exc):
+                                sys.stderr.write("ERROR: table %s missing in db %s on %s:%d (engine=%s): %s: %s\n" % (qualified_table_ref, self.dbname, self.endpoint, self.port, self.engine, type(exc).__name__, str(exc)))
+                                sys.exit(20)
+                            if self._is_permission_denied_error(self.engine, exc):
+                                sys.stderr.write("ERROR: SELECT denied on %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
+                                sys.exit(24)
+                            sys.stderr.write("ERROR: existence probe failed for %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
+                            sys.exit(24)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            if self.engine == "sqlserver":
+                                cursor.execute(
+                                    "SELECT TOP 1 1 FROM " + qualified_table_ref
+                                )
+                            else:
+                                cursor.execute(
+                                    "SELECT 1 FROM " + qualified_table_ref
+                                    + " LIMIT 1"
+                                )
+                            row = cursor.fetchone()
+                        except Exception as exc:  # noqa: BLE001
+                            if self._is_permission_denied_error(self.engine, exc):
+                                sys.stderr.write("ERROR: SELECT denied on %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
+                                sys.exit(24)
+                            sys.stderr.write("ERROR: non-empty probe failed for %s (engine=%s): %s: %s\n" % (qualified_table_ref, self.engine, type(exc).__name__, str(exc)))
+                            sys.exit(24)
+                        if row is None:
+                            sys.stderr.write("ERROR: table %s empty; cannot select row (engine=%s).\n" % (qualified_table_ref, self.engine))
+                            sys.exit(21)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    elapsed = time.monotonic() - start
+                    if elapsed > deadline_s:
+                        sys.stderr.write("ERROR: pre-flight exceeded %.1fs deadline on %s (engine=%s); elapsed %.2fs.\n" % (deadline_s, qualified_table_ref, self.engine, elapsed))
+                        sys.exit(22)
+
+                def _introspect_primary_key(
+                    self, conn, schema: Optional[str], table: str,
+                ) -> List[str]:
+                    """
+                    Discover ordered primary-key column names for the target table.
+                    """
+                    engine = self.engine
+                    if engine == "postgres":
+                        sql = (
+                            "SELECT kcu.column_name, kcu.ordinal_position "
+                            "FROM information_schema.table_constraints tc "
+                            "JOIN information_schema.key_column_usage kcu "
+                            "  ON tc.constraint_name = kcu.constraint_name "
+                            " AND tc.table_schema = kcu.table_schema "
+                            " AND tc.table_name = kcu.table_name "
+                            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                            "  AND tc.table_name = %s "
+                            "ORDER BY kcu.ordinal_position"
+                        )
+                        params = (table,)
+                        metadata_views = (
+                            "information_schema.table_constraints, "
+                            "information_schema.key_column_usage"
+                        )
+                    elif engine == "mysql":
+                        sql = (
+                            "SELECT kcu.column_name, kcu.ordinal_position "
+                            "FROM information_schema.table_constraints tc "
+                            "JOIN information_schema.key_column_usage kcu "
+                            "  ON tc.constraint_schema = kcu.constraint_schema "
+                            " AND tc.constraint_name = kcu.constraint_name "
+                            " AND tc.table_schema = kcu.table_schema "
+                            " AND tc.table_name = kcu.table_name "
+                            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                            "  AND tc.table_schema = DATABASE() "
+                            "  AND tc.table_name = %s "
+                            "ORDER BY kcu.ordinal_position"
+                        )
+                        params = (table,)
+                        metadata_views = (
+                            "information_schema.table_constraints, "
+                            "information_schema.key_column_usage"
+                        )
+                    elif engine == "sqlserver":
+                        sql = (
+                            "SELECT c.name AS column_name, ic.key_ordinal "
+                            "FROM sys.indexes i "
+                            "JOIN sys.index_columns ic "
+                            "  ON i.object_id = ic.object_id "
+                            " AND i.index_id = ic.index_id "
+                            "JOIN sys.columns c "
+                            "  ON ic.object_id = c.object_id "
+                            " AND ic.column_id = c.column_id "
+                            "WHERE i.is_primary_key = 1 "
+                            "  AND i.object_id = OBJECT_ID(?) "
+                            "ORDER BY ic.key_ordinal"
+                        )
+
+                        if schema:
+                            params = (schema + "." + table,)
+                        else:
+                            params = (table,)
+                        metadata_views = (
+                            "sys.indexes, sys.index_columns, sys.columns"
+                        )
+                    else:
+                        sys.stderr.write("ERROR: Unsupported DatabaseEngine %r for Real_Mode introspection.\n" % (engine,))
+                        sys.exit(4)
+
+                    qualified = (schema + "." + table) if schema else table
+
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            cursor.execute(sql, params)
+                            rows = cursor.fetchall()
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write("ERROR: PK introspection failed for %s (engine=%s): %s: %s. Verify %s has SELECT on %s.\n" % (qualified, engine, type(exc).__name__, str(exc), self.user, metadata_views))
+                            sys.exit(24)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if not rows:
+                        sys.stderr.write("ERROR: table %s has no PK; Real_Mode requires one (engine=%s).\n" % (qualified, engine))
+                        sys.exit(23)
+
+                    return [str(row[0]) for row in rows]
+
+                def _select_target_row(
+                    self, conn, qualified_table_ref: str,
+                    pk_columns: List[str],
+                ) -> Tuple:
+                    """
+                    Select the first row's PK values (ordered by PK ASC).
+                    """
+                    engine = self.engine
+                    quoted_cols = ", ".join(
+                        quote_identifier(engine, c) for c in pk_columns
+                    )
+                    if engine == "sqlserver":
+                        sql = (
+                            "SELECT TOP 1 " + quoted_cols + " FROM "
+                            + qualified_table_ref + " ORDER BY "
+                            + quoted_cols + " ASC"
+                        )
+                    else:
+                        sql = (
+                            "SELECT " + quoted_cols + " FROM "
+                            + qualified_table_ref + " ORDER BY "
+                            + quoted_cols + " ASC LIMIT 1"
+                        )
+
+                    cursor = conn.cursor()
+                    try:
+                        try:
+                            cursor.execute(sql)
+                            row = cursor.fetchone()
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write("ERROR: target-row select failed for %s (engine=%s): %s: %s\n" % (qualified_table_ref, engine, type(exc).__name__, str(exc)))
+                            sys.exit(24)
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if row is None:
+                        sys.stderr.write("ERROR: table %s empty; cannot select row (engine=%s).\n" % (qualified_table_ref, engine))
+                        sys.exit(21)
+
+                    return tuple(row)
+
+                def _acquire_blocker_lock(
+                    self, conn,
+                    lock_sql: str,
+                    pk_values: Tuple[Any, ...],
+                ) -> bool:
+                    """
+                    Acquire the Blocker's row-level exclusive lock.
+
+                    Always parameterised: ``lock_sql`` is built once by
+                    ``build_lock_query`` and ``pk_values`` are driver-bound at
+                    execute time so user-controlled values are never spliced
+                    into SQL. Returns False if the locking SELECT returned
+                    zero rows (target row deleted between selection and lock
+                    acquisition).
+                    """
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute(lock_sql, pk_values)
+                        row = cursor.fetchone()
+                        if row is None:
+                            return False
+                        try:
+                            cursor.fetchall()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return True
+                    finally:
+                        try:
+                            cursor.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                def _waiter_worker(
+                    self, waiter_id: int,
+                    lock_sql: str,
+                    pk_values: Tuple[Any, ...],
+                ) -> None:
+                    """
+                    Run a single Waiter session against the Blocker-held row.
+
+                    Always issues the engine-native row-level locking SELECT
+                    (`SELECT ... FOR UPDATE` on PostgreSQL/MySQL,
+                    `SELECT ... WITH (UPDLOCK, HOLDLOCK)` on SQL Server).
+                    Synthetic_Mode and Real_Mode share this exact same path;
+                    only the bound ``pk_values`` differ. Synthetic_Mode keeps
+                    the ``counter`` column on ``fis_blocking_locks_target`` for
+                    schema compatibility with the original requirement, but
+                    it is never mutated.
+                    """
+                    try:
+                        conn = self._connect()
+                    except SystemExit:
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        print("W%d connect fail: %s: %s" % (waiter_id, type(exc).__name__, str(exc)))
+                        return
+                    try:
+                        cursor = conn.cursor()
+                        try:
+                            cursor.execute(lock_sql, pk_values)
+                            try:
+                                cursor.fetchall()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            conn.commit()
+                        except Exception as exc:  # noqa: BLE001
+                            print("W%d locking SELECT/COMMIT fail: %s: %s" % (waiter_id, type(exc).__name__, str(exc)))
+                            try:
+                                conn.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        finally:
+                            try:
+                                cursor.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                def _ramp_waiters(
+                    self, schedule: List[Tuple[int, int]],
+                    lock_sql: str,
+                    pk_values: Tuple[Any, ...],
+                ) -> None:
+                    """
+                    Drive the Waiter ramp.
+                    """
+                    next_waiter_id = 1
+                    total_started = 0
+                    for step_idx, (wait_before, n) in enumerate(schedule, start=1):
+                        if wait_before > 0:
+                            time.sleep(wait_before)
+                        for _ in range(n):
+                            t = threading.Thread(
+                                target=self._waiter_worker,
+                                args=(next_waiter_id, lock_sql, pk_values),
+                                daemon=True,
+                            )
+                            t.start()
+                            self._waiter_threads.append(t)
+                            next_waiter_id += 1
+                            total_started += 1
+                        print("Ramp %d/%d: +%d waiter(s), total=%d/%d" % (step_idx, len(schedule), n, total_started, self.waiter_count))
+
+                def prepare_target(self) -> TargetSpec:
+                    """
+                    Resolve the experiment target into a single ``TargetSpec``.
+
+                    The only thing that differs between Synthetic_Mode and
+                    Real_Mode is *target preparation*: which table, which PK
+                    columns, which row, and whether cleanup will drop the
+                    table at the end. Everything downstream of this method
+                    runs the same in both modes.
+                    """
+                    if is_real_mode(self.target_table_name):
+                        return self._prepare_real_target()
+                    return self._prepare_synthetic_target()
+
+                def _prepare_synthetic_target(self) -> TargetSpec:
+                    """
+                    Synthetic_Mode preparation: ensure the experiment-owned
+                    ``fis_blocking_locks_target`` table exists with seed row
+                    ``id = 1``, and return a TargetSpec that points the rest
+                    of the harness at it. ``created_table`` is True only when
+                    this run created the table, so cleanup drops only what we
+                    made.
+                    """
+                    # SQL Server requires a two-part identifier so the lock
+                    # SQL emits [dbo].[fis_blocking_locks_target]. PostgreSQL
+                    # and MySQL use the connection's current schema/database,
+                    # so the schema component is None.
+                    schema = "dbo" if self.engine == "sqlserver" else None
+                    qualified_ref = build_quoted_table_ref(
+                        self.engine, schema, self.TABLE_NAME,
+                    )
+
+                    control_conn = self._connect()
+                    try:
+                        try:
+                            self._created_table = self.ensure_table(control_conn)
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write("ERROR: ensure_table failed for %s: %s: %s\n" % (self.TABLE_NAME, type(exc).__name__, str(exc)))
+                            sys.exit(6)
+                    finally:
+                        try:
+                            control_conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    if self._created_table:
+                        print("Created %s (will DROP on cleanup)" % self.TABLE_NAME)
+                    else:
+                        print("Reusing %s (will NOT drop on cleanup)" % self.TABLE_NAME)
+
+                    return TargetSpec(
+                        qualified_ref=qualified_ref,
+                        pk_columns=["id"],
+                        pk_values=(1,),
+                        created_table=self._created_table,
+                    )
+
+                def _prepare_real_target(self) -> TargetSpec:
+                    """
+                    Real_Mode preparation: validate the user-supplied table,
+                    introspect its primary key, and select the first row's PK
+                    values.
+                    """
+                    schema, table = parse_qualified_table_name(
+                        self.engine, self.target_table_name,
+                    )
+                    qualified_ref = build_quoted_table_ref(
+                        self.engine, schema, table,
+                    )
+                    print("Real_Mode: %s (%s)" % (qualified_ref, self.engine))
+
+                    control_conn = self._connect()
+                    try:
+                        self._validate_target_table(control_conn, qualified_ref)
+                        pk_columns = self._introspect_primary_key(
+                            control_conn, schema, table,
+                        )
+                        pk_values = self._select_target_row(
+                            control_conn, qualified_ref, pk_columns,
+                        )
+                    finally:
+                        try:
+                            control_conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    print("PK columns: %s" % (pk_columns,))
+                    print("Locking pk_values=%r" % (pk_values,))
+                    return TargetSpec(
+                        qualified_ref=qualified_ref,
+                        pk_columns=pk_columns,
+                        pk_values=pk_values,
+                        created_table=False,
+                    )
+
+                def run(self) -> None:
+                    """
+                    Mode-agnostic experiment driver.
+
+                    The flow is identical for Synthetic_Mode and Real_Mode
+                    """
+                    print("=== Blocking Locks Harness ===")
+                    print("Engine: %s" % self.engine)
+                    print("Endpoint: %s:%d Database: %s User: %s" % (self.endpoint, self.port, self.dbname, self.user))
+                    mode_label = (
+                        "Real_Mode" if is_real_mode(self.target_table_name)
+                        else "Synthetic_Mode"
+                    )
+                    print("Mode: %s TargetTableName: %s" % (mode_label, self.target_table_name))
+                    print("Waiters=%d Duration=%ds Ramp=%ds Steps=%d" % (self.waiter_count, self.experiment_duration_s, self.ramp_time_s, self.ramp_steps))
+
+                    target = self.prepare_target()
+
+                    lock_sql = build_lock_query(
+                        self.engine, target.qualified_ref, target.pk_columns,
+                    )
+                    print("Lock SQL: %s" % (lock_sql,))
+
+                    schedule = self._compute_clamped_schedule()
+                    print("Ramp schedule: %s" % (schedule,))
+
+                    self._run_experiment(target, lock_sql, schedule)
+
+                def _compute_clamped_schedule(self) -> List[Tuple[int, int]]:
+                    """
+                    Compute the Waiter ramp schedule, clamping ``ramp_time_s``
+                    to ``experiment_duration_s`` if it exceeds it (Requirement
+                    8.6).
+                    """
+                    effective_ramp_time = self.ramp_time_s
+                    if effective_ramp_time > self.experiment_duration_s:
+                        print("NOTE: RampTime %ds > Duration %ds; clamping." % (effective_ramp_time, self.experiment_duration_s))
+                        effective_ramp_time = self.experiment_duration_s
+                    return self.compute_ramp_schedule(
+                        self.waiter_count,
+                        self.ramp_steps,
+                        effective_ramp_time,
+                        self.experiment_duration_s,
+                    )
+
+                def _run_experiment(
+                    self, target: TargetSpec, lock_sql: str,
+                    schedule: List[Tuple[int, int]],
+                ) -> None:
+                    """
+                    Run the Blocker + ramp + liveness-loop + join.
+
+                    This is the single mode-agnostic experiment body. It
+                    receives a fully-resolved ``TargetSpec`` plus the lock
+                    SQL and schedule, and does not branch on mode.
+                    """
+                    def _drive_ramp() -> None:
+                        try:
+                            self._ramp_waiters(
+                                schedule,
+                                lock_sql=lock_sql,
+                                pk_values=target.pk_values,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print("Ramp failed: %s: %s" % (type(exc).__name__, str(exc)))
+
+                    ramp_thread = threading.Thread(target=_drive_ramp, daemon=True)
+
+                    blocker_conn = self._connect()
+                    blocker_start = time.monotonic()
+                    try:
+                        try:
+                            acquired = self._acquire_blocker_lock(
+                                blocker_conn,
+                                lock_sql=lock_sql,
+                                pk_values=target.pk_values,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            sys.stderr.write("ERROR: blocker lock failed on %s pk=%r (engine=%s): %s: %s\n" % (target.qualified_ref, target.pk_values, self.engine, type(exc).__name__, str(exc)))
+                            try:
+                                blocker_conn.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            try:
+                                blocker_conn.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            sys.exit(25 if is_real_mode(self.target_table_name) else 5)
+
+                        if not acquired:
+                            sys.stderr.write("ERROR: blocker lock failed on %s pk=%r; row deleted before lock acquired (engine=%s).\n" % (target.qualified_ref, target.pk_values, self.engine))
+                            try:
+                                blocker_conn.rollback()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            try:
+                                blocker_conn.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            sys.exit(25 if is_real_mode(self.target_table_name) else 5)
+
+                        print("Blocker locked %s pk=%r; holding %ds" % (target.qualified_ref, target.pk_values, self.experiment_duration_s))
+                        ramp_thread.start()
+
+                        liveness_exceptions = self._connection_closed_exceptions()
+                        chunk_seconds = 15
+                        deadline = blocker_start + self.experiment_duration_s
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            time.sleep(min(chunk_seconds, remaining))
+                            try:
+                                cursor = blocker_conn.cursor()
+                                try:
+                                    cursor.execute("SELECT 1")
+                                    cursor.fetchall()
+                                finally:
+                                    try:
+                                        cursor.close()
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                            except liveness_exceptions as exc:
+                                elapsed = int(time.monotonic() - blocker_start)
+                                print("Blocker tx killed by server after %ds (engine=%s). idle-in-tx kill." % (elapsed, self.engine))
+                                print("Underlying exception: %s: %s" % (type(exc).__name__, str(exc)))
+                                self._blocker_terminated_early = True
+                                break
+
+                        if not self._blocker_terminated_early:
+                            try:
+                                blocker_conn.commit()
+                                print("Blocker COMMIT; %s pk=%r released after %ds" % (target.qualified_ref, target.pk_values, self.experiment_duration_s))
+                            except Exception as exc:  # noqa: BLE001
+                                elapsed = int(time.monotonic() - blocker_start)
+                                print("Blocker tx killed by server after %ds (engine=%s). idle-in-tx kill." % (elapsed, self.engine))
+                                print("Underlying exception on COMMIT: %s: %s" % (type(exc).__name__, str(exc)))
+                                self._blocker_terminated_early = True
+                    finally:
+                        try:
+                            blocker_conn.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+                    ramp_thread.join(timeout=60)
+
+                    print("Joining %d waiter threads..." % len(self._waiter_threads))
+                    for t in self._waiter_threads:
+                        t.join(timeout=30)
+                    alive = sum(1 for t in self._waiter_threads if t.is_alive())
+                    if alive:
+                        print("WARN: %d waiter(s) still alive after timeout" % alive)
+                    else:
+                        print("Waiters joined")
+
+
+            def _positive_int(name: str, raw: str) -> int:
+                try:
+                    value = int(raw)
+                except ValueError:
+                    sys.stderr.write("ERROR: %s must be an integer, got %r\n" % (name, raw))
+                    sys.exit(1)
+                if value < 0:
+                    sys.stderr.write("ERROR: %s must be >= 0, got %d\n" % (name, value))
+                    sys.exit(1)
+                return value
+
+
+            def main(argv: Optional[List[str]] = None) -> None:
+                argv = list(sys.argv if argv is None else argv)
+                if len(argv) != 13:
+                    sys.stderr.write("Usage: %s ENGINE ENDPOINT PORT DBNAME USER SECRET_ARN WAITERS DURATION RAMP_TIME RAMP_STEPS REGION TARGET_TABLE\n" % (argv[0] if argv else "harness.py",))
+                    sys.exit(1)
+
+                (_prog, engine, endpoint, port_raw, dbname, user, secret_arn,
+                 waiter_count_raw, experiment_duration_iso, ramp_time_iso,
+                 ramp_steps_raw, region, target_table_name) = argv
+
+                if engine not in ("postgres", "mysql", "sqlserver"):
+                    sys.stderr.write("ERROR: Unsupported DatabaseEngine %r. Expected one of: postgres, mysql, sqlserver.\n" % (engine,))
+                    sys.exit(4)
+
+                port = _positive_int("DatabasePort", port_raw)
+                waiter_count = _positive_int("WaiterCount", waiter_count_raw)
+                ramp_steps = _positive_int("RampSteps", ramp_steps_raw)
+                experiment_duration_s = BlockingLocksHarness.parse_iso8601_duration(
+                    experiment_duration_iso)
+                ramp_time_s = BlockingLocksHarness.parse_iso8601_duration(ramp_time_iso, allow_zero=True)
+
+                password = BlockingLocksHarness.get_password(secret_arn, region)
+
+                harness = BlockingLocksHarness(
+                    engine=engine,
+                    endpoint=endpoint,
+                    port=port,
+                    dbname=dbname,
+                    user=user,
+                    password=password,
+                    waiter_count=waiter_count,
+                    experiment_duration_s=experiment_duration_s,
+                    ramp_time_s=ramp_time_s,
+                    ramp_steps=ramp_steps,
+                    target_table_name=target_table_name,
+                )
+
+                exit_code = 0
+                try:
+                    harness.run()
+                except SystemExit:
+                    raise
+                except Exception:  # noqa: BLE001
+                    sys.stderr.write("ERROR: Harness raised an uncaught exception:\n")
+                    traceback.print_exc()
+                    exit_code = 10
+                finally:
+                    if harness._created_table:
+                        harness._drop_table()
+
+                sys.exit(exit_code)
+
+
+            if __name__ == "__main__":
+                main()
+            PYTHON_EOF
+
+            python3 /tmp/blocking_locks_harness.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ WaiterCount }}" \
+              "{{ ExperimentDuration }}" \
+              "{{ RampTime }}" \
+              "{{ RampSteps }}" \
+              "{{ global:REGION }}" \
+              "{{ TargetTableName }}"
+
+  - name: TerminateInstance
+    action: 'aws:changeInstanceState'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      DesiredState: terminated
+
+  - name: WaitForInstanceTermination
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - terminated
+
+  - name: RevokeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: revoke_ingress
+      Script: |
+        import boto3
+
+        def revoke_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            try:
+                response = ec2.revoke_security_group_ingress(
+                    GroupId=database_sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': port,
+                        'ToPort': port,
+                        'UserIdGroupPairs': [{
+                            'GroupId': load_gen_sg_id
+                        }]
+                    }]
+                )
+                return {'StatusCode': 200, 'Response': response}
+            except Exception as e:
+                return {'StatusCode': 500, 'Error': str(e)}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: CleanupSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: DeleteSecurityGroup
+      GroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+
+outputs:
+  - LaunchLoadGenerator.InstanceId
+  - CreateSecurityGroup.SecurityGroupId
