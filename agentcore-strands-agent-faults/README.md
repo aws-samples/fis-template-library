@@ -17,15 +17,15 @@ It ships one extra artifact the resource-based experiments do not: a small Pytho
 
 ## Hypothesis
 
-When tool calls made by a Strands agent are **cancelled** (`timeout`, `network_error`, `execution_error`, `validation_error`) or its tool results are **corrupted** (`truncate_fields`, `remove_fields`, `corrupt_values`), the agent will detect that a trustworthy result is unavailable and **fail safe** (acknowledge that it cannot complete the task, return a caveated or partial answer, or escalate) rather than fabricate a result from missing data. Raw errors will not be surfaced to the user. Other unfaulted user journeys on the same workload will continue unaffected, and when the fault is removed the agent will return to steady state within the parameter cache TTL.
+When tool calls made by a Strands agent are **cancelled** (`timeout`, `network_error`, `execution_error`, `validation_error`) or its tool results are **corrupted** (`truncate_fields`, `remove_fields`, `corrupt_values`), the agent will detect that a trustworthy result is unavailable and **fail safe** (acknowledge that it cannot complete the task, return a caveated or partial answer, or escalate) rather than fabricate a result from missing data. Raw errors will not be surfaced to the user. Other unfaulted user journeys on the same workload will continue unaffected, and when the fault is removed the agent will return to steady state within the parameter cache TTL (10 seconds by default).
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
 1. You have the necessary permissions to execute the FIS experiment and to start SSM Automation executions.
-2. A Strands agent integrated with `plugins=chaos_plugins()` (using the included `strands_agentcore_chaos.py`) is built and deployed to a **dedicated chaos** Amazon Bedrock AgentCore Runtime, separate from production.
-3. You know the runtime ID of that chaos runtime; it scopes the `/chaos/{runtime_id}/` parameter subtree and must equal the value the chaos build resolves via `resolve_runtime_id`.
+2. A Strands agent integrated with `plugins=chaos_plugins()` (using the included `strands_agentcore_chaos.py`) is built and deployed to a **dedicated chaos** Amazon Bedrock AgentCore Runtime, separate from production. See "Integrating the chaos module" below.
+3. You know the runtime ID of that chaos runtime; it scopes the `/chaos/{runtime_id}/` parameter subtree and must equal the value the chaos build resolves via `resolve_runtime_id` (see "Runtime ID resolution" below).
 4. The following IAM roles exist:
    - An FIS experiment role (`ChaosExperiment-FIS-Role`) trusted by `fis.amazonaws.com`, with permission to start the SSM Automation (policy and trust in `agentcore-strands-agent-faults-fis-role-iam-policy.json` / `fis-iam-trust-relationship.json`).
    - An SSM Automation role (`ChaosExperiment-SSM-Automation-Role`) with `ssm:PutParameter` and `ssm:DeleteParameters` on `/chaos/*` (policy and trust in `agentcore-strands-agent-faults-ssm-automation-role-iam-policy.json` / `ssm-iam-trust-relationship.json`).
@@ -33,6 +33,35 @@ Before running this experiment, ensure that:
 5. The SSM Automation document (`agentcore-strands-agent-faults-automation.yaml`) is deployed to your account as `ChaosExperiment`.
 
 Throughout the artifacts, replace the placeholders `<YOUR REGION>` and `<YOUR AWS ACCOUNT>` with your values, and set the `RuntimeId` document parameter to your chaos runtime ID before running.
+
+### Integrating the chaos module
+
+Copy `strands_agentcore_chaos.py` into your agent project and register its plugins when constructing the agent:
+
+```python
+from strands import Agent
+from strands_agentcore_chaos import chaos_plugins
+
+agent = Agent(model=..., tools=[...], plugins=chaos_plugins())
+```
+
+`chaos_plugins()` returns two plugins: a `RuntimeChaosController` that reads the SSM config and decides per invocation whether to arm a fault, and the unmodified `ChaosPlugin` from `strands_evals`, which performs the actual tool-level injection.
+
+The chaos build must include the packages the module imports: the Strands Agents SDK (`strands`), the Strands evaluation package (`strands_evals`, whose `chaos` effects this module reuses), `pydantic`, and `boto3`. Your production build should include none of these chaos artifacts: it omits `strands_agentcore_chaos.py`, does not pass `plugins=chaos_plugins()`, and its runtime execution role has no `/chaos/*` access.
+
+### Runtime ID resolution
+
+At startup the controller resolves the runtime ID that scopes its `/chaos/{runtime_id}/` parameter subtree, trying three sources in order:
+
+1. `AGENT_RUNTIME_ID` environment variable: an explicit operator-set override. Recommended, as it is fully under your control and portable to other compute (ECS, Lambda).
+2. `AGENTCORE_RUNTIME_URL` environment variable: set by AgentCore Runtime; the runtime ARN is URL-encoded in its path and the ID is the segment after `runtime/`.
+3. `cloud.resource_id` within `OTEL_RESOURCE_ATTRIBUTES`: present when AgentCore observability is enabled (the default).
+
+If none of the sources resolves, the module raises at construction time rather than guessing (fail closed). Whichever value it resolves must equal the `RuntimeId` parameter you pass to the `ChaosExperiment` document; that equality is what wires one FIS experiment to exactly one runtime.
+
+### Configuration cache TTL
+
+The controller caches the SSM parameters for 10 seconds by default (configurable via `RuntimeChaosController(ttl_seconds=...)`). Enabling, changing, or disabling chaos therefore takes effect within one TTL. The automation document's disable step waits 15 seconds after writing `active=false` so that in-flight invocations observe the off switch before the parameters are deleted; if you raise the TTL, raise that wait to match.
 
 ## How it works
 
@@ -45,9 +74,61 @@ FIS runs a single `aws:ssm:start-automation-execution` action, which invokes the
 
 `fault_rate` decides *whether* an invocation is faulted; `fault_injections` (a JSON map of tool to one effect) decides *what*. Malformed JSON, an unknown `effect_type`, more than one effect per tool, or an out-of-range `fault_rate` all fail closed to a no-op. A misconfiguration can only ever produce less chaos, never more.
 
+### Experiment parameters
+
+The FIS template passes these parameters to the `ChaosExperiment` document via `documentParameters`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `RuntimeId` | (required) | The AgentCore runtime ID of your chaos runtime. Becomes the `/chaos/{runtime_id}/` parameter prefix and must equal the ID the chaos build resolves. |
+| `FaultRate` | `0.5` | Probability in `[0.0, 1.0]` that any given invocation is faulted. `0` never faults, `1` faults every invocation. |
+| `FaultInjections` | see below | JSON map of tool name to a list containing exactly one effect spec. When an invocation is selected, the whole map applies to it: every listed tool gets its effect for that invocation. |
+| `DurationSeconds` | `900` | How long chaos stays active before the clean disable. |
+| `AutomationAssumeRole` | (required) | ARN of `ChaosExperiment-SSM-Automation-Role`. |
+
+A readable `FaultInjections` value looks like this (in the FIS template it appears JSON-escaped inside `documentParameters`):
+
+```json
+{
+  "search_products": [{"effect_type": "timeout"}],
+  "get_order_status": [{"effect_type": "truncate_fields", "max_length": 200}]
+}
+```
+
+**Replace the example tool names before running.** The shipped template's default (`get_move`, `get_pokemon`) targets a demo agent's tools. Tool names are matched exactly against your agent's tools, and a name that matches nothing injects nothing: run the template unmodified against your own agent and the experiment will complete "successfully" while injecting no faults at all. Set the map keys to the actual tool names your agent registers.
+
+Also note the FIS action's `maxDuration` (set to `PT20M` in the template): it must exceed `DurationSeconds` plus the 15-second TTL wait. If it does not, FIS cancels the automation mid-hold. The rollback path still disables chaos safely, but your experiment window silently truncates. If you raise `DurationSeconds`, raise `maxDuration` with it.
+
 ### Supported effect types
 
-**Pre-hook** effects cancel the tool call before it executes: `timeout`, `network_error`, `execution_error`, `validation_error` (each returns a configurable `error_message`). **Post-hook** effects corrupt the tool's response after it runs: `truncate_fields` (`max_length`, default 10), `remove_fields` (`remove_ratio`, default 0.5), `corrupt_values` (`corrupt_ratio`, default 0.5). The upstream effect definitions in `strands_evals.chaos.effects` are authoritative; new effect types are picked up automatically.
+**Pre-hook** effects cancel the tool call before it executes; the tool never runs and the agent receives an error result instead:
+
+| `effect_type` | Simulates | Parameters |
+|---|---|---|
+| `timeout` | The tool call timing out | `error_message` (optional) |
+| `network_error` | A network failure reaching the tool | `error_message` (optional) |
+| `execution_error` | The tool failing during execution | `error_message` (optional) |
+| `validation_error` | The tool rejecting its input | `error_message` (optional) |
+
+**Post-hook** effects let the tool run normally, then corrupt its response before the agent sees it:
+
+| `effect_type` | Does | Parameters |
+|---|---|---|
+| `truncate_fields` | Truncates field values in the result | `max_length` (default 10) |
+| `remove_fields` | Removes a random subset of result fields | `remove_ratio` (default 0.5) |
+| `corrupt_values` | Corrupts a random subset of result values | `corrupt_ratio` (default 0.5) |
+
+The upstream effect definitions in `strands_evals.chaos.effects` are authoritative; new effect types are picked up automatically.
+
+### Verifying faults are being injected
+
+While the experiment is running, confirm the control plane wrote the parameters:
+
+```bash
+aws ssm get-parameters-by-path --path "/chaos/<YOUR RUNTIME ID>/" --region <YOUR REGION>
+```
+
+You should see `active=true`, your `fault_rate`, your `fault_injections` map, and an `execution_id`. Then invoke the agent repeatedly; at `FaultRate` 0.5, roughly half the invocations should show the configured fault (for pre-hook effects, an agent response acknowledging a failed tool; for post-hook effects, behavior consistent with degraded data). Each faulted invocation logs an `activated chaos execution=<...> tools=<...>` line (see the observability section below for surfacing it). If parameters are present but no invocation ever faults, check that the tool names in `fault_injections` exactly match your agent's registered tools and that the runtime ID in the parameter path matches the one the build resolves.
 
 ## Stop Conditions
 
