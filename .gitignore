@@ -13,4 +13,4 @@ samconfig.toml
 cdk.out
 .idea/
 
-test_harnesses/
+test_harnesses/eks-automode-az-impairment/isengard/

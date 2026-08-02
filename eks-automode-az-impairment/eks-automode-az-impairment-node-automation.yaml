@@ -1,0 +1,626 @@
+schemaVersion: '0.3'
+description: |
+  Cordon EKS Auto Mode nodes in a target AZ and patch the NodePool to exclude
+  that AZ from scheduling. Waits for specified duration, then restores the
+  original NodePool configuration and uncordons nodes.
+  Handles cleanup on cancel or failure.
+  Uses the Kubernetes REST API directly (no kubectl binary needed).
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role for automation execution
+    default: ''
+  ClusterName:
+    type: String
+    description: Name of the EKS cluster
+  TargetAZ:
+    type: String
+    description: Availability Zone to impair (e.g. ap-southeast-2a)
+  NodePoolName:
+    type: String
+    description: Name of the EKS Auto Mode NodePool to patch (e.g. general-purpose, system)
+    default: 'general-purpose'
+  Duration:
+    type: String
+    description: Duration of the impairment in ISO 8601 format
+    default: 'PT15M'
+mainSteps:
+  - name: ValidateAndGetCluster
+    description: Validate inputs and get cluster endpoint/CA for K8s API access
+    action: aws:executeScript
+    nextStep: CordonNodesInAZ
+    isEnd: false
+    inputs:
+      Runtime: python3.11
+      Handler: validate_and_get_cluster
+      Script: |
+        import re
+        import boto3
+        import json
+
+        def validate_and_get_cluster(events, context):
+            cluster_name = events['ClusterName']
+            target_az = events['TargetAZ']
+            node_pool_name = events['NodePoolName']
+
+            if not re.match(r'^[a-z]{2}-[a-z]+-\d[a-z]$', target_az):
+                raise ValueError(f"Invalid AZ format: {target_az}")
+            if not cluster_name:
+                raise ValueError("Cluster name cannot be empty")
+            if not node_pool_name:
+                raise ValueError("NodePool name cannot be empty")
+
+            eks_client = boto3.client('eks')
+            try:
+                response = eks_client.describe_cluster(name=cluster_name)
+                cluster = response['cluster']
+                if cluster['status'] != 'ACTIVE':
+                    raise ValueError(f"Cluster is not ACTIVE: {cluster['status']}")
+            except eks_client.exceptions.ResourceNotFoundException:
+                raise ValueError(f"Cluster {cluster_name} not found")
+
+            return json.dumps({
+                'Endpoint': cluster['endpoint'],
+                'CertificateAuthority': cluster['certificateAuthority']['data']
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        TargetAZ: '{{ TargetAZ }}'
+        NodePoolName: '{{ NodePoolName }}'
+    outputs:
+      - Name: ClusterInfo
+        Selector: $.Payload
+        Type: String
+
+  - name: CordonNodesInAZ
+    description: Cordon all nodes in the target AZ using the Kubernetes REST API
+    action: aws:executeScript
+    nextStep: PatchNodePoolExcludeAZ
+    isEnd: false
+    onFailure: 'step:RestoreNodePool'
+    onCancel: 'step:RestoreNodePool'
+    inputs:
+      Runtime: python3.11
+      Handler: cordon_nodes
+      Script: |
+        import boto3
+        import json
+        import base64
+        import urllib3
+        import tempfile
+        import os
+
+        def get_token(cluster_name):
+            session = boto3.Session()
+            from botocore.signers import RequestSigner
+            from botocore.model import ServiceId
+
+            service_id = ServiceId('sts')
+            signer = RequestSigner(service_id, session.region_name, 'sts', 'v4',
+                                   session.get_credentials(), session.events)
+            params = {
+                'method': 'GET',
+                'url': f'https://sts.{session.region_name}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15',
+                'body': {},
+                'headers': {'x-k8s-aws-id': cluster_name},
+                'context': {}
+            }
+            signed_url = signer.generate_presigned_url(
+                params, region_name=session.region_name,
+                expires_in=60, operation_name='')
+            return 'k8s-aws-v1.' + base64.urlsafe_b64encode(
+                signed_url.encode('utf-8')).decode('utf-8').rstrip('=')
+
+        def k8s_request(http, endpoint, token, ca_file, method, path, body=None):
+            url = f"{endpoint}{path}"
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/strategic-merge-patch+json' if method == 'PATCH' else 'application/json',
+                'Accept': 'application/json'
+            }
+            if method == 'GET':
+                resp = http.request('GET', url, headers=headers)
+            elif method == 'PATCH':
+                resp = http.request('PATCH', url, headers=headers,
+                                    body=json.dumps(body).encode('utf-8'))
+            else:
+                resp = http.request(method, url, headers=headers,
+                                    body=json.dumps(body).encode('utf-8') if body else None)
+            return resp
+
+        def cordon_nodes(events, context):
+            cluster_name = events['ClusterName']
+            target_az = events['TargetAZ']
+            cluster_info = json.loads(events['ClusterInfo'])
+            endpoint = cluster_info['Endpoint']
+            ca_data = cluster_info['CertificateAuthority']
+
+            # Write CA cert to temp file
+            ca_file = tempfile.NamedTemporaryFile(delete=False, suffix='.crt')
+            ca_file.write(base64.b64decode(ca_data))
+            ca_file.close()
+
+            token = get_token(cluster_name)
+            http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name)
+
+            # List nodes with zone label
+            resp = k8s_request(http, endpoint, token, ca_file.name, 'GET',
+                f'/api/v1/nodes?labelSelector=topology.kubernetes.io/zone={target_az}')
+
+            if resp.status != 200:
+                os.unlink(ca_file.name)
+                raise RuntimeError(f"Failed to list nodes: {resp.status} {resp.data.decode()}")
+
+            nodes_data = json.loads(resp.data.decode())
+            nodes = [n['metadata']['name'] for n in nodes_data.get('items', [])]
+
+            if not nodes:
+                os.unlink(ca_file.name)
+                return json.dumps({'Status': 'NO_NODES_FOUND', 'TargetAZ': target_az, 'CordonedNodes': []})
+
+            # Cordon each node (set spec.unschedulable = true)
+            cordoned = []
+            for node in nodes:
+                patch_body = {'spec': {'unschedulable': True}}
+                resp = k8s_request(http, endpoint, token, ca_file.name, 'PATCH',
+                    f'/api/v1/nodes/{node}', patch_body)
+                if resp.status == 200:
+                    cordoned.append(node)
+                else:
+                    print(f"Warning: Failed to cordon {node}: {resp.status}")
+
+            os.unlink(ca_file.name)
+            return json.dumps({
+                'Status': 'NODES_CORDONED',
+                'TargetAZ': target_az,
+                'CordonedNodes': cordoned,
+                'TotalNodes': len(nodes)
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        TargetAZ: '{{ TargetAZ }}'
+        ClusterInfo: '{{ ValidateAndGetCluster.ClusterInfo }}'
+    outputs:
+      - Name: CordonResult
+        Selector: $.Payload
+        Type: String
+
+  - name: PatchNodePoolExcludeAZ
+    description: Patch the NodePool to exclude the target AZ from scheduling
+    action: aws:executeScript
+    nextStep: DeletePodsInAZ
+    isEnd: false
+    onFailure: 'step:RestoreNodePool'
+    onCancel: 'step:RestoreNodePool'
+    inputs:
+      Runtime: python3.11
+      Handler: patch_nodepool
+      Script: |
+        import boto3
+        import json
+        import base64
+        import urllib3
+        import tempfile
+        import os
+
+        def get_token(cluster_name):
+            session = boto3.Session()
+            from botocore.signers import RequestSigner
+            from botocore.model import ServiceId
+
+            service_id = ServiceId('sts')
+            signer = RequestSigner(service_id, session.region_name, 'sts', 'v4',
+                                   session.get_credentials(), session.events)
+            params = {
+                'method': 'GET',
+                'url': f'https://sts.{session.region_name}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15',
+                'body': {},
+                'headers': {'x-k8s-aws-id': cluster_name},
+                'context': {}
+            }
+            signed_url = signer.generate_presigned_url(
+                params, region_name=session.region_name,
+                expires_in=60, operation_name='')
+            return 'k8s-aws-v1.' + base64.urlsafe_b64encode(
+                signed_url.encode('utf-8')).decode('utf-8').rstrip('=')
+
+        def k8s_request(http, endpoint, token, ca_file, method, path, body=None, content_type=None):
+            url = f"{endpoint}{path}"
+            ct = content_type or ('application/json' if method == 'GET' else 'application/json-patch+json')
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': ct,
+                'Accept': 'application/json'
+            }
+            if body:
+                resp = http.request(method, url, headers=headers,
+                                    body=json.dumps(body).encode('utf-8'))
+            else:
+                resp = http.request(method, url, headers=headers)
+            return resp
+
+        def patch_nodepool(events, context):
+            cluster_name = events['ClusterName']
+            target_az = events['TargetAZ']
+            node_pool_name = events['NodePoolName']
+            cluster_info = json.loads(events['ClusterInfo'])
+            endpoint = cluster_info['Endpoint']
+            ca_data = cluster_info['CertificateAuthority']
+
+            ca_file = tempfile.NamedTemporaryFile(delete=False, suffix='.crt')
+            ca_file.write(base64.b64decode(ca_data))
+            ca_file.close()
+
+            token = get_token(cluster_name)
+            http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name)
+
+            # Try eks.amazonaws.com API group first, then karpenter.sh
+            nodepool_path = None
+            for api_group in ['eks.amazonaws.com', 'karpenter.sh']:
+                path = f'/apis/{api_group}/v1/nodepools/{node_pool_name}'
+                resp = http.request('GET', f"{endpoint}{path}",
+                    headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+                if resp.status == 200:
+                    nodepool_path = path
+                    break
+
+            if not nodepool_path:
+                os.unlink(ca_file.name)
+                raise RuntimeError(f"NodePool {node_pool_name} not found in eks.amazonaws.com or karpenter.sh API groups")
+
+            current_nodepool = json.loads(resp.data.decode())
+            requirements = current_nodepool.get('spec', {}).get('template', {}).get('spec', {}).get('requirements', [])
+
+            # Find existing zone requirement
+            zone_req_index = None
+            original_zone_values = []
+            for i, req in enumerate(requirements):
+                if req.get('key') == 'topology.kubernetes.io/zone':
+                    zone_req_index = i
+                    original_zone_values = req.get('values', [])
+                    break
+
+            if zone_req_index is not None:
+                # Remove target AZ from existing values
+                new_values = [z for z in original_zone_values if z != target_az]
+                if not new_values:
+                    os.unlink(ca_file.name)
+                    raise ValueError(f"Cannot remove last AZ. {target_az} is the only zone.")
+                patch = [{'op': 'replace',
+                          'path': f'/spec/template/spec/requirements/{zone_req_index}/values',
+                          'value': new_values}]
+            else:
+                # No zone req exists — get all AZs from subnets via EKS/EC2 API (more reliable than node labels)
+                import boto3 as boto3_inner
+                eks_client = boto3_inner.client('eks')
+                ec2_client = boto3_inner.client('ec2')
+
+                cluster_resp = eks_client.describe_cluster(name=cluster_name)
+                subnet_ids = cluster_resp['cluster']['resourcesVpcConfig']['subnetIds']
+
+                subnet_resp = ec2_client.describe_subnets(SubnetIds=subnet_ids)
+                all_azs = list(set(s['AvailabilityZone'] for s in subnet_resp['Subnets']))
+
+                new_values = [z for z in all_azs if z and z != target_az]
+                if not new_values:
+                    os.unlink(ca_file.name)
+                    raise ValueError(f"No other AZs available. Found: {all_azs}")
+                new_req = {'key': 'topology.kubernetes.io/zone', 'operator': 'In', 'values': new_values}
+                patch = [{'op': 'add', 'path': '/spec/template/spec/requirements/-', 'value': new_req}]
+
+            # Apply JSON patch
+            resp = k8s_request(http, endpoint, token, ca_file.name, 'PATCH',
+                nodepool_path, patch, content_type='application/json-patch+json')
+
+            os.unlink(ca_file.name)
+
+            if resp.status != 200:
+                raise RuntimeError(f"Failed to patch NodePool: {resp.status} {resp.data.decode()[:500]}")
+
+            return json.dumps({
+                'Status': 'NODEPOOL_PATCHED',
+                'NodePoolName': node_pool_name,
+                'ExcludedAZ': target_az,
+                'RemainingAZs': new_values,
+                'ZoneReqExisted': zone_req_index is not None,
+                'OriginalZoneValues': original_zone_values
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        TargetAZ: '{{ TargetAZ }}'
+        NodePoolName: '{{ NodePoolName }}'
+        ClusterInfo: '{{ ValidateAndGetCluster.ClusterInfo }}'
+    outputs:
+      - Name: PatchResult
+        Selector: $.Payload
+        Type: String
+
+  - name: DeletePodsInAZ
+    description: Delete all pods running on nodes in the target AZ (simulates sudden pod death)
+    action: aws:executeScript
+    nextStep: WaitForDuration
+    isEnd: false
+    onFailure: 'step:RestoreNodePool'
+    onCancel: 'step:RestoreNodePool'
+    inputs:
+      Runtime: python3.11
+      Handler: delete_pods
+      Script: |
+        import boto3
+        import json
+        import base64
+        import urllib3
+        import tempfile
+        import os
+
+        def get_token(cluster_name):
+            session = boto3.Session()
+            from botocore.signers import RequestSigner
+            from botocore.model import ServiceId
+
+            service_id = ServiceId('sts')
+            signer = RequestSigner(service_id, session.region_name, 'sts', 'v4',
+                                   session.get_credentials(), session.events)
+            params = {
+                'method': 'GET',
+                'url': f'https://sts.{session.region_name}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15',
+                'body': {},
+                'headers': {'x-k8s-aws-id': cluster_name},
+                'context': {}
+            }
+            signed_url = signer.generate_presigned_url(
+                params, region_name=session.region_name,
+                expires_in=60, operation_name='')
+            return 'k8s-aws-v1.' + base64.urlsafe_b64encode(
+                signed_url.encode('utf-8')).decode('utf-8').rstrip('=')
+
+        def delete_pods(events, context):
+            cluster_name = events['ClusterName']
+            target_az = events['TargetAZ']
+            cluster_info = json.loads(events['ClusterInfo'])
+            endpoint = cluster_info['Endpoint']
+            ca_data = cluster_info['CertificateAuthority']
+
+            ca_file = tempfile.NamedTemporaryFile(delete=False, suffix='.crt')
+            ca_file.write(base64.b64decode(ca_data))
+            ca_file.close()
+
+            token = get_token(cluster_name)
+            http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name)
+
+            # Get nodes in target AZ
+            resp = http.request('GET',
+                f"{endpoint}/api/v1/nodes?labelSelector=topology.kubernetes.io/zone={target_az}",
+                headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+
+            if resp.status != 200:
+                os.unlink(ca_file.name)
+                return json.dumps({'Status': 'FAILED_TO_LIST_NODES', 'Error': resp.data.decode()[:200]})
+
+            nodes_data = json.loads(resp.data.decode())
+            node_names = [n['metadata']['name'] for n in nodes_data.get('items', [])]
+
+            if not node_names:
+                os.unlink(ca_file.name)
+                return json.dumps({'Status': 'NO_NODES_IN_AZ', 'DeletedPods': 0})
+
+            # Get all non-system pods on those nodes and delete them
+            deleted_pods = []
+            for node_name in node_names:
+                resp = http.request('GET',
+                    f"{endpoint}/api/v1/pods?fieldSelector=spec.nodeName={node_name}",
+                    headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+
+                if resp.status != 200:
+                    continue
+
+                pods_data = json.loads(resp.data.decode())
+                for pod in pods_data.get('items', []):
+                    ns = pod['metadata']['namespace']
+                    name = pod['metadata']['name']
+
+                    # Skip kube-system and kube-node-lease pods
+                    if ns in ['kube-system', 'kube-node-lease', 'kube-public']:
+                        continue
+
+                    # Delete the pod (immediate, no grace period — simulates sudden death)
+                    del_resp = http.request('DELETE',
+                        f"{endpoint}/api/v1/namespaces/{ns}/pods/{name}?gracePeriodSeconds=0",
+                        headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+
+                    if del_resp.status in [200, 202]:
+                        deleted_pods.append(f"{ns}/{name}")
+                    else:
+                        print(f"Warning: Failed to delete {ns}/{name}: {del_resp.status}")
+
+            os.unlink(ca_file.name)
+            return json.dumps({
+                'Status': 'PODS_DELETED',
+                'TargetAZ': target_az,
+                'DeletedPods': len(deleted_pods),
+                'PodNames': deleted_pods[:20]  # Cap output
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        TargetAZ: '{{ TargetAZ }}'
+        ClusterInfo: '{{ ValidateAndGetCluster.ClusterInfo }}'
+    outputs:
+      - Name: DeleteResult
+        Selector: $.Payload
+        Type: String
+
+  - name: WaitForDuration
+    description: Wait for the specified impairment duration
+    action: aws:sleep
+    nextStep: RestoreNodePool
+    isEnd: false
+    onFailure: 'step:RestoreNodePool'
+    onCancel: 'step:RestoreNodePool'
+    inputs:
+      Duration: '{{ Duration }}'
+
+  - name: RestoreNodePool
+    description: Restore NodePool config and uncordon nodes. Idempotent and safe on failure/cancel.
+    action: aws:executeScript
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: restore_nodepool
+      Script: |
+        import boto3
+        import json
+        import base64
+        import urllib3
+        import tempfile
+        import os
+
+        def get_token(cluster_name):
+            session = boto3.Session()
+            from botocore.signers import RequestSigner
+            from botocore.model import ServiceId
+
+            service_id = ServiceId('sts')
+            signer = RequestSigner(service_id, session.region_name, 'sts', 'v4',
+                                   session.get_credentials(), session.events)
+            params = {
+                'method': 'GET',
+                'url': f'https://sts.{session.region_name}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15',
+                'body': {},
+                'headers': {'x-k8s-aws-id': cluster_name},
+                'context': {}
+            }
+            signed_url = signer.generate_presigned_url(
+                params, region_name=session.region_name,
+                expires_in=60, operation_name='')
+            return 'k8s-aws-v1.' + base64.urlsafe_b64encode(
+                signed_url.encode('utf-8')).decode('utf-8').rstrip('=')
+
+        def restore_nodepool(events, context):
+            cluster_name = events['ClusterName']
+            target_az = events['TargetAZ']
+            node_pool_name = events['NodePoolName']
+            cluster_info_str = events.get('ClusterInfo', '{}')
+            patch_result_str = events.get('PatchResult', '{}')
+
+            # If ClusterInfo is empty (early failure), get it fresh
+            if cluster_info_str == '{}' or not cluster_info_str:
+                eks_client = boto3.client('eks')
+                response = eks_client.describe_cluster(name=cluster_name)
+                cluster = response['cluster']
+                cluster_info = {
+                    'Endpoint': cluster['endpoint'],
+                    'CertificateAuthority': cluster['certificateAuthority']['data']
+                }
+            else:
+                cluster_info = json.loads(cluster_info_str)
+
+            endpoint = cluster_info['Endpoint']
+            ca_data = cluster_info['CertificateAuthority']
+
+            ca_file = tempfile.NamedTemporaryFile(delete=False, suffix='.crt')
+            ca_file.write(base64.b64decode(ca_data))
+            ca_file.close()
+
+            token = get_token(cluster_name)
+            http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name)
+
+            restore_status = 'UNKNOWN'
+
+            # --- Restore NodePool ---
+            try:
+                patch_result = json.loads(patch_result_str) if patch_result_str and patch_result_str != '{}' else {}
+
+                # Find the NodePool
+                nodepool_path = None
+                for api_group in ['eks.amazonaws.com', 'karpenter.sh']:
+                    path = f'/apis/{api_group}/v1/nodepools/{node_pool_name}'
+                    resp = http.request('GET', f"{endpoint}{path}",
+                        headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+                    if resp.status == 200:
+                        nodepool_path = path
+                        break
+
+                if nodepool_path:
+                    current_nodepool = json.loads(resp.data.decode())
+                    requirements = current_nodepool.get('spec', {}).get('template', {}).get('spec', {}).get('requirements', [])
+
+                    zone_req_existed = patch_result.get('ZoneReqExisted', False)
+                    original_zone_values = patch_result.get('OriginalZoneValues', [])
+
+                    if zone_req_existed and original_zone_values:
+                        # Restore original zone values
+                        for i, req in enumerate(requirements):
+                            if req.get('key') == 'topology.kubernetes.io/zone':
+                                patch = [{'op': 'replace',
+                                          'path': f'/spec/template/spec/requirements/{i}/values',
+                                          'value': original_zone_values}]
+                                http.request('PATCH', f"{endpoint}{nodepool_path}",
+                                    headers={'Authorization': f'Bearer {token}',
+                                             'Content-Type': 'application/json-patch+json',
+                                             'Accept': 'application/json'},
+                                    body=json.dumps(patch).encode('utf-8'))
+                                break
+                    else:
+                        # Zone req was added by us — remove it
+                        for i, req in enumerate(requirements):
+                            if req.get('key') == 'topology.kubernetes.io/zone':
+                                patch = [{'op': 'remove',
+                                          'path': f'/spec/template/spec/requirements/{i}'}]
+                                http.request('PATCH', f"{endpoint}{nodepool_path}",
+                                    headers={'Authorization': f'Bearer {token}',
+                                             'Content-Type': 'application/json-patch+json',
+                                             'Accept': 'application/json'},
+                                    body=json.dumps(patch).encode('utf-8'))
+                                break
+
+                    restore_status = 'NODEPOOL_RESTORED'
+                else:
+                    restore_status = 'NODEPOOL_NOT_FOUND'
+
+            except Exception as e:
+                restore_status = f'NODEPOOL_RESTORE_ERROR: {str(e)}'
+
+            # --- Uncordon nodes ---
+            uncordoned = []
+            try:
+                resp = http.request('GET',
+                    f"{endpoint}/api/v1/nodes?labelSelector=topology.kubernetes.io/zone={target_az}",
+                    headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+
+                if resp.status == 200:
+                    nodes_data = json.loads(resp.data.decode())
+                    for node in nodes_data.get('items', []):
+                        node_name = node['metadata']['name']
+                        if node.get('spec', {}).get('unschedulable'):
+                            patch_body = {'spec': {'unschedulable': None}}
+                            patch_resp = http.request('PATCH', f"{endpoint}/api/v1/nodes/{node_name}",
+                                headers={'Authorization': f'Bearer {token}',
+                                         'Content-Type': 'application/strategic-merge-patch+json',
+                                         'Accept': 'application/json'},
+                                body=json.dumps(patch_body).encode('utf-8'))
+                            if patch_resp.status == 200:
+                                uncordoned.append(node_name)
+            except Exception as e:
+                restore_status += f' | UNCORDON_ERROR: {str(e)}'
+
+            os.unlink(ca_file.name)
+
+            return json.dumps({
+                'Status': restore_status,
+                'UncordonedNodes': uncordoned,
+                'NodePoolName': node_pool_name,
+                'RestoredAZ': target_az
+            })
+      InputPayload:
+        ClusterName: '{{ ClusterName }}'
+        TargetAZ: '{{ TargetAZ }}'
+        NodePoolName: '{{ NodePoolName }}'
+        ClusterInfo: '{{ ValidateAndGetCluster.ClusterInfo }}'
+        PatchResult: '{{ PatchNodePoolExcludeAZ.PatchResult }}'
+    outputs:
+      - Name: RestoreResult
+        Selector: $.Payload
+        Type: String
+outputs:
+  - RestoreNodePool.RestoreResult

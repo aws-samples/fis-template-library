@@ -1,0 +1,84 @@
+# Kubernetes RBAC configuration for FIS EKS Pod actions and SSM automation
+# Apply this to your cluster: kubectl apply -f eks-automode-az-impairment-rbac.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: default
+  name: fis-experiment-sa
+
+---
+# Role for FIS pod actions (delete, network packet loss)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: fis-experiment-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "list", "get", "delete", "deletecollection"]
+- apiGroups: [""]
+  resources: ["pods/ephemeralcontainers"]
+  verbs: ["update"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fis-experiment-rolebinding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: fis-experiment-sa
+  namespace: default
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: fis-experiment
+roleRef:
+  kind: Role
+  name: fis-experiment-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ClusterRole for SSM automation (cordon/uncordon nodes, patch NodePool, delete pods)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fis-az-impairment-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["karpenter.sh"]
+  resources: ["nodepools"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: ["eks.amazonaws.com"]
+  resources: ["nodepools"]
+  verbs: ["get", "list", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fis-az-impairment-cluster-rolebinding
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: User
+  name: fis-ssm-automation
+roleRef:
+  kind: ClusterRole
+  name: fis-az-impairment-cluster-role
+  apiGroup: rbac.authorization.k8s.io

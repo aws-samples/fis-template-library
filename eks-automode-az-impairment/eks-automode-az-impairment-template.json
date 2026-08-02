@@ -1,0 +1,49 @@
+{
+    "description": "EKS Auto Mode AZ Impairment - Simulates availability zone failure with pod deletion, network disruption, and node pool AZ exclusion",
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
+    "actions": {
+        "disrupt-az-network": {
+            "actionId": "aws:network:disrupt-connectivity",
+            "description": "Block all network traffic on target AZ subnet via NACLs, simulating full AZ network failure.",
+            "parameters": {
+                "duration": "PT15M",
+                "scope": "all"
+            },
+            "targets": {
+                "Subnets": "subnets-in-target-az"
+            }
+        },
+        "cordon-and-exclude-az": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Cordon nodes, patch NodePool to exclude target AZ, delete pods in target AZ, wait for impairment duration, then restore. All K8s operations are handled by this single SSM automation.",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/eks-automode-az-impairment-node-automation",
+                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\",\"ClusterName\":\"<YOUR EKS CLUSTER>\",\"TargetAZ\":\"<YOUR TARGET AZ>\",\"NodePoolName\":\"<YOUR NODEPOOL NAME>\",\"Duration\":\"PT15M\"}",
+                "maxDuration": "PT40M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "targets": {
+        "subnets-in-target-az": {
+            "resourceType": "aws:ec2:subnet",
+            "resourceArns": [
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/<YOUR SUBNET ID IN TARGET AZ>"
+            ],
+            "selectionMode": "ALL"
+        }
+    },
+    "tags": {
+        "Name": "eks-automode-az-impairment",
+        "Purpose": "chaos-engineering",
+        "Environment": "test"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}
