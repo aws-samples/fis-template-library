@@ -19,8 +19,12 @@ parameters:
     description: Availability Zone to impair (e.g. ap-southeast-2a)
   NodePoolName:
     type: String
-    description: Name of the EKS Auto Mode NodePool to patch (e.g. general-purpose, system)
-    default: 'general-purpose'
+    description: >-
+      Name of a custom EKS Auto Mode NodePool to patch. Must NOT be a built-in
+      pool (general-purpose or system): AWS reconciles those back to their
+      managed configuration, so the AZ exclusion is silently reverted
+      mid-experiment while the experiment still reports success.
+    default: ''
   Duration:
     type: String
     description: Duration of the impairment in ISO 8601 format
@@ -50,6 +54,16 @@ mainSteps:
                 raise ValueError("Cluster name cannot be empty")
             if not node_pool_name:
                 raise ValueError("NodePool name cannot be empty")
+
+            # The built-in Auto Mode NodePools are managed by AWS and cannot be
+            # modified: EKS reconciles them back to their managed config, which
+            # silently ends the impairment early while the experiment still
+            # reports success. Fail loudly instead.
+            if node_pool_name in ('general-purpose', 'system'):
+                raise ValueError(
+                    f"'{node_pool_name}' is a built-in EKS Auto Mode NodePool and cannot be "
+                    "modified. EKS reverts changes to it mid-experiment, silently ending the "
+                    "AZ exclusion. Specify a custom NodePool instead.")
 
             eks_client = boto3.client('eks')
             try:
@@ -529,54 +543,77 @@ mainSteps:
 
             # --- Restore NodePool ---
             try:
-                patch_result = json.loads(patch_result_str) if patch_result_str and patch_result_str != '{}' else {}
+                try:
+                    patch_result = json.loads(patch_result_str) if patch_result_str and patch_result_str != '{}' else {}
+                except (ValueError, TypeError):
+                    # Unresolved SSM reference (the patch step never ran).
+                    patch_result = {}
 
-                # Find the NodePool
-                nodepool_path = None
-                for api_group in ['eks.amazonaws.com', 'karpenter.sh']:
-                    path = f'/apis/{api_group}/v1/nodepools/{node_pool_name}'
-                    resp = http.request('GET', f"{endpoint}{path}",
-                        headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
-                    if resp.status == 200:
-                        nodepool_path = path
-                        break
-
-                if nodepool_path:
-                    current_nodepool = json.loads(resp.data.decode())
-                    requirements = current_nodepool.get('spec', {}).get('template', {}).get('spec', {}).get('requirements', [])
-
-                    zone_req_existed = patch_result.get('ZoneReqExisted', False)
-                    original_zone_values = patch_result.get('OriginalZoneValues', [])
-
-                    if zone_req_existed and original_zone_values:
-                        # Restore original zone values
-                        for i, req in enumerate(requirements):
-                            if req.get('key') == 'topology.kubernetes.io/zone':
-                                patch = [{'op': 'replace',
-                                          'path': f'/spec/template/spec/requirements/{i}/values',
-                                          'value': original_zone_values}]
-                                http.request('PATCH', f"{endpoint}{nodepool_path}",
-                                    headers={'Authorization': f'Bearer {token}',
-                                             'Content-Type': 'application/json-patch+json',
-                                             'Accept': 'application/json'},
-                                    body=json.dumps(patch).encode('utf-8'))
-                                break
-                    else:
-                        # Zone req was added by us — remove it
-                        for i, req in enumerate(requirements):
-                            if req.get('key') == 'topology.kubernetes.io/zone':
-                                patch = [{'op': 'remove',
-                                          'path': f'/spec/template/spec/requirements/{i}'}]
-                                http.request('PATCH', f"{endpoint}{nodepool_path}",
-                                    headers={'Authorization': f'Bearer {token}',
-                                             'Content-Type': 'application/json-patch+json',
-                                             'Accept': 'application/json'},
-                                    body=json.dumps(patch).encode('utf-8'))
-                                break
-
-                    restore_status = 'NODEPOOL_RESTORED'
+                # Only touch the NodePool if the patch step confirmed it changed it.
+                # Without that confirmation we cannot distinguish a zone
+                # requirement we added from one that was already part of the
+                # customer's NodePool, and removing theirs would be destructive.
+                if patch_result.get('Status') != 'NODEPOOL_PATCHED':
+                    restore_status = 'NODEPOOL_UNCHANGED_NO_PATCH_RECORDED'
                 else:
-                    restore_status = 'NODEPOOL_NOT_FOUND'
+                    # Find the NodePool
+                    nodepool_path = None
+                    for api_group in ['eks.amazonaws.com', 'karpenter.sh']:
+                        path = f'/apis/{api_group}/v1/nodepools/{node_pool_name}'
+                        resp = http.request('GET', f"{endpoint}{path}",
+                            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+                        if resp.status == 200:
+                            nodepool_path = path
+                            break
+
+                    if nodepool_path:
+                        current_nodepool = json.loads(resp.data.decode())
+                        requirements = current_nodepool.get('spec', {}).get('template', {}).get('spec', {}).get('requirements', [])
+
+                        zone_req_existed = patch_result.get('ZoneReqExisted', False)
+                        original_zone_values = patch_result.get('OriginalZoneValues', [])
+
+                        if zone_req_existed and original_zone_values:
+                            # Restore the original zone values we recorded.
+                            restore_status = 'NODEPOOL_ALREADY_CORRECT'
+                            for i, req in enumerate(requirements):
+                                if req.get('key') == 'topology.kubernetes.io/zone':
+                                    if sorted(req.get('values', [])) == sorted(original_zone_values):
+                                        break
+                                    patch = [{'op': 'replace',
+                                              'path': f'/spec/template/spec/requirements/{i}/values',
+                                              'value': original_zone_values}]
+                                    r = http.request('PATCH', f"{endpoint}{nodepool_path}",
+                                        headers={'Authorization': f'Bearer {token}',
+                                                 'Content-Type': 'application/json-patch+json',
+                                                 'Accept': 'application/json'},
+                                        body=json.dumps(patch).encode('utf-8'))
+                                    restore_status = ('NODEPOOL_RESTORED' if r.status == 200
+                                                      else f'NODEPOOL_RESTORE_FAILED_{r.status}')
+                                    break
+                        else:
+                            # We added the zone requirement ourselves, so remove it —
+                            # but only if it still holds exactly the values we set.
+                            expected = patch_result.get('RemainingAZs', [])
+                            restore_status = 'NODEPOOL_ALREADY_CORRECT'
+                            for i, req in enumerate(requirements):
+                                if req.get('key') == 'topology.kubernetes.io/zone':
+                                    if expected and sorted(req.get('values', [])) != sorted(expected):
+                                        # Modified since we patched it — leave it alone.
+                                        restore_status = 'NODEPOOL_MODIFIED_EXTERNALLY_SKIPPED'
+                                        break
+                                    patch = [{'op': 'remove',
+                                              'path': f'/spec/template/spec/requirements/{i}'}]
+                                    r = http.request('PATCH', f"{endpoint}{nodepool_path}",
+                                        headers={'Authorization': f'Bearer {token}',
+                                                 'Content-Type': 'application/json-patch+json',
+                                                 'Accept': 'application/json'},
+                                        body=json.dumps(patch).encode('utf-8'))
+                                    restore_status = ('NODEPOOL_RESTORED' if r.status == 200
+                                                      else f'NODEPOOL_RESTORE_FAILED_{r.status}')
+                                    break
+                    else:
+                        restore_status = 'NODEPOOL_NOT_FOUND'
 
             except Exception as e:
                 restore_status = f'NODEPOOL_RESTORE_ERROR: {str(e)}'

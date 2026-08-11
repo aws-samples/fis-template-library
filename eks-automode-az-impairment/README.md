@@ -28,6 +28,22 @@ This experiment uses a "trifecta" approach (analogous to the ECS Fargate pattern
 2. **Node pool exclusion** — Cordon nodes and patch the NodePool to prevent scheduling in the target AZ
 3. **Pod deletion** — Force-delete pods to trigger rescheduling to healthy AZs
 
+### Important: use a custom NodePool, not a built-in one
+
+AWS documents that [the built-in `general-purpose` and `system` NodePools cannot be modified](https://aws.amazon.com/blogs/containers/maximizing-value-with-amazon-eks-auto-mode-strategies-for-visibility-control-and-optimization/). The Kubernetes API *accepts* a patch to them, but EKS Auto Mode reconciles the built-in NodePool back to its managed configuration.
+
+In validation testing against `general-purpose`, the zone exclusion was applied successfully and was still in place two minutes in, but had been reverted roughly four minutes into a fifteen-minute impairment — while Auto Mode was actively provisioning replacement nodes. Once reverted, nothing stops Auto Mode from launching nodes in the "impaired" AZ again, so the impairment silently ends early and the experiment still reports success.
+
+**Point `NodePoolName` at a custom NodePool that you own.** A custom NodePool is not reconciled by EKS, so the exclusion holds for the full duration. Verify the exclusion survives the whole window before trusting results:
+
+```bash
+# Should keep showing the target AZ excluded for the full impairment duration.
+watch -n 30 "kubectl get nodepool <YOUR NODEPOOL NAME> -o json \
+  | jq '.spec.template.spec.requirements[] | select(.key==\"topology.kubernetes.io/zone\")'"
+```
+
+Note that the NACL network disruption (`disrupt-az-network`) is unaffected by this and runs for its full duration regardless.
+
 ## Prerequisites
 
 Before running this experiment, ensure that:
@@ -71,10 +87,11 @@ Before running this experiment, ensure that:
 
 7. **Sufficient Capacity**: Remaining AZs must have sufficient capacity (or the ability to scale) to handle the workload during the experiment.
 
-8. **NodePool Identification**: Identify which NodePool your workloads use (default is `general-purpose` for EKS Auto Mode built-in pools). Check with:
+8. **NodePool Identification**: Identify which NodePool your workloads use:
    ```bash
    kubectl get nodepools
    ```
+   This must be a **custom NodePool**, not the built-in `general-purpose` or `system` pools — see [Important: use a custom NodePool](#important-use-a-custom-nodepool-not-a-built-in-one) above. Built-in pools are reconciled by EKS and the AZ exclusion will be silently reverted mid-experiment.
 
 ## How It Works
 
@@ -117,7 +134,7 @@ T+15m                     ▼  FIS restores NACLs (network connectivity returns)
                           ▼  EKS Auto Mode rebalances workloads across all AZs
 ```
 
-**Why the 2-minute wait before pod deletion:** The SSM automation needs ~30-60 seconds to cordon nodes and patch the NodePool. The additional buffer ensures that by the time pods are deleted, EKS Auto Mode has no option to reschedule them in the impaired AZ. After running 10 test iterations of the SSM automation, we measured the control plane time (cordon + NodePool patch) at approximately 38 seconds consistently. We recommend calibrating this for your specific cluster by running the SSM automation standalone 10 times and using the max observed time + 30 seconds buffer.
+**Why pods are deleted only after the NodePool is patched:** The ordering inside the SSM automation is what makes the impairment stick. Cordoning marks existing nodes in the target AZ unschedulable and the NodePool patch stops EKS Auto Mode from provisioning replacements there. Only then are pods deleted, so Kubernetes has no placement option left in the impaired AZ. If pods were deleted first, they could be rescheduled straight back into the AZ before the exclusion took effect.
 
 ### Actions Detail
 
@@ -166,13 +183,13 @@ The solution: the SSM automation handles pod deletion directly via the Kubernete
 | Target Name | Resource Type | Selection Mode | Description |
 |-------------|---------------|----------------|-------------|
 | `subnets-in-target-az` | `aws:ec2:subnet` | ALL | VPC subnets in the target AZ to disrupt network connectivity |
-| `eks-pods-in-target-az` | `aws:eks:pod` | ALL | Pods to delete in the target AZ |
-| `eks-pods-for-packet-loss` | `aws:eks:pod` | ALL | Pods to inject packet loss in the target AZ |
+
+The template defines only this one FIS target. Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why Pod Deletion Is in the SSM Automation](#why-pod-deletion-is-in-the-ssm-automation-not-a-separate-fis-action) above.
 
 ### Target Requirements
-- Pods must be identifiable via label selectors (e.g., `app=myapp,topology.kubernetes.io/zone=<AZ>`)
-- Pods must have `readOnlyRootFilesystem: false` for packet loss injection
-- The FIS service account must have RBAC access to the target namespace
+- The subnet must be in the AZ named by the automation's `TargetAZ` parameter, so the network disruption and the Kubernetes-level impairment affect the same AZ
+- Nodes must carry the standard `topology.kubernetes.io/zone` label (EKS applies this automatically) — the automation uses it to find nodes and pods in the target AZ
+- The SSM automation role must have Kubernetes API access via an EKS Access Entry plus the RBAC in `eks-automode-az-impairment-rbac.yaml`
 
 ## Parameters to Configure
 
@@ -187,39 +204,21 @@ Before running the experiment, update these placeholder values:
 | `<YOUR EKS CLUSTER>` | Name of your EKS cluster |
 | `<YOUR TARGET AZ>` | Availability Zone to impair (e.g., `ap-southeast-2a`) |
 | `<YOUR SUBNET ID IN TARGET AZ>` | Subnet ID(s) in the target AZ |
-| `<YOUR NODEPOOL NAME>` | EKS Auto Mode NodePool name (default: `general-purpose`) |
-| `<YOUR K8S SERVICE ACCOUNT>` | Kubernetes service account for FIS (default: `fis-experiment-sa`) |
-| `<YOUR NAMESPACE>` | Kubernetes namespace where target pods run |
-| `<YOUR POD LABEL SELECTOR>` | Label selector for target pods (e.g., `app=myapp`) |
-| `<YOUR CONTAINER NAME>` | Container name within the pod to target |
+| `<YOUR NODEPOOL NAME>` | Name of a **custom** EKS Auto Mode NodePool (not `general-purpose` or `system`) |
 
-## Targeting Pods in a Specific AZ
+## How Pods in the Target AZ Are Selected
 
-FIS EKS pod actions use label selectors, not AZ filters directly. To target pods in a specific AZ, you have two options:
+No pod label selector configuration is required. The SSM automation resolves the target pods itself:
 
-### Option 1: Use Pod Topology Labels (Recommended)
+1. Lists nodes matching `topology.kubernetes.io/zone=<TargetAZ>`
+2. For each of those nodes, lists pods via `fieldSelector=spec.nodeName=<node>`
+3. Deletes each pod with `gracePeriodSeconds=0`, skipping the `kube-system`, `kube-node-lease`, and `kube-public` namespaces
 
-If your pods have topology labels (many frameworks add these automatically):
-```yaml
-selectorType: labelSelector
-selectorValue: "app=myapp,topology.kubernetes.io/zone=ap-southeast-2a"
-```
-
-### Option 2: Use a Topology Spread Constraint + Custom Labels
-
-Add a mutating webhook or init container that labels pods with their AZ, or use the Kubernetes Downward API to expose node topology labels.
-
-### Option 3: Target All Pods (Simpler)
-
-Target all pods with the app label across all AZs. The network disruption and NodePool exclusion handle the AZ-specific failure — pods in healthy AZs continue working normally despite the packet loss action (which only affects reachability, not pod lifecycle):
-```yaml
-selectorType: labelSelector
-selectorValue: "app=myapp"
-```
+This means **all non-system pods on nodes in the target AZ are deleted**, across every namespace. If you need to limit the blast radius to specific workloads, add a namespace or label filter to the `DeletePodsInAZ` step in `eks-automode-az-impairment-node-automation.yaml`.
 
 ## Fine-Tuning the Wait Duration
 
-The 2-minute wait before pod deletion is a conservative default. Your cluster may need more or less time depending on:
+The automation deletes pods immediately after cordoning nodes and patching the NodePool, so no separate wait action is needed. If your cluster's control plane is slow enough that pods get rescheduled into the impaired AZ before the NodePool patch propagates, insert an `aws:sleep` step between `PatchNodePoolExcludeAZ` and `DeletePodsInAZ`. Timing depends on:
 
 - **Cluster size**: More nodes = longer cordon time
 - **Control plane load**: Busy clusters may take longer for NodePool patches to propagate
@@ -228,7 +227,7 @@ The 2-minute wait before pod deletion is a conservative default. Your cluster ma
 To calibrate:
 1. Run the SSM automation document standalone 10 times
 2. Measure the time from start to "nodes cordoned + NodePool patched"
-3. Set `wait-before-pod-delete` to the P95 duration + 30 seconds buffer
+3. Size the added `aws:sleep` step at the P95 duration + 30 seconds buffer
 
 ## Stop Conditions
 
@@ -263,7 +262,7 @@ After the experiment completes:
 
 1. **Network**: FIS automatically restores the original NACLs (built into `aws:network:disrupt-connectivity`)
 2. **NodePool**: SSM automation restores the original zone requirements
-3. **Nodes**: SSM automation uncordons nodes in the target AZ
+3. **Nodes**: SSM automation uncordons nodes in the target AZ — note that if EKS Auto Mode terminated a drained node during the impairment, there may be no node left in that AZ to uncordon, and `UncordonedNodes` will be empty. This is expected.
 4. **Pods**: EKS Auto Mode will **not** automatically rebalance pods back to the restored AZ — pods stay where they landed during the failover
 
 **To trigger rebalancing after the experiment:**
@@ -272,7 +271,7 @@ After the experiment completes:
 kubectl rollout restart deployment/<your-deployment-name>
 ```
 
-This cycles the pods, and the scheduler will spread them across all AZs again (prompting EKS Auto Mode to provision a node in the restored AZ if needed). In production, this is the equivalent of a post-incident rebalancing step.
+This cycles the pods so the scheduler can place them across all AZs again. Whether they actually spread back depends on your pod resource requests and topology constraints: if the surviving AZ's nodes have enough headroom to hold every replica, the scheduler has no reason to spread and Auto Mode will not provision a node in the restored AZ. A hard `topologySpreadConstraints` entry (`whenUnsatisfiable: DoNotSchedule`) combined with requests large enough that one node cannot hold all replicas is what forces a genuine multi-AZ spread. In production, this is the equivalent of a post-incident rebalancing step.
 
 Recovery time depends on:
 - Control plane operations to provision new nodes (if needed)

@@ -29,22 +29,10 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowEKSPodActions",
+      "Sid": "AllowEKSDescribe",
       "Effect": "Allow",
-      "Action": [
-        "eks:DescribeCluster",
-        "eks:AccessKubernetesApi"
-      ],
+      "Action": "eks:DescribeCluster",
       "Resource": "arn:aws:eks:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster/<YOUR EKS CLUSTER>"
-    },
-    {
-      "Sid": "AllowEC2Describe",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstances",
-        "ec2:DescribeSubnets"
-      ],
-      "Resource": "*"
     },
     {
       "Sid": "AllowSSMAutomationExecution",
