@@ -76,7 +76,7 @@ Before running this experiment, ensure that:
      --document-format YAML
    ```
 
-5. **Multi-AZ Deployment**: Your EKS Auto Mode cluster must have subnets in at least 2 different AZs, with workloads distributed across them.
+5. **Multi-AZ Deployment**: Your EKS Auto Mode cluster must have subnets in at least 2 different AZs, with workloads distributed across them. **3 AZs is recommended** — with `DoNotSchedule` and `maxSkew: 1`, a 3-AZ cluster allows evicted pods to redistribute across both surviving AZs (all pods `Running`), whereas a 2-AZ cluster leaves them `Pending`. See [Number of Availability Zones](#3-number-of-availability-zones).
 
 6. **Workload must be able to fail over into the surviving AZs** — see [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome) below. This is a property of *your* workload, not of the experiment, and it decides whether you observe a surviving service or a degraded one.
 
@@ -129,20 +129,59 @@ If existing nodes have headroom, failover is as fast as pod startup — no EC2 l
 
 ### Which behaviour to expect
 
-| Workload configuration | During impairment | What it demonstrates |
-|---|---|---|
-| `ScheduleAnyway`, headroom available in surviving AZ | All replicas `Running` in surviving AZ; no new nodes | Workload sustains AZ loss; fastest recovery |
-| `ScheduleAnyway`, no headroom | Replicas briefly `Pending`, then `Running` on newly provisioned nodes | Workload sustains AZ loss via scale-up |
-| `ScheduleAnyway`, scale-up blocked (NodePool `limits`, instance constraints) | Some replicas stay `Pending` | Capacity ceiling — a real finding to fix |
-| `DoNotSchedule` | Replicas stay `Pending` for the whole impairment; service degraded | Proves the AZ exclusion is in force, but **not** that the workload survives |
+| Workload configuration | AZs | During impairment | What it demonstrates |
+|---|---|---|---|
+| `ScheduleAnyway`, headroom available | 2 | All replicas `Running` in surviving AZ; no new nodes | Workload sustains AZ loss; fastest recovery |
+| `ScheduleAnyway`, no headroom | 2 | Replicas briefly `Pending`, then `Running` on newly provisioned nodes | Workload sustains AZ loss via scale-up |
+| `ScheduleAnyway`, scale-up blocked (NodePool `limits`, instance constraints) | 2 | Some replicas stay `Pending` | Capacity ceiling — a real finding to fix |
+| `DoNotSchedule` | 2 | Replicas stay `Pending` for the whole impairment; service degraded | Proves the AZ exclusion is in force, but **not** that the workload survives |
+| `ScheduleAnyway`, headroom available | 3 | All replicas `Running`, distributed 0/3/3 across surviving AZs | Workload sustains AZ loss with even distribution |
+| `DoNotSchedule`, `maxSkew: 1` | 3 | All replicas `Running`, distributed 0/3/3 across surviving AZs | **Both proves the exclusion AND that the workload survives** — the key 3-AZ advantage |
+| `DoNotSchedule`, `maxSkew: 1`, no headroom | 3 | Replicas briefly `Pending`, then `Running` after Auto Mode scale-up in surviving AZs | Workload sustains via scale-up in both surviving AZs |
 
 Both settings are legitimate tests, but they answer different questions. `DoNotSchedule` is the stricter proof that the impairment itself is real — `Pending` pods are unambiguous evidence that nothing could be scheduled into the impaired AZ, which is useful when validating the template or the automation. `ScheduleAnyway` is what you want for an AZ impairment scenario that showcases the workload sustaining the failure.
 
-Validated on an EKS Auto Mode cluster (6 replicas, 500m CPU requests, 2 AZs): with `DoNotSchedule` the service ran at 50% capacity (3 `Running` / 3 `Pending`) for the full 15-minute impairment. Changing only `whenUnsatisfiable` to `ScheduleAnyway` produced 6 `Running` / 0 `Pending` throughout — 100% availability — with the replicas packing onto existing nodes in the surviving AZ and no new nodes needed.
+### 3. Number of Availability Zones
+
+The number of AZs in your cluster changes both the blast radius and the redistribution behaviour during impairment.
+
+| Cluster AZs | Pods lost | Surviving pods | Where replacements land | Effective capacity during impairment |
+|---|---|---|---|---|
+| 2 AZs (e.g. 3/3) | 50% of replicas | 50% | Single surviving AZ only | 50% baseline (if `DoNotSchedule`) or 100% (if `ScheduleAnyway` with headroom) |
+| 3 AZs (e.g. 2/2/2) | 33% of replicas | 67% | **Distributed across both surviving AZs** | 67% baseline (if `DoNotSchedule`) or 100% (if `ScheduleAnyway` with headroom) |
+
+With **3 AZs and `DoNotSchedule`**, the topology spread constraint (`maxSkew: 1`) forces the scheduler to distribute evicted pods across both surviving AZs rather than concentrating them in one. After the 2 pods in the target AZ are killed, the scheduler must place them so that no zone exceeds the others by more than 1 — the only valid 6-pod arrangement across 2 zones is 3/3. This means the workload stays spread even under failure, rather than hotspotting into a single AZ.
+
+With **2 AZs and `DoNotSchedule`**, there is only one surviving AZ. The evicted pods cannot schedule there because moving from a 3/3 spread to 0/6 violates `maxSkew: 1` (skew = 6). They remain `Pending`.
+
+This makes the 3-AZ topology fundamentally different: `DoNotSchedule` no longer means "degraded for the duration" — it means "pods redistribute evenly across surviving zones while still proving the impaired AZ is excluded."
+
+### Validation results
+
+**2 AZs** (6 replicas, 500m CPU requests, `DoNotSchedule`): the service ran at 50% capacity (3 `Running` / 3 `Pending`) for the full 15-minute impairment. Changing only `whenUnsatisfiable` to `ScheduleAnyway` produced 6 `Running` / 0 `Pending` throughout — 100% availability — with the replicas packing onto existing nodes in the surviving AZ and no new nodes needed.
+
+**3 AZs** (6 replicas, 500m CPU requests, `DoNotSchedule`): the 2 pods in the target AZ were killed and rescheduled — one to each surviving AZ — producing a clean 0/3/3 distribution. All 6 pods were `Running` throughout the impairment. The `maxSkew: 1` constraint was satisfiable across 2 remaining zones (3 vs 3 = skew 0), so unlike the 2-AZ case, `DoNotSchedule` did not cause degradation. The workload sustained the AZ loss with pods distributed across both surviving zones rather than collapsing into one.
+
+| Metric | 2 AZs | 3 AZs |
+|---|---|---|
+| Starting distribution | 3 / 3 | 2 / 2 / 2 |
+| Pods killed | 3 (50%) | 2 (33%) |
+| During impairment (`DoNotSchedule`) | 0 / 3 + 3 `Pending` | 0 / 3 / 3 — all `Running` |
+| During impairment (`ScheduleAnyway`) | 0 / 6 — all `Running` | 0 / 3 / 3 — all `Running` |
+| Nodes reprovisioned during | 0 | 0 |
+| Post-restore distribution | Unchanged until rollout restart | Unchanged until rollout restart |
 
 ### After the experiment
 
-`ScheduleAnyway` is a preference, so replicas do **not** migrate back once the AZ is restored. See [Recovery Behavior](#recovery-behavior) for how to rebalance.
+Regardless of `whenUnsatisfiable` or AZ count, replicas do **not** automatically migrate back once the impaired AZ is restored. Topology spread constraints are evaluated only at scheduling time — they never evict a running pod to satisfy a spread. Additionally, with `consolidationPolicy: WhenEmpty`, no new node is reprovisioned in the restored AZ because no scheduling demand exists there.
+
+The post-restore state is:
+- NodePool zone requirement includes all original AZs again ✓
+- No cordoned nodes remain ✓
+- No leftover NACLs (FIS restores these automatically) ✓
+- **Pods stay where they landed during impairment** — the cluster has capacity in the restored AZ but nothing triggers rebalancing
+
+This is realistic production behaviour: after an AZ recovers, workloads drift from their intended spread until an explicit action redistributes them. See [Recovery Behavior](#recovery-behavior) for how to rebalance.
 
 ## How It Works
 
@@ -320,8 +359,9 @@ After the experiment completes:
 2. **NodePool**: SSM automation restores the original zone requirements
 3. **Nodes**: SSM automation uncordons nodes in the target AZ — note that if EKS Auto Mode terminated a drained node during the impairment, there may be no node left in that AZ to uncordon, and `UncordonedNodes` will be empty. This is expected.
 4. **Pods**: behaviour depends on the configuration described in [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome):
-   - With `ScheduleAnyway`, pods that failed over **stay** in the surviving AZ. The spread is only a preference, so a running pod is never moved to satisfy it.
-   - With `DoNotSchedule`, pods that were left `Pending` schedule into the restored AZ on their own as soon as the NodePool is restored and Auto Mode provisions a node there — no manual step needed.
+   - With `ScheduleAnyway` (2 or 3 AZs), pods that failed over **stay** in the surviving AZ(s). The spread is only a preference, so a running pod is never moved to satisfy it.
+   - With `DoNotSchedule` (2 AZs), pods that were left `Pending` schedule into the restored AZ on their own as soon as the NodePool is restored and Auto Mode provisions a node there — no manual step needed.
+   - With `DoNotSchedule` (3 AZs), pods **already rescheduled successfully** into the surviving AZs during impairment. They stay in their 0/3/3 distribution — they will not rebalance to 2/2/2 because topology spread constraints are only evaluated at scheduling time.
 
 **To rebalance pods that stayed put:**
 
@@ -330,6 +370,12 @@ kubectl rollout restart deployment/<your-deployment-name>
 ```
 
 This cycles the pods so the scheduler places them fresh across all AZs. Note that a soft constraint still will not guarantee a spread: if the surviving AZ has enough headroom for every replica, the scheduler may simply place them all there again. In production, this is the equivalent of a post-incident rebalancing step.
+
+**Why no automatic rebalance occurs:**
+
+Kubernetes topology spread constraints are admission-time only — they influence where a pod is *initially placed* but never evict a running pod to re-satisfy the constraint. Combined with EKS Auto Mode's `consolidationPolicy: WhenEmpty` (or Karpenter's equivalent), no new node is provisioned in the restored AZ because no scheduling demand exists there. The node that was cordoned and drained during impairment was likely terminated, and nothing triggers its replacement.
+
+This post-impairment drift is realistic production behaviour: after an AZ recovers, workloads remain where they failed over until an operator explicitly rebalances them (rollout restart, scaling event, or a descheduler).
 
 Recovery time depends on:
 - Control plane operations to provision new nodes (if needed)
