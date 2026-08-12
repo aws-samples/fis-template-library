@@ -6,13 +6,15 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Hypothesis
 
-When an Availability Zone experiences an impairment affecting an EKS Auto Mode cluster, the workloads should continue operating with reduced capacity using pods in the remaining healthy AZs. Specifically:
+When an Availability Zone experiences an impairment affecting an EKS Auto Mode cluster, the workload should sustain the failure by running its replicas in the remaining healthy AZs — scaling up there as needed — rather than losing capacity for the duration. Specifically:
 
 - When network connectivity is disrupted in the target AZ, pods in that AZ should become unreachable
 - When nodes in the target AZ are cordoned and the NodePool is patched to exclude the AZ, EKS Auto Mode should not provision new nodes in the impaired AZ
-- When pods are deleted in the target AZ, EKS Auto Mode should reschedule them to healthy AZs only
-- The application should remain available throughout the experiment with degraded but functional capacity
-- When the NodePool is restored and nodes are uncordoned, EKS Auto Mode should automatically rebalance workloads across all AZs
+- When pods are deleted in the target AZ, Kubernetes should reschedule them into the healthy AZs only, scaling up there if required
+- The application should remain available throughout the experiment, serving from the healthy AZs
+- When the NodePool is restored and nodes are uncordoned, capacity should become available in that AZ again
+
+Whether the third and fourth points hold depends on your workload's topology spread constraints and the capacity headroom in the surviving AZs — see [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome). A workload that cannot fail over will instead run at reduced capacity for the duration, and the experiment will still report success.
 
 ## Background: Why This Is Different from Standard EKS
 
@@ -83,15 +85,71 @@ Before running this experiment, ensure that:
 
 5. **Multi-AZ Deployment**: Your EKS Auto Mode cluster must have subnets in at least 2 different AZs, with workloads distributed across them.
 
-6. **Pod Security Context**: For the `aws:eks:pod-network-packet-loss` action, target pods must have `readOnlyRootFilesystem: false` in their security context. The FIS pod container requires this to monitor fault injection status.
+6. **Workload must be able to fail over into the surviving AZs** — see [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome) below. This is a property of *your* workload, not of the experiment, and it decides whether you observe a surviving service or a degraded one.
 
-7. **Sufficient Capacity**: Remaining AZs must have sufficient capacity (or the ability to scale) to handle the workload during the experiment.
-
-8. **NodePool Identification**: Identify which NodePool your workloads use:
+7. **NodePool Identification**: Identify which NodePool your workloads use:
    ```bash
    kubectl get nodepools
    ```
    This must be a **custom NodePool**, not the built-in `general-purpose` or `system` pools — see [Important: use a custom NodePool](#important-use-a-custom-nodepool-not-a-built-in-one) above. Built-in pools are reconciled by EKS and the AZ exclusion will be silently reverted mid-experiment.
+
+## Cluster configuration determines the outcome
+
+This experiment always does the same three things: cordon the nodes in the target AZ, exclude that AZ from the NodePool, and delete the pods there. What you *observe* — a service that rides through the impairment, or one that runs degraded — is decided entirely by **your workload's configuration**, not by anything in the experiment template.
+
+The intent of an AZ impairment scenario is to show that the workload sustains the failure by running its replicas in the healthy AZs. If your workload is not configured to allow that, the experiment will still report success while the service sits at reduced capacity. Check the two settings below **before** running it, or you will draw the wrong conclusion from a passing experiment.
+
+These are cluster/workload changes, applied with `kubectl` against your own manifests. Nothing here is part of the FIS template.
+
+### 1. Topology spread constraint: `whenUnsatisfiable`
+
+This is the setting that decides the outcome.
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway   # <-- or DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: myapp
+```
+
+With `DoNotSchedule` and `maxSkew: 1`, concentrating every replica into one AZ violates the constraint (a 6-vs-0 split is a skew of 6), so the scheduler **refuses to place the evicted pods at all**. They stay `Pending`. Because they are unschedulable rather than merely unplaced, EKS Auto Mode never receives a signal to provision capacity for them, so no replacement node appears anywhere.
+
+With `ScheduleAnyway`, the even spread becomes a preference. The evicted pods schedule immediately into the surviving AZ, using spare capacity on existing nodes if there is any, and prompting Auto Mode to provision a node there if there is not.
+
+### 2. Capacity headroom in the surviving AZs
+
+Failover only completes if the replicas actually fit. Compare the total requests of the replicas that will move against the allocatable capacity left in the surviving AZs:
+
+```bash
+# Allocatable CPU per node, by zone.
+kubectl get nodes -o custom-columns=\
+'NAME:.metadata.name,ZONE:.metadata.labels.topology\.kubernetes\.io/zone,CPU:.status.allocatable.cpu'
+
+# What each node is already committed to.
+kubectl describe node <node> | grep -A5 'Allocated resources'
+```
+
+If existing nodes have headroom, failover is as fast as pod startup — no EC2 launch required. If they do not, Auto Mode provisions new nodes and failover additionally waits on instance launch and node registration (typically 60–90s). Make sure nothing prevents that scale-up: a `spec.limits` on the NodePool, an insufficient `maxSkew`, or restrictive instance-type requirements can all cap it.
+
+### Which behaviour to expect
+
+| Workload configuration | During impairment | What it demonstrates |
+|---|---|---|
+| `ScheduleAnyway`, headroom available in surviving AZ | All replicas `Running` in surviving AZ; no new nodes | Workload sustains AZ loss; fastest recovery |
+| `ScheduleAnyway`, no headroom | Replicas briefly `Pending`, then `Running` on newly provisioned nodes | Workload sustains AZ loss via scale-up |
+| `ScheduleAnyway`, scale-up blocked (NodePool `limits`, instance constraints) | Some replicas stay `Pending` | Capacity ceiling — a real finding to fix |
+| `DoNotSchedule` | Replicas stay `Pending` for the whole impairment; service degraded | Proves the AZ exclusion is in force, but **not** that the workload survives |
+
+Both settings are legitimate tests, but they answer different questions. `DoNotSchedule` is the stricter proof that the impairment itself is real — `Pending` pods are unambiguous evidence that nothing could be scheduled into the impaired AZ, which is useful when validating the template or the automation. `ScheduleAnyway` is what you want for an AZ impairment scenario that showcases the workload sustaining the failure.
+
+Validated on an EKS Auto Mode cluster (6 replicas, 500m CPU requests, 2 AZs): with `DoNotSchedule` the service ran at 50% capacity (3 `Running` / 3 `Pending`) for the full 15-minute impairment. Changing only `whenUnsatisfiable` to `ScheduleAnyway` produced 6 `Running` / 0 `Pending` throughout — 100% availability — with the replicas packing onto existing nodes in the surviving AZ and no new nodes needed.
+
+### After the experiment
+
+`ScheduleAnyway` is a preference, so replicas do **not** migrate back once the AZ is restored. See [Recovery Behavior](#recovery-behavior) for how to rebalance.
 
 ## How It Works
 
@@ -263,15 +321,17 @@ After the experiment completes:
 1. **Network**: FIS automatically restores the original NACLs (built into `aws:network:disrupt-connectivity`)
 2. **NodePool**: SSM automation restores the original zone requirements
 3. **Nodes**: SSM automation uncordons nodes in the target AZ — note that if EKS Auto Mode terminated a drained node during the impairment, there may be no node left in that AZ to uncordon, and `UncordonedNodes` will be empty. This is expected.
-4. **Pods**: EKS Auto Mode will **not** automatically rebalance pods back to the restored AZ — pods stay where they landed during the failover
+4. **Pods**: behaviour depends on the configuration described in [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome):
+   - With `ScheduleAnyway`, pods that failed over **stay** in the surviving AZ. The spread is only a preference, so a running pod is never moved to satisfy it.
+   - With `DoNotSchedule`, pods that were left `Pending` schedule into the restored AZ on their own as soon as the NodePool is restored and Auto Mode provisions a node there — no manual step needed.
 
-**To trigger rebalancing after the experiment:**
+**To rebalance pods that stayed put:**
 
 ```bash
 kubectl rollout restart deployment/<your-deployment-name>
 ```
 
-This cycles the pods so the scheduler can place them across all AZs again. Whether they actually spread back depends on your pod resource requests and topology constraints: if the surviving AZ's nodes have enough headroom to hold every replica, the scheduler has no reason to spread and Auto Mode will not provision a node in the restored AZ. A hard `topologySpreadConstraints` entry (`whenUnsatisfiable: DoNotSchedule`) combined with requests large enough that one node cannot hold all replicas is what forces a genuine multi-AZ spread. In production, this is the equivalent of a post-incident rebalancing step.
+This cycles the pods so the scheduler places them fresh across all AZs. Note that a soft constraint still will not guarantee a spread: if the surviving AZ has enough headroom for every replica, the scheduler may simply place them all there again. In production, this is the equivalent of a post-incident rebalancing step.
 
 Recovery time depends on:
 - Control plane operations to provision new nodes (if needed)
