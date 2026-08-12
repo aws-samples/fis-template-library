@@ -2,7 +2,10 @@
 
 This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
-THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Hypothesis
 
@@ -55,7 +58,7 @@ Before running this experiment, ensure that:
 2. **EKS Cluster Access**: The SSM automation role must have Kubernetes API access. Create an EKS Access Entry:
    ```bash
    aws eks create-access-entry \
-     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR SSM ROLE NAME> \
+     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME> \
      --username fis-ssm-automation \
      --cluster-name <YOUR EKS CLUSTER>
    ```
@@ -295,7 +298,7 @@ Before running the experiment, update these placeholder values:
 | `<YOUR AWS ACCOUNT>` | Your 12-digit AWS account ID |
 | `<YOUR REGION>` | AWS region where resources are deployed (e.g., `ap-southeast-2`) |
 | `<YOUR FIS ROLE NAME>` | FIS execution IAM role name |
-| `<YOUR SSM ROLE NAME>` | SSM automation IAM role name |
+| `<YOUR SSM AUTOMATION ROLE NAME>` | SSM automation IAM role name |
 | `<YOUR EKS CLUSTER>` | Name of your EKS cluster |
 | `<YOUR TARGET AZ>` | Availability Zone to impair (e.g., `ap-southeast-2a`) |
 | `<YOUR SUBNET ID IN TARGET AZ>` | Subnet ID(s) in the target AZ |
@@ -327,6 +330,13 @@ To calibrate:
 ## Stop Conditions
 
 The experiment does not include stop conditions by default. It will continue until all actions complete (approximately 30-45 minutes total).
+
+## Observability and stop conditions
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
+business metric requiring an immediate end of the fault injection. This 
+template makes no assumptions about your application and the relevant metrics 
+and does not include stop conditions by default.
 
 ### Recommended Metrics for Stop Conditions
 
@@ -385,17 +395,21 @@ Recovery time depends on:
 
 ## Next Steps
 
-1. Review the RBAC ClusterRole and confirm the `fis-ssm-automation` username matches the one in your EKS Access Entry.
-2. Narrow the blast radius if needed — by default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter to the `DeletePodsInAZ` step to scope it.
-3. Identify business metrics tied to your EKS workload health.
-4. Create CloudWatch alarms and add them as stop conditions.
-5. **Test in a non-production environment first** to validate automation behavior and timing.
-6. Document expected vs actual behavior to build an AZ failure runbook.
-7. Gradually increase scope (longer duration, more namespaces, multiple NodePools).
+As you adapt this scenario to your needs, we recommend:
+
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to your EKS workload health.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the AZ impairment.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Reviewing the RBAC ClusterRole and confirming the `fis-ssm-automation` username matches the one in your EKS Access Entry.
+6. Narrowing the blast radius if needed — by default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter to the `DeletePodsInAZ` step to scope it.
+7. **Testing in a non-production environment first** to validate automation behavior and timing.
+8. Documenting expected vs actual behavior to build an AZ failure runbook.
+9. Gradually increasing scope (longer duration, more namespaces, multiple NodePools).
 
 ## Import Experiment
 
-You can import the JSON experiment template into your AWS account via CLI or AWS CDK. For step by step instructions, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
 
 ## Files in This Directory
 
@@ -405,8 +419,8 @@ You can import the JSON experiment template into your AWS account via CLI or AWS
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
 | `eks-automode-az-impairment-template.json` | FIS experiment template definition |
 | `eks-automode-az-impairment-node-automation.yaml` | SSM Automation document (cordon, patch NodePool, wait, restore) |
-| `eks-automode-az-impairment-fis-role-iam-policy.json` | IAM policy for the FIS execution role |
-| `eks-automode-az-impairment-ssm-automation-role-iam-policy.json` | IAM policy for the SSM automation role |
+| `eks-automode-az-impairment-iam-policy.json` | IAM policy for the FIS execution role |
+| `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role |
 | `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the SSM automation role |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ssm-iam-trust-relationship.json` | Trust policy for SSM service |
