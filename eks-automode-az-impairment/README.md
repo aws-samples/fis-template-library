@@ -58,21 +58,14 @@ Before running this experiment, ensure that:
      --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR SSM ROLE NAME> \
      --username fis-ssm-automation \
      --cluster-name <YOUR EKS CLUSTER>
-
-   # For FIS pod actions
-   aws eks create-access-entry \
-     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR FIS ROLE NAME> \
-     --username fis-experiment \
-     --cluster-name <YOUR EKS CLUSTER>
    ```
+   Only the SSM automation role needs Kubernetes access. The FIS execution role never calls the Kubernetes API — it only starts the SSM automation and drives the NACL action — so it does not need an access entry.
 
 3. **Kubernetes RBAC**: Apply the RBAC configuration to your cluster:
    ```bash
    kubectl apply -f eks-automode-az-impairment-rbac.yaml
    ```
-   This grants:
-   - FIS pod actions: permissions to delete pods and inject ephemeral containers
-   - SSM automation: permissions to cordon/uncordon nodes and patch NodePools
+   This grants the SSM automation permission to cordon/uncordon nodes, delete pods, and patch the NodePool.
 
 4. **SSM Automation Document**: Deploy the SSM automation document:
    ```bash
@@ -224,17 +217,22 @@ Steps 2-4 have `onFailure` and `onCancel` routing to the restore step, ensuring 
 | Workload termination | `aws:ecs:stop-task` (FIS action, AZ-filterable) | K8s API pod delete via SSM automation (see below) |
 | Restore mechanism | Re-add subnet to service config | Remove zone exclusion from NodePool + uncordon nodes |
 
-### Why Pod Deletion Is in the SSM Automation (Not a Separate FIS Action)
+### Why This Experiment Uses No `aws:eks:pod` Actions
 
 The ECS experiment uses `aws:ecs:stop-task` as a separate FIS action because ECS tasks have native AZ metadata that FIS can filter on (resource tags + `AvailabilityZone` path filter).
 
-EKS pods do not have native AZ filtering in FIS. The `aws:eks:pod-delete` action targets pods by **namespace + label selector** only — there is no way to filter to a specific AZ. This means:
+EKS pod targets have no equivalent. FIS resolves `aws:eks:pod` targets by **namespace + label selector**, and the [FIS documentation](https://docs.aws.amazon.com/fis/latest/userguide/eks-pod-actions.html) states you *"can't identify targets of type `aws:eks:pod` in your experiment template using resource ARNs or resource tags."* Critically, **pods do not inherit their node's `topology.kubernetes.io/zone` label** — that label exists on Nodes only. A selector like `app=myapp,topology.kubernetes.io/zone=us-east-1a` therefore matches zero pods.
 
-- You can't say "delete only pods in ap-southeast-2a" using FIS's pod-delete action
-- If you target all pods by label, you'd delete pods in healthy AZs too
-- The `emptyTargetResolutionMode: skip` causes the action to silently do nothing when no AZ-specific targets resolve
+That leaves no correct way to scope a pod action to one AZ:
 
-The solution: the SSM automation handles pod deletion directly via the Kubernetes API. After cordoning nodes and patching the NodePool, it lists pods running on nodes in the target AZ and deletes them with `gracePeriodSeconds=0` (simulating sudden death, same as ECS stop-task). This gives precise AZ-scoped pod termination without requiring FIS to support AZ filtering for EKS pods.
+- An AZ-qualified label selector resolves to nothing, and with `emptyTargetResolutionMode: skip` the action silently does nothing while the experiment still reports success
+- Dropping the AZ term and targeting `app=myapp` hits pods in the **healthy** AZs too — degrading the very capacity the experiment is meant to prove survives
+
+So pod termination is handled by the SSM automation instead, directly via the Kubernetes API: it lists pods on nodes in the target AZ and deletes them with `gracePeriodSeconds=0` (sudden death, same as ECS stop-task). This gives precise AZ-scoped termination with no dependency on FIS pod targeting.
+
+**This is also why there is no `aws:eks:pod-network-packet-loss` action.** Beyond the same targeting problem, subnet-level NACLs (`aws:network:disrupt-connectivity`) already block all traffic in the AZ — strictly broader than per-pod packet loss, since it affects every resource in the subnet rather than only labelled pods. The pod action would add setup cost (a Kubernetes service account, the `privileged` Pod Security Standard, root in the ephemeral container, and `readOnlyRootFilesystem: false` on every target pod) for no additional coverage.
+
+If you do add `aws:eks:pod` actions to a fork of this experiment, note that all of them fail unless target pods set `readOnlyRootFilesystem: false` in their `securityContext` — FIS cannot otherwise monitor injection status. You would also need to re-add a Kubernetes service account, an EKS access entry for the FIS role, and the corresponding RBAC, none of which this experiment installs.
 
 ## Targets
 
@@ -242,7 +240,7 @@ The solution: the SSM automation handles pod deletion directly via the Kubernete
 |-------------|---------------|----------------|-------------|
 | `subnets-in-target-az` | `aws:ec2:subnet` | ALL | VPC subnets in the target AZ to disrupt network connectivity |
 
-The template defines only this one FIS target. Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why Pod Deletion Is in the SSM Automation](#why-pod-deletion-is-in-the-ssm-automation-not-a-separate-fis-action) above.
+The template defines only this one FIS target. Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why This Experiment Uses No `aws:eks:pod` Actions](#why-this-experiment-uses-no-awsekspod-actions) above.
 
 ### Target Requirements
 - The subnet must be in the AZ named by the automation's `TargetAZ` parameter, so the network disruption and the Kubernetes-level impairment affect the same AZ
@@ -341,13 +339,13 @@ Recovery time depends on:
 
 ## Next Steps
 
-1. Review and customize the RBAC configuration for your specific namespaces and workloads.
-2. Identify business metrics tied to your EKS workload health.
-3. Create CloudWatch alarms and add them as stop conditions.
-4. **Test in a non-production environment first** to validate automation behavior and timing.
-5. Fine-tune the wait duration based on your cluster's SSM execution time.
+1. Review the RBAC ClusterRole and confirm the `fis-ssm-automation` username matches the one in your EKS Access Entry.
+2. Narrow the blast radius if needed — by default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter to the `DeletePodsInAZ` step to scope it.
+3. Identify business metrics tied to your EKS workload health.
+4. Create CloudWatch alarms and add them as stop conditions.
+5. **Test in a non-production environment first** to validate automation behavior and timing.
 6. Document expected vs actual behavior to build an AZ failure runbook.
-7. Gradually increase scope (longer duration, multiple services/namespaces).
+7. Gradually increase scope (longer duration, more namespaces, multiple NodePools).
 
 ## Import Experiment
 
@@ -363,6 +361,6 @@ You can import the JSON experiment template into your AWS account via CLI or AWS
 | `eks-automode-az-impairment-node-automation.yaml` | SSM Automation document (cordon, patch NodePool, wait, restore) |
 | `eks-automode-az-impairment-fis-role-iam-policy.json` | IAM policy for the FIS execution role |
 | `eks-automode-az-impairment-ssm-automation-role-iam-policy.json` | IAM policy for the SSM automation role |
-| `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for FIS and SSM automation |
+| `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the SSM automation role |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ssm-iam-trust-relationship.json` | Trust policy for SSM service |

@@ -1,56 +1,16 @@
-# Kubernetes RBAC configuration for FIS EKS Pod actions and SSM automation
+# Kubernetes RBAC for the SSM automation used by this experiment.
 # Apply this to your cluster: kubectl apply -f eks-automode-az-impairment-rbac.yaml
+#
+# The permissions below are exactly what eks-automode-az-impairment-node-automation.yaml
+# performs against the Kubernetes API:
+#   - list nodes by zone label, and patch them to cordon/uncordon  (nodes: list, patch)
+#   - list pods on those nodes, and delete them                    (pods: list, delete)
+#   - read and patch the NodePool's zone requirements              (nodepools: get, patch)
+#
+# The subject is the username given to the SSM automation role in its EKS Access
+# Entry (see the Prerequisites section of the README). Change `fis-ssm-automation`
+# here if you used a different --username.
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  namespace: default
-  name: fis-experiment-sa
-
----
-# Role for FIS pod actions (delete, network packet loss)
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: default
-  name: fis-experiment-role
-rules:
-- apiGroups: [""]
-  resources: ["configmaps"]
-  verbs: ["get", "create", "patch", "delete"]
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["create", "list", "get", "delete", "deletecollection"]
-- apiGroups: [""]
-  resources: ["pods/ephemeralcontainers"]
-  verbs: ["update"]
-- apiGroups: [""]
-  resources: ["pods/exec"]
-  verbs: ["create"]
-- apiGroups: ["apps"]
-  resources: ["deployments"]
-  verbs: ["get"]
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: fis-experiment-rolebinding
-  namespace: default
-subjects:
-- kind: ServiceAccount
-  name: fis-experiment-sa
-  namespace: default
-- apiGroup: rbac.authorization.k8s.io
-  kind: User
-  name: fis-experiment
-roleRef:
-  kind: Role
-  name: fis-experiment-role
-  apiGroup: rbac.authorization.k8s.io
-
----
-# ClusterRole for SSM automation (cordon/uncordon nodes, patch NodePool, delete pods)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -58,16 +18,18 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get", "list", "patch", "update"]
+  verbs: ["get", "list", "patch"]
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "delete"]
+# EKS Auto Mode serves NodePools under eks.amazonaws.com; upstream Karpenter uses
+# karpenter.sh. The automation tries both, so both are granted.
 - apiGroups: ["karpenter.sh"]
   resources: ["nodepools"]
-  verbs: ["get", "list", "patch", "update"]
+  verbs: ["get", "patch"]
 - apiGroups: ["eks.amazonaws.com"]
   resources: ["nodepools"]
-  verbs: ["get", "list", "patch", "update"]
+  verbs: ["get", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
