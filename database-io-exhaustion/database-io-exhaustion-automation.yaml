@@ -34,7 +34,7 @@ parameters:
 
   DatabasePasswordSecretArn:
     type: String
-    description: 'ARN of Secrets Manager secret containing database password'
+    description: 'ARN of Secrets Manager secret containing database password. Retrieved on the EC2 load generator using its instance profile role - see database-io-exhaustion-ec2-instance-role-iam-policy.json'
 
   WorkerThreads:
     type: String
@@ -55,9 +55,19 @@ parameters:
       - write
       - mixed
 
+  SeedRowCount:
+    type: String
+    description: 'Rows seeded into each worker table before the timed I/O phase begins, so read and mixed patterns have data to scan/update instead of querying an empty table'
+    default: '500'
+
+  MinActiveWorkerPercentage:
+    type: String
+    description: 'Minimum percentage of worker threads that must successfully record I/O operations for the experiment to be considered a successful fault injection. If this threshold is not met, ExhaustDatabaseIO fails and the automation exits non-zero.'
+    default: '50'
+
   SubnetId:
     type: String
-    description: 'Subnet ID for load generator instance'
+    description: 'Subnet ID for load generator instance. Must route to the database, and to SSM/SSM Messages, Secrets Manager, and package repository endpoints - see README Prerequisites'
 
   VpcId:
     type: String
@@ -65,7 +75,7 @@ parameters:
 
   DatabaseSecurityGroupId:
     type: String
-    description: 'Security group ID of the target database (for creating ingress rule)'
+    description: 'Security group ID of the target database (automation will add a temporary ingress rule). Must be tagged FIS-Ready=True'
 
   InstanceType:
     type: String
@@ -104,24 +114,41 @@ mainSteps:
         Selector: '$.GroupId'
         Type: String
 
-  - name: AuthorizeOutboundToDatabase
+  - name: ConfigureSecurityGroupEgress
     action: 'aws:executeScript'
     onFailure: 'step:CleanupSecurityGroup'
     onCancel: 'step:CleanupSecurityGroup'
     inputs:
       Runtime: python3.11
-      Handler: authorize_egress
+      Handler: configure_egress
       Script: |
         import boto3
+        from botocore.exceptions import ClientError
 
-        def authorize_egress(events, context):
+        def configure_egress(events, context):
             ec2 = boto3.client('ec2')
 
             security_group_id = events['SecurityGroupId']
             database_sg_id = events['DatabaseSecurityGroupId']
             port = int(events['DatabasePort'])
 
-            response = ec2.authorize_security_group_egress(
+            # A newly created VPC security group starts with an allow-all outbound
+            # rule. Remove it so the load generator's egress is limited to the
+            # database port plus the HTTPS traffic it needs for SSM and package
+            # installation, rather than unrestricted outbound access.
+            try:
+                ec2.revoke_security_group_egress(
+                    GroupId=security_group_id,
+                    IpPermissions=[{
+                        'IpProtocol': '-1',
+                        'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                    }]
+                )
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'InvalidPermission.NotFound':
+                    raise
+
+            ec2.authorize_security_group_egress(
                 GroupId=security_group_id,
                 IpPermissions=[{
                     'IpProtocol': 'tcp',
@@ -130,6 +157,19 @@ mainSteps:
                     'UserIdGroupPairs': [{
                         'GroupId': database_sg_id,
                         'Description': 'Allow outbound to database'
+                    }]
+                }]
+            )
+
+            response = ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 443,
+                    'ToPort': 443,
+                    'IpRanges': [{
+                        'CidrIp': '0.0.0.0/0',
+                        'Description': 'HTTPS for SSM, Secrets Manager, and package repositories'
                     }]
                 }]
             )
@@ -178,8 +218,8 @@ mainSteps:
 
   - name: LaunchLoadGenerator
     action: 'aws:runInstances'
-    onFailure: 'step:CleanupSecurityGroup'
-    onCancel: 'step:CleanupSecurityGroup'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
     inputs:
       ImageId: '{{ LatestAmiId }}'
       InstanceType: '{{ InstanceType }}'
@@ -232,6 +272,7 @@ mainSteps:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
         - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 600
       Parameters:
         commands:
           - |
@@ -293,6 +334,7 @@ mainSteps:
             set -e
 
             cat > /tmp/exhaust_io.py << 'PYTHON_EOF'
+            import re
             import sys
             import time
             import json
@@ -324,8 +366,17 @@ mainSteps:
             def generate_random_data(size_bytes=1024):
                 return ''.join(random.choices(string.ascii_letters + string.digits, k=size_bytes))
 
-            def io_worker_postgres(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time):
+            def generate_seed_rows(seed_rows):
+                return [
+                    (generate_random_data(4096), bytes(random.getrandbits(8) for _ in range(8192)))
+                    for _ in range(seed_rows)
+                ]
+
+            def io_worker_postgres(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
                 import psycopg2
+                ops_count = 0
+                error_count = 0
+                conn = None
                 try:
                     conn = psycopg2.connect(
                         host=endpoint, port=port, database=dbname,
@@ -334,44 +385,54 @@ mainSteps:
                     conn.autocommit = True
                     cursor = conn.cursor()
 
-                    table_name = f"fis_io_test_{thread_id}"
                     cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id SERIAL PRIMARY KEY, data TEXT, padding BYTEA, created_at TIMESTAMP DEFAULT NOW())")
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", generate_seed_rows(seed_rows))
 
-                    ops_count = 0
-                    while time.time() < end_time:
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY random() LIMIT 100")
+                                    cursor.fetchall()
+                                    cursor.execute(f"SELECT COUNT(*), pg_size_pretty(pg_total_relation_size('{table_name}')) FROM {table_name}")
+                                    cursor.fetchone()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE {table_name} SET data = %s WHERE id = (SELECT id FROM {table_name} ORDER BY random() LIMIT 1)", (data,))
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
                         try:
-                            if io_pattern in ('write', 'mixed'):
-                                data = generate_random_data(4096)
-                                padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
-                                ops_count += 1
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        except Exception:
+                            pass
+                        cursor.close()
 
-                            if io_pattern in ('read', 'mixed'):
-                                cursor.execute(f"SELECT * FROM {table_name} ORDER BY random() LIMIT 100")
-                                cursor.fetchall()
-                                cursor.execute(f"SELECT COUNT(*), pg_size_pretty(pg_total_relation_size('{table_name}')) FROM {table_name}")
-                                cursor.fetchone()
-                                ops_count += 1
-
-                            if io_pattern == 'mixed' and random.random() < 0.3:
-                                data = generate_random_data(4096)
-                                cursor.execute(f"UPDATE {table_name} SET data = %s WHERE id = (SELECT id FROM {table_name} ORDER BY random() LIMIT 1)", (data,))
-                                ops_count += 1
-
-                        except Exception as e:
-                            time.sleep(0.1)
-
-                    cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                    cursor.close()
-                    conn.close()
-                    return ops_count
+                    return {'ops': ops_count, 'errors': error_count}
 
                 except Exception as e:
                     print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return 0
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
 
-            def io_worker_mysql(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time):
+            def io_worker_mysql(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
                 import mysql.connector
+                ops_count = 0
+                error_count = 0
+                conn = None
                 try:
                     conn = mysql.connector.connect(
                         host=endpoint, port=port, database=dbname,
@@ -380,87 +441,107 @@ mainSteps:
                     conn.autocommit = True
                     cursor = conn.cursor()
 
-                    table_name = f"fis_io_test_{thread_id}"
                     cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id INT AUTO_INCREMENT PRIMARY KEY, data TEXT, padding LONGBLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", generate_seed_rows(seed_rows))
 
-                    ops_count = 0
-                    while time.time() < end_time:
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY RAND() LIMIT 100")
+                                    cursor.fetchall()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE {table_name} SET data = %s ORDER BY RAND() LIMIT 1", (data,))
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
                         try:
-                            if io_pattern in ('write', 'mixed'):
-                                data = generate_random_data(4096)
-                                padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
-                                ops_count += 1
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        except Exception:
+                            pass
+                        cursor.close()
 
-                            if io_pattern in ('read', 'mixed'):
-                                cursor.execute(f"SELECT * FROM {table_name} ORDER BY RAND() LIMIT 100")
-                                cursor.fetchall()
-                                ops_count += 1
-
-                            if io_pattern == 'mixed' and random.random() < 0.3:
-                                data = generate_random_data(4096)
-                                cursor.execute(f"UPDATE {table_name} SET data = %s ORDER BY RAND() LIMIT 1", (data,))
-                                ops_count += 1
-
-                        except Exception as e:
-                            time.sleep(0.1)
-
-                    cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                    cursor.close()
-                    conn.close()
-                    return ops_count
+                    return {'ops': ops_count, 'errors': error_count}
 
                 except Exception as e:
                     print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return 0
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
 
-            def io_worker_sqlserver(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time):
+            def io_worker_sqlserver(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
                 import pyodbc
+                ops_count = 0
+                error_count = 0
+                conn = None
                 try:
                     conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes'
                     conn = pyodbc.connect(conn_str, timeout=10)
                     conn.autocommit = True
                     cursor = conn.cursor()
 
-                    table_name = f"fis_io_test_{thread_id}"
                     cursor.execute(f"""
                         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
                         CREATE TABLE {table_name} (id INT IDENTITY(1,1) PRIMARY KEY, data NVARCHAR(MAX), padding VARBINARY(MAX), created_at DATETIME DEFAULT GETDATE())
                     """)
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", generate_seed_rows(seed_rows))
 
-                    ops_count = 0
-                    while time.time() < end_time:
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", (data, padding))
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT TOP 100 * FROM {table_name} ORDER BY NEWID()")
+                                    cursor.fetchall()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE TOP(1) {table_name} SET data = ?", (data,))
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
                         try:
-                            if io_pattern in ('write', 'mixed'):
-                                data = generate_random_data(4096)
-                                padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", (data, padding))
-                                ops_count += 1
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        except Exception:
+                            pass
+                        cursor.close()
 
-                            if io_pattern in ('read', 'mixed'):
-                                cursor.execute(f"SELECT TOP 100 * FROM {table_name} ORDER BY NEWID()")
-                                cursor.fetchall()
-                                ops_count += 1
-
-                            if io_pattern == 'mixed' and random.random() < 0.3:
-                                data = generate_random_data(4096)
-                                cursor.execute(f"UPDATE TOP(1) {table_name} SET data = ?", (data,))
-                                ops_count += 1
-
-                        except Exception as e:
-                            time.sleep(0.1)
-
-                    cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                    cursor.close()
-                    conn.close()
-                    return ops_count
+                    return {'ops': ops_count, 'errors': error_count}
 
                 except Exception as e:
                     print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return 0
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
 
-            def io_worker_oracle(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time):
+            def io_worker_oracle(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
                 import oracledb
+                ops_count = 0
+                error_count = 0
+                conn = None
                 try:
                     oracledb.init_oracle_client()
                     dsn = oracledb.makedsn(endpoint, port, service_name=dbname)
@@ -468,7 +549,6 @@ mainSteps:
                     conn.autocommit = True
                     cursor = conn.cursor()
 
-                    table_name = f"FIS_IO_TEST_{thread_id}"
                     try:
                         cursor.execute(f"""
                             BEGIN
@@ -478,39 +558,48 @@ mainSteps:
                                     IF SQLCODE != -955 THEN RAISE; END IF;
                             END;
                         """)
-                    except:
+                    except Exception:
                         pass
 
-                    ops_count = 0
-                    while time.time() < end_time:
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", generate_seed_rows(seed_rows))
+
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", [data, padding])
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT * FROM {table_name} WHERE ROWNUM <= 100 ORDER BY DBMS_RANDOM.VALUE")
+                                    cursor.fetchall()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE {table_name} SET data = :1 WHERE ROWNUM = 1", [data])
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
                         try:
-                            if io_pattern in ('write', 'mixed'):
-                                data = generate_random_data(4096)
-                                padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", [data, padding])
-                                ops_count += 1
+                            cursor.execute(f"DROP TABLE {table_name} PURGE")
+                        except Exception:
+                            pass
+                        cursor.close()
 
-                            if io_pattern in ('read', 'mixed'):
-                                cursor.execute(f"SELECT * FROM {table_name} WHERE ROWNUM <= 100 ORDER BY DBMS_RANDOM.VALUE")
-                                cursor.fetchall()
-                                ops_count += 1
-
-                            if io_pattern == 'mixed' and random.random() < 0.3:
-                                data = generate_random_data(4096)
-                                cursor.execute(f"UPDATE {table_name} SET data = :1 WHERE ROWNUM = 1", [data])
-                                ops_count += 1
-
-                        except Exception as e:
-                            time.sleep(0.1)
-
-                    cursor.execute(f"DROP TABLE {table_name} PURGE")
-                    cursor.close()
-                    conn.close()
-                    return ops_count
+                    return {'ops': ops_count, 'errors': error_count}
 
                 except Exception as e:
                     print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return 0
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
 
             def main():
                 engine = sys.argv[1]
@@ -523,8 +612,17 @@ mainSteps:
                 experiment_duration_iso = sys.argv[8]
                 io_pattern = sys.argv[9]
                 region = sys.argv[10]
+                execution_id = sys.argv[11]
+                seed_rows = int(sys.argv[12])
+                min_active_percent = float(sys.argv[13])
 
                 experiment_duration = parse_iso8601_duration(experiment_duration_iso)
+
+                # Keep table names short and unique per execution so concurrent runs
+                # (or a stale table from a prior run) can never collide, and cleanup
+                # only ever drops objects this execution created. Kept short to stay
+                # under Oracle's 30-character unquoted identifier limit.
+                exec_suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
 
                 print("=== Database I/O Exhaustion Test ===")
                 print(f"Engine: {engine}")
@@ -534,6 +632,8 @@ mainSteps:
                 print(f"Worker Threads: {worker_threads}")
                 print(f"Experiment Duration: {experiment_duration}s")
                 print(f"I/O Pattern: {io_pattern}")
+                print(f"Seed Rows Per Table: {seed_rows}")
+                print(f"Execution Suffix: {exec_suffix}")
                 print("====================================")
 
                 print("Retrieving database password from Secrets Manager...")
@@ -550,7 +650,7 @@ mainSteps:
 
                 end_time = time.time() + experiment_duration
                 threads = []
-                results = [0] * worker_threads
+                results = [None] * worker_threads
 
                 worker_func = {
                     'postgres': io_worker_postgres,
@@ -562,11 +662,14 @@ mainSteps:
                 print(f"Launching {worker_threads} I/O worker threads...")
 
                 for i in range(worker_threads):
-                    thread = threading.Thread(
-                        target=lambda idx=i: results.__setitem__(idx, worker_func(
-                            idx + 1, endpoint, port, dbname, user, password, io_pattern, end_time
-                        ))
-                    )
+                    table_name = f"fis_io_{exec_suffix}_{i + 1}"
+
+                    def run_worker(idx=i, tbl=table_name):
+                        results[idx] = worker_func(
+                            idx + 1, endpoint, port, dbname, user, password, io_pattern, end_time, tbl, seed_rows
+                        )
+
+                    thread = threading.Thread(target=run_worker)
                     thread.start()
                     threads.append(thread)
                     time.sleep(0.1)
@@ -580,23 +683,35 @@ mainSteps:
                 for thread in threads:
                     thread.join()
 
-                total_ops = sum(results)
-                active_workers = sum(1 for r in results if r > 0)
+                total_ops = sum(r['ops'] for r in results if r)
+                total_errors = sum(r['errors'] for r in results if r)
+                active_workers = sum(1 for r in results if r and r['ops'] > 0)
+                active_percent = (active_workers / worker_threads * 100) if worker_threads else 0
 
                 print("=== I/O Exhaustion Test Complete ===")
-                print(f"Active workers: {active_workers}/{worker_threads}")
+                print(f"Active workers: {active_workers}/{worker_threads} ({active_percent:.1f}%)")
                 print(f"Total I/O operations: {total_ops}")
+                print(f"Total operation errors: {total_errors}")
                 print(f"Avg ops/worker: {total_ops // max(active_workers, 1)}")
                 print("====================================")
+
+                fault_injected = total_ops > 0 and active_percent >= min_active_percent
 
                 result = {
                     "ActiveWorkers": active_workers,
                     "TotalWorkers": worker_threads,
                     "TotalIOOperations": total_ops,
+                    "TotalOperationErrors": total_errors,
                     "DurationSeconds": experiment_duration,
-                    "IOPattern": io_pattern
+                    "IOPattern": io_pattern,
+                    "FaultInjected": fault_injected
                 }
                 print(json.dumps(result))
+
+                if not fault_injected:
+                    print(f"ERROR: Fault was not reliably injected - {active_percent:.1f}% of workers were active "
+                          f"(minimum required: {min_active_percent}%) and {total_ops} I/O operations were recorded.")
+                    sys.exit(1)
 
             if __name__ == '__main__':
                 main()
@@ -612,7 +727,10 @@ mainSteps:
               "{{ WorkerThreads }}" \
               "{{ ExperimentDuration }}" \
               "{{ IOPattern }}" \
-              "{{ global:REGION }}"
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}" \
+              "{{ SeedRowCount }}" \
+              "{{ MinActiveWorkerPercentage }}"
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'
@@ -644,6 +762,7 @@ mainSteps:
       Handler: revoke_ingress
       Script: |
         import boto3
+        from botocore.exceptions import ClientError
 
         def revoke_ingress(events, context):
             ec2 = boto3.client('ec2')
@@ -665,7 +784,9 @@ mainSteps:
                     }]
                 )
                 return {'StatusCode': 200, 'Response': response}
-            except Exception as e:
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                    return {'StatusCode': 200, 'Response': 'Ingress rule already absent'}
                 return {'StatusCode': 500, 'Error': str(e)}
       InputPayload:
         DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'

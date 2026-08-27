@@ -7,7 +7,7 @@
             "description": "Exhaust database I/O capacity with heavy read/write load",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DatabaseIOExhaustion-Automation",
-                "documentParameters": "{\"DatabaseEngine\":\"postgres\",\"DatabaseEndpoint\":\"<YOUR DATABASE ENDPOINT>\",\"DatabasePort\":\"5432\",\"DatabaseName\":\"postgres\",\"DatabaseUser\":\"postgres\",\"DatabasePasswordSecretArn\":\"<YOUR SECRET ARN>\",\"WorkerThreads\":\"50\",\"ExperimentDuration\":\"PT10M\",\"IOPattern\":\"mixed\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"DatabaseSecurityGroupId\":\"<YOUR DATABASE SECURITY GROUP ID>\",\"InstanceType\":\"t3.medium\"}",
+                "documentParameters": "{\"DatabaseEngine\":\"postgres\",\"DatabaseEndpoint\":\"<YOUR DATABASE ENDPOINT>\",\"DatabasePort\":\"5432\",\"DatabaseName\":\"postgres\",\"DatabaseUser\":\"postgres\",\"DatabasePasswordSecretArn\":\"<YOUR SECRET ARN>\",\"WorkerThreads\":\"50\",\"ExperimentDuration\":\"PT10M\",\"IOPattern\":\"mixed\",\"SeedRowCount\":\"500\",\"MinActiveWorkerPercentage\":\"50\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"DatabaseSecurityGroupId\":\"<YOUR DATABASE SECURITY GROUP ID>\",\"InstanceType\":\"t3.medium\"}",
                 "maxDuration": "PT180M"
             }
         }
