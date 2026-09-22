@@ -182,8 +182,8 @@ mainSteps:
 
   - name: AuthorizeInboundFromLoadGenerator
     action: 'aws:executeScript'
-    onFailure: 'step:CleanupSecurityGroup'
-    onCancel: 'step:CleanupSecurityGroup'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
     inputs:
       Runtime: python3.11
       Handler: authorize_ingress
@@ -734,6 +734,8 @@ mainSteps:
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
     inputs:
       InstanceIds:
         - '{{ LaunchLoadGenerator.InstanceId }}'
@@ -743,7 +745,7 @@ mainSteps:
     action: 'aws:waitForAwsResourceProperty'
     timeoutSeconds: 300
     onFailure: 'Continue'
-    onCancel: 'Abort'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
     inputs:
       Service: ec2
       Api: DescribeInstances

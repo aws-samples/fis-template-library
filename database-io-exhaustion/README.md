@@ -31,13 +31,15 @@ This experiment tests your application's resilience to database I/O exhaustion b
 4. **Verifying** the fault was actually injected (a minimum percentage of workers recorded I/O operations) and failing the experiment if it was not
 5. **Cleaning up** all test tables and terminating the load generator instance
 
-The experiment is **parameterized by database engine**, making it reusable across engines in RDS:
-- Aurora PostgreSQL
-- Aurora MySQL
-- RDS PostgreSQL
-- RDS MySQL
-- RDS SQL Server
-- RDS Oracle
+The experiment is **parameterized by database engine**, targeting these engines in RDS:
+- Aurora PostgreSQL - validated end-to-end
+- RDS PostgreSQL - validated end-to-end
+- RDS Oracle - validated end-to-end
+- Aurora MySQL - **experimental**, not yet validated end-to-end (client install, driver connect, and `executemany` seeding are unexercised)
+- RDS MySQL - **experimental**, not yet validated end-to-end
+- RDS SQL Server - **experimental**, not yet validated end-to-end
+
+Before relying on the MySQL or SQL Server paths, run a small `WorkerThreads`/short-`ExperimentDuration` smoke test against your target engine first.
 
 ## Architecture Overview
 
@@ -95,7 +97,7 @@ Before running this experiment, ensure that:
    - The temporary security group's egress is restricted to the database port and HTTPS (443) only - see "How It Works" Phase 1 below
 
 2. **Database Configuration**:
-   - Supported database is running (Aurora PostgreSQL, Aurora MySQL, RDS PostgreSQL, RDS MySQL, RDS SQL Server, or RDS Oracle)
+   - Supported database is running (Aurora PostgreSQL, RDS PostgreSQL, and RDS Oracle are validated end-to-end; Aurora MySQL, RDS MySQL, and RDS SQL Server are experimental - see Description above)
    - You know the database endpoint, username, and password
    - The database user has permissions to CREATE and DROP tables
    - The database security group (`DatabaseSecurityGroupId`) is tagged `FIS-Ready=True` - the SSM automation role's IAM policy only permits ingress changes on security groups carrying this tag
@@ -129,7 +131,7 @@ The experiment requires the following parameters:
 
 ### I/O Load Settings
 - **WorkerThreads**: Number of concurrent worker threads generating I/O (default: 50)
-- **ExperimentDuration**: Total experiment duration in ISO8601 format (default: PT10M = 10 minutes)
+- **ExperimentDuration**: Total experiment duration in ISO8601 format (default: PT10M = 10 minutes). **Keep well under PT115M**: the `ExhaustDatabaseIO` step's `TimeoutSeconds` is fixed at 7200s (2h), and the FIS action's `maxDuration` is fixed at PT180M (3h) - client install and worker seeding also consume part of that budget. Going over either causes the step/action to time out rather than complete cleanly (cleanup still runs via the runCommand timeout path, but the run itself fails)
 - **IOPattern**: I/O pattern to generate (default: `mixed`)
   - `read` - Heavy SELECT queries with random row access and full table scans
   - `write` - Heavy INSERT and UPDATE operations with large payloads
