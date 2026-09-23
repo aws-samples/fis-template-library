@@ -73,9 +73,9 @@ Before running this experiment, ensure that:
 4. **SSM Automation Document**: Deploy the SSM automation document:
    ```bash
    aws ssm create-document \
-     --name "eks-automode-az-impairment-node-automation" \
+     --name "eks-automode-az-impairment-automation" \
      --document-type "Automation" \
-     --content file://eks-automode-az-impairment-node-automation.yaml \
+     --content file://eks-automode-az-impairment-automation.yaml \
      --document-format YAML
    ```
 
@@ -88,6 +88,14 @@ Before running this experiment, ensure that:
    kubectl get nodepools
    ```
    This must be a **custom NodePool**, not the built-in `general-purpose` or `system` pools — see [Important: use a custom NodePool](#important-use-a-custom-nodepool-not-a-built-in-one) above. Built-in pools are reconciled by EKS and the AZ exclusion will be silently reverted mid-experiment.
+
+8. **Tag the target subnet**: The FIS experiment resolves its target by tag, so the VPC subnet in the AZ you want to impair must carry the tag `FIS-Ready=True`. The template also scopes the target to a single AZ via the `availabilityZoneIdentifier` parameter, so only the FIS-Ready subnet(s) in `<YOUR TARGET AZ>` are selected. Tag it with:
+   ```bash
+   aws ec2 create-tags \
+     --resources <YOUR SUBNET ID IN TARGET AZ> \
+     --tags Key=FIS-Ready,Value=True
+   ```
+   The IAM policy's `ec2:ReplaceNetworkAclAssociation` permission is conditioned on this tag, so the network-disruption action can only associate the deny-NACL with a subnet you have explicitly marked `FIS-Ready=True`.
 
 ## Cluster configuration determines the outcome
 
@@ -238,7 +246,7 @@ T+15m                     ▼  FIS restores NACLs (network connectivity returns)
 
 ### SSM Automation Document
 
-The experiment uses a single SSM Automation document (`eks-automode-az-impairment-node-automation`) that manages the complete EKS-specific fault lifecycle:
+The experiment uses a single SSM Automation document (`eks-automode-az-impairment-automation`) that manages the complete EKS-specific fault lifecycle:
 
 1. **Validates** input parameters (AZ format, cluster existence)
 2. **Cordons nodes** in the target AZ (~4s) — prevents pod scheduling on existing nodes
@@ -280,12 +288,12 @@ If you do add `aws:eks:pod` actions to a fork of this experiment, note that all 
 
 | Target Name | Resource Type | Selection Mode | Description |
 |-------------|---------------|----------------|-------------|
-| `subnets-in-target-az` | `aws:ec2:subnet` | ALL | VPC subnets in the target AZ to disrupt network connectivity |
+| `subnets-in-target-az` | `aws:ec2:subnet` | ALL | VPC subnets tagged `FIS-Ready=True` in the target AZ (scoped via the `availabilityZoneIdentifier` parameter) to disrupt network connectivity |
 
-The template defines only this one FIS target. Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why This Experiment Uses No `aws:eks:pod` Actions](#why-this-experiment-uses-no-awsekspod-actions) above.
+The template defines only this one FIS target. It is resolved by the `FIS-Ready=True` resource tag and scoped to a single AZ with the `availabilityZoneIdentifier` parameter (rather than a hard-coded subnet ARN), consistent with the tagging strategy used across this library. Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why This Experiment Uses No `aws:eks:pod` Actions](#why-this-experiment-uses-no-awsekspod-actions) above.
 
 ### Target Requirements
-- The subnet must be in the AZ named by the automation's `TargetAZ` parameter, so the network disruption and the Kubernetes-level impairment affect the same AZ
+- The subnet must carry the `FIS-Ready=True` tag and be in the AZ named by both the target's `availabilityZoneIdentifier` parameter and the automation's `TargetAZ` parameter, so the network disruption and the Kubernetes-level impairment affect the same AZ
 - Nodes must carry the standard `topology.kubernetes.io/zone` label (EKS applies this automatically) — the automation uses it to find nodes and pods in the target AZ
 - The SSM automation role must have Kubernetes API access via an EKS Access Entry plus the RBAC in `eks-automode-az-impairment-rbac.yaml`
 
@@ -301,7 +309,7 @@ Before running the experiment, update these placeholder values:
 | `<YOUR SSM AUTOMATION ROLE NAME>` | SSM automation IAM role name |
 | `<YOUR EKS CLUSTER>` | Name of your EKS cluster |
 | `<YOUR TARGET AZ>` | Availability Zone to impair (e.g., `ap-southeast-2a`) |
-| `<YOUR SUBNET ID IN TARGET AZ>` | Subnet ID(s) in the target AZ |
+| `<YOUR SUBNET ID IN TARGET AZ>` | Subnet ID(s) in the target AZ to tag with `FIS-Ready=True` (used in the `create-tags` step, not hard-coded in the template) |
 | `<YOUR NODEPOOL NAME>` | Name of a **custom** EKS Auto Mode NodePool (not `general-purpose` or `system`) |
 
 ## How Pods in the Target AZ Are Selected
@@ -312,7 +320,7 @@ No pod label selector configuration is required. The SSM automation resolves the
 2. For each of those nodes, lists pods via `fieldSelector=spec.nodeName=<node>`
 3. Deletes each pod with `gracePeriodSeconds=0`, skipping the `kube-system`, `kube-node-lease`, and `kube-public` namespaces
 
-This means **all non-system pods on nodes in the target AZ are deleted**, across every namespace. If you need to limit the blast radius to specific workloads, add a namespace or label filter to the `DeletePodsInAZ` step in `eks-automode-az-impairment-node-automation.yaml`.
+This means **all non-system pods on nodes in the target AZ are deleted**, across every namespace. If you need to limit the blast radius to specific workloads, add a namespace or label filter to the `DeletePodsInAZ` step in `eks-automode-az-impairment-automation.yaml`.
 
 ## Fine-Tuning the Wait Duration
 
@@ -434,7 +442,7 @@ You can import the json experiment template into your AWS account via cli or aws
 | `README.md` | This documentation file |
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
 | `eks-automode-az-impairment-template.json` | FIS experiment template definition |
-| `eks-automode-az-impairment-node-automation.yaml` | SSM Automation document (cordon, patch NodePool, wait, restore) |
+| `eks-automode-az-impairment-automation.yaml` | SSM Automation document (cordon, patch NodePool, wait, restore) |
 | `eks-automode-az-impairment-iam-policy.json` | IAM policy for the FIS execution role |
 | `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role |
 | `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the SSM automation role |

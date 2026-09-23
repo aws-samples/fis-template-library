@@ -1,7 +1,7 @@
 # Kubernetes RBAC for the SSM automation used by this experiment.
 # Apply this to your cluster: kubectl apply -f eks-automode-az-impairment-rbac.yaml
 #
-# The permissions below are exactly what eks-automode-az-impairment-node-automation.yaml
+# The permissions below are exactly what eks-automode-az-impairment-automation.yaml
 # performs against the Kubernetes API:
 #   - list nodes by zone label, and patch them to cordon/uncordon  (nodes: list, patch)
 #   - list pods on those nodes, and delete them                    (pods: list, delete)
