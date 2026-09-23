@@ -373,6 +373,22 @@ After the experiment completes:
    - With `DoNotSchedule` (2 AZs), pods that were left `Pending` schedule into the restored AZ on their own as soon as the NodePool is restored and Auto Mode provisions a node there — no manual step needed.
    - With `DoNotSchedule` (3 AZs), pods **already rescheduled successfully** into the surviving AZs during impairment. They stay in their 0/3/3 distribution — they will not rebalance to 2/2/2 because topology spread constraints are only evaluated at scheduling time.
 
+### Restore status and failure signal
+
+The `RestoreNodePool` step reports a `Status` in its `RestoreResult` output describing how the cleanup went. On a clean run this is `NODEPOOL_RESTORED` (or `NODEPOOL_ALREADY_CORRECT` / `NODEPOOL_UNCHANGED_NO_PATCH_RECORDED` when there was nothing to undo).
+
+If the restore cannot complete cleanly, the step **fails the SSM automation** (raises after first attempting to uncordon nodes) so the failure is visible to an operator and can trip a CloudWatch alarm or FIS stop condition, rather than being silently reported as success. A terminal restore leaves the target AZ still excluded from the NodePool and/or nodes still cordoned, so it requires **manual remediation**. Statuses that fail the step are:
+
+- `NODEPOOL_RESTORE_FAILED_<code>` — the restore PATCH to the Kubernetes API returned a non-200 status.
+- `NODEPOOL_RESTORE_ERROR: <message>` — an unexpected exception occurred during NodePool restore.
+- Any status containing `UNCORDON_ERROR` or `UNCORDON_LIST_FAILED` — one or more nodes could not be uncordoned.
+
+One status is treated as a **warning, not a failure**:
+
+- `NODEPOOL_MODIFIED_EXTERNALLY_SKIPPED` — the NodePool was changed by something else (EKS Auto Mode reconciliation, a GitOps controller, or an operator) after the automation patched it. The automation **deliberately declined to touch it**, because removing a requirement it no longer recognises could be destructive. That external change has frequently already reverted the AZ exclusion, so failing here would be a false alarm. It is logged as a `WARNING` and the step still succeeds — but a human should confirm the NodePool's `topology.kubernetes.io/zone` requirement is correct. If you want unattended runs to alarm on it, create a metric filter on the `WARNING: NODEPOOL_MODIFIED_EXTERNALLY_SKIPPED` log line rather than relying on step failure.
+
+**Manual remediation** when the step fails: inspect the `RestoreResult` in the automation execution output, then restore the NodePool's `topology.kubernetes.io/zone` requirement to its original values and uncordon any remaining nodes in the target AZ (`kubectl uncordon <node>`). Because the automation records its failure, an unattended run will surface it instead of leaving degraded capacity in place unnoticed.
+
 **To rebalance pods that stayed put:**
 
 ```bash
