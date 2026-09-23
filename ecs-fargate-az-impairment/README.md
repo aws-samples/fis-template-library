@@ -12,10 +12,20 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 When an Availability Zone experiences an impairment affecting an ECS Fargate service, the service should continue operating with reduced capacity using tasks in the remaining healthy AZs. Specifically:
 
 - When tasks are stopped in the target AZ, ECS should reschedule them to healthy AZs
-- When the subnet is removed from the service configuration, new tasks should only launch in remaining subnets
+- When the subnet is removed from the service configuration, ECS triggers a rolling service deployment; replacement tasks should launch only in the remaining subnets, never back into the impaired AZ
 - When network packet loss is injected, affected tasks should be detected as unhealthy
 - The application should remain available throughout the experiment with degraded but functional capacity
 - When the subnet is restored, the service should automatically rebalance tasks across all AZs
+
+## Scope and Intent: Why This Experiment Removes the Subnet
+
+This experiment is designed to be run as **one component of a full-application Availability Zone impairment scenario** — all resources in the target AZ (compute, data, network) impaired together, focused on the *same* AZ. Run on its own, without the surrounding AZ-impairment scenario, the subnet-removal step is not a meaningful test: in isolation it primarily exercises ECS control-plane redeploy mechanics rather than AZ-down application behaviour.
+
+**Why the subnet-removal step exists (and why it is still valuable):** ECS Fargate does not yet support Availability Zone impairment the way ECS on EC2 does. Regulated customers running critical applications on Fargate still need a way to demonstrate, as part of compliance and disaster-recovery testing, that they can fully shut down all resources in one AZ and continue serving successfully from the remaining AZs. Removing the subnet from the service network configuration is currently the available mechanism to force ECS Fargate to stop placing tasks in the impaired AZ, so this step gives Fargate customers a way to evidence AZ-loss resilience for DR/compliance until native parity with ECS on EC2 exists.
+
+**Be aware this is an ECS control-plane action.** Changing `awsvpcConfiguration` via `UpdateService` triggers a full rolling service deployment across all AZs — not a silent placement block on the impaired AZ alone. That is expected and acceptable within a whole-application AZ-impairment DR test, but it is why the step should be run in that context, not standalone.
+
+**Alternative that avoids the ECS control plane:** if triggering an ECS redeploy is undesirable for your test, a network/subnet-level impairment — for example a Network ACL deny on the target subnet — can produce the same AZ-isolation effect (tasks in the impaired AZ lose connectivity and are drained; ECS reschedules into healthy AZs) without an `UpdateService` redeploy. Consider this approach when the redeploy artifact would confound the results, or when you want the impairment to more closely mirror a network-layer AZ failure.
 
 ## Prerequisites
 
@@ -68,7 +78,7 @@ T+0     ┌───────────────────────
         └─────────────────────────────────────────────────────────────────────┘
                           │
 T+~30s  SSM automation removes subnet from ECS service network config
-        ECS can no longer reschedule tasks into the impaired AZ
+        (triggers a rolling service deployment; replacements skip the AZ)
                           │
 T+1m                      ▼
         ┌─────────────────────────────────────────────────────────────────────┐
@@ -81,7 +91,7 @@ T+17m                     ▼  SSM automation restores subnet
                           ▼  ECS rebalances tasks across AZs
 ```
 
-**Why `impair-subnet-in-az` starts at T+0:** ECS does not evict running tasks when a subnet is removed from the service network config — only new task placements are blocked. If the subnet removal runs concurrently with or after the task stop, ECS can reschedule the just-stopped tasks back into the impaired AZ before the SSM automation has updated the service. Starting the SSM automation at T+0 ensures the subnet is fully removed (~30 seconds of SSM startup + API call) before `stop-tasks-in-az` fires at T+1m, giving ECS no healthy subnet to place replacements in for that AZ.
+**Why `impair-subnet-in-az` starts at T+0:** removing the subnet from the service network config changes `awsvpcConfiguration`, which triggers a rolling service deployment — after it completes, ECS will not place replacement tasks into the impaired AZ. This is a control-plane action, not an instantaneous placement block, so it needs a head start: if the subnet removal ran concurrently with or after the task stop, ECS could reschedule the just-stopped tasks back into the impaired AZ before the deployment settled. Starting the SSM automation at T+0 ensures the subnet is removed and the redeploy is underway (~30 seconds of SSM startup + API call) before `stop-tasks-in-az` fires at T+1m, so ECS has no healthy subnet in that AZ to place replacements in. (See "Scope and Intent" above for why this control-plane approach is used for Fargate and the network-layer alternative.)
 
 ### Actions Detail
 
