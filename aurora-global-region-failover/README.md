@@ -2,6 +2,10 @@
 
 This experiment performs Aurora Global Database regional failover/switchover to test disaster recovery procedures and measure RTO/RPO.
 
+## Hypothesis
+
+When an Aurora Global Database performs a regional failover/switchover, the secondary Region cluster is promoted to primary and the application resumes read/write operations against the new primary within a recovery time objective (RTO) of 5 minutes, with a recovery point objective (RPO) of zero for a planned switchover (no data loss). A CloudWatch alarm on application error rate or database connection failures returns to its OK state within 5 minutes of the promotion completing.
+
 ## Prerequisites
 
 - Aurora Global Database with primary and secondary clusters
@@ -59,3 +63,18 @@ aws fis start-experiment --experiment-template-id <TEMPLATE-ID>
 ```
 
 The experiment will automatically detect the secondary cluster and promote it to primary based on the configured failover type.
+
+## Stop Conditions
+
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the failover/switchover automation completes.
+
+## Next Steps
+As you adapt this scenario to your needs, we recommend:
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to the Aurora Global Database and the applications that depend on it.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the regional failover/switchover.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Confirming your recovery time objective (RTO) and recovery point objective (RPO) targets against the observed failover/switchover behavior.
+
+## Import Experiment
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
