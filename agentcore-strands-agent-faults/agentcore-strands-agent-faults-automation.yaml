@@ -1,0 +1,146 @@
+schemaVersion: '0.3'
+description: 'Run a bounded chaos experiment for a Strands agent (enable, hold, disable, with rollback)'
+assumeRole: '{{ AutomationAssumeRole }}'
+
+parameters:
+  RuntimeId:
+    type: String
+    description: 'AgentCore runtime ID (used as the /chaos/{runtime_id}/ parameter prefix)'
+  FaultRate:
+    type: String
+    description: 'Probability in [0.0, 1.0] that any given invocation is faulted'
+    default: '0.5'
+  FaultInjections:
+    type: String
+    description: 'JSON map tool -> effect spec(s); applied wholesale per faulted invocation'
+    default: '{"get_move":[{"effect_type":"timeout"}]}'
+  DurationSeconds:
+    type: String
+    description: 'How long chaos stays active before clean disable (integer seconds, >= 1)'
+    default: '900'
+  AutomationAssumeRole:
+    type: String
+    description: 'IAM role for SSM Automation to assume'
+
+mainSteps:
+  # --- Enable: write config first, set active=true LAST (Requirement 4.1) ---
+  - name: SetFaultRate
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/chaos/{{ RuntimeId }}/fault_rate'
+      Value: '{{ FaultRate }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetFaultInjections
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/chaos/{{ RuntimeId }}/fault_injections'
+      Value: '{{ FaultInjections }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetExecutionId
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/chaos/{{ RuntimeId }}/execution_id'
+      # The SSM Automation execution ID is unique per run and auto-populated.
+      # FIS does not interpolate its own experiment ID into action parameters,
+      # so this SSM execution ID is the per-run correlation key.
+      Value: '{{ automation:EXECUTION_ID }}'
+      Type: String
+      Overwrite: true
+
+  - name: SetActiveLast
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/chaos/{{ RuntimeId }}/active'
+      Value: 'true'
+      Type: String
+      Overwrite: true
+
+  # --- Hold for the experiment window. From here, any cancel/failure rolls back. ---
+  - name: HoldExperimentWindow
+    action: 'aws:sleep'
+    onCancel: 'step:DisableChaos'
+    onFailure: 'step:DisableChaos'
+    inputs:
+      Duration: 'PT{{ DurationSeconds }}S'
+
+  # --- Clean disable on the happy path: write active=false FIRST (Requirement 4.2) ---
+  - name: DisableActive
+    action: 'aws:executeAwsApi'
+    onCancel: 'step:DisableChaos'
+    onFailure: 'step:DisableChaos'
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/chaos/{{ RuntimeId }}/active'
+      Value: 'false'
+      Type: String
+      Overwrite: true
+
+  - name: WaitForCacheTTL
+    action: 'aws:sleep'
+    inputs:
+      Duration: 'PT15S'  # plugin TTL is 10s; allow a small buffer so in-flight invocations observe active=false
+
+  # --- Tidy up on the happy path: delete the chaos parameters so none linger. ---
+  # active=false has already been written and observed (above), so deletion only
+  # removes now-inert parameters. The loader treats absent parameters exactly like
+  # active=false (fail-closed no-op), so this is a clean stop from the agent's view.
+  - name: CleanupParameters
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'   # chaos is already disabled; a cleanup hiccup must not fail the run
+    isEnd: true
+    inputs:
+      Service: ssm
+      Api: DeleteParameters
+      Names:
+        - '/chaos/{{ RuntimeId }}/active'
+        - '/chaos/{{ RuntimeId }}/fault_rate'
+        - '/chaos/{{ RuntimeId }}/fault_injections'
+        - '/chaos/{{ RuntimeId }}/execution_id'
+
+  # --- Rollback handler: reached only via onCancel / onFailure above (Requirement 4.3). ---
+  # Writes active=false FIRST (the critical off-switch), then deletes the parameters
+  # so a cancelled/failed run also leaves a clean slate.
+  - name: DisableChaos
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'   # ensure cleanup still runs; the active=false write above is what matters
+    inputs:
+      Service: ssm
+      Api: PutParameter
+      Name: '/chaos/{{ RuntimeId }}/active'
+      Value: 'false'
+      Type: String
+      Overwrite: true
+
+  - name: CleanupParametersOnRollback
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    isEnd: true
+    inputs:
+      Service: ssm
+      Api: DeleteParameters
+      Names:
+        - '/chaos/{{ RuntimeId }}/active'
+        - '/chaos/{{ RuntimeId }}/fault_rate'
+        - '/chaos/{{ RuntimeId }}/fault_injections'
+        - '/chaos/{{ RuntimeId }}/execution_id'

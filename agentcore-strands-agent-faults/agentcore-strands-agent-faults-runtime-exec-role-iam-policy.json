@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowChaosParameterReads",
+      "Effect": "Allow",
+      "Action": [ "ssm:GetParametersByPath" ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:parameter/chaos/*"
+    }
+  ]
+}

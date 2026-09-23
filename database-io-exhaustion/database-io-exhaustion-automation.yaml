@@ -1,0 +1,809 @@
+schemaVersion: '0.3'
+description: 'Create ephemeral load generator to exhaust database I/O capacity with heavy read/write operations'
+assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/DatabaseIOExhaustion-SSM-Automation-Role'
+
+parameters:
+  DatabaseEngine:
+    type: String
+    description: 'Database engine type'
+    default: 'postgres'
+    allowedValues:
+      - postgres
+      - mysql
+      - sqlserver
+      - oracle
+
+  DatabaseEndpoint:
+    type: String
+    description: 'Database endpoint hostname'
+
+  DatabasePort:
+    type: String
+    description: 'Database port number'
+    default: '5432'
+
+  DatabaseName:
+    type: String
+    description: 'Database name to connect to (postgres: postgres, mysql: mysql, sqlserver: master, oracle: ORCL)'
+    default: 'postgres'
+
+  DatabaseUser:
+    type: String
+    description: 'Database username'
+    default: 'postgres'
+
+  DatabasePasswordSecretArn:
+    type: String
+    description: 'ARN of Secrets Manager secret containing database password. Retrieved on the EC2 load generator using its instance profile role - see database-io-exhaustion-ec2-instance-role-iam-policy.json'
+
+  WorkerThreads:
+    type: String
+    description: 'Number of concurrent worker threads generating I/O load'
+    default: '50'
+
+  ExperimentDuration:
+    type: String
+    description: 'Total experiment duration in ISO8601 format (e.g., PT10M for 10 minutes, PT1H for 1 hour)'
+    default: 'PT10M'
+
+  IOPattern:
+    type: String
+    description: 'I/O pattern: read (heavy SELECT queries), write (heavy INSERT/UPDATE), mixed (both)'
+    default: 'mixed'
+    allowedValues:
+      - read
+      - write
+      - mixed
+
+  SeedRowCount:
+    type: String
+    description: 'Rows seeded into each worker table before the timed I/O phase begins, so read and mixed patterns have data to scan/update instead of querying an empty table'
+    default: '500'
+
+  MinActiveWorkerPercentage:
+    type: String
+    description: 'Minimum percentage of worker threads that must successfully record I/O operations for the experiment to be considered a successful fault injection. If this threshold is not met, ExhaustDatabaseIO fails and the automation exits non-zero.'
+    default: '50'
+
+  SubnetId:
+    type: String
+    description: 'Subnet ID for load generator instance. Must route to the database, and to SSM/SSM Messages, Secrets Manager, and package repository endpoints - see README Prerequisites'
+
+  VpcId:
+    type: String
+    description: 'VPC ID where the load generator will be launched'
+
+  DatabaseSecurityGroupId:
+    type: String
+    description: 'Security group ID of the target database (automation will add a temporary ingress rule). Must be tagged FIS-Ready=True'
+
+  InstanceType:
+    type: String
+    description: 'EC2 instance type (use t3.medium or larger for high thread counts)'
+    default: 't3.medium'
+
+  LatestAmiId:
+    type: String
+    description: 'Amazon Linux 2023 AMI ID'
+    default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+
+mainSteps:
+  - name: CreateSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: CreateSecurityGroup
+      GroupName: 'FIS-DatabaseIO-LoadGen-{{ automation:EXECUTION_ID }}'
+      Description: 'Temporary security group for FIS database I/O exhaustion experiment'
+      VpcId: '{{ VpcId }}'
+      TagSpecifications:
+        - ResourceType: 'security-group'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-DatabaseIO-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseIOExhaustion'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: SecurityGroupId
+        Selector: '$.GroupId'
+        Type: String
+
+  - name: ConfigureSecurityGroupEgress
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: configure_egress
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def configure_egress(events, context):
+            ec2 = boto3.client('ec2')
+
+            security_group_id = events['SecurityGroupId']
+            database_sg_id = events['DatabaseSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            # A newly created VPC security group starts with an allow-all outbound
+            # rule. Remove it so the load generator's egress is limited to the
+            # database port plus the HTTPS traffic it needs for SSM and package
+            # installation, rather than unrestricted outbound access.
+            try:
+                ec2.revoke_security_group_egress(
+                    GroupId=security_group_id,
+                    IpPermissions=[{
+                        'IpProtocol': '-1',
+                        'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                    }]
+                )
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'InvalidPermission.NotFound':
+                    raise
+
+            ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': database_sg_id,
+                        'Description': 'Allow outbound to database'
+                    }]
+                }]
+            )
+
+            response = ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 443,
+                    'ToPort': 443,
+                    'IpRanges': [{
+                        'CidrIp': '0.0.0.0/0',
+                        'Description': 'HTTPS for SSM, Secrets Manager, and package repositories'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        SecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: AuthorizeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_ingress
+      Script: |
+        import boto3
+
+        def authorize_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            response = ec2.authorize_security_group_ingress(
+                GroupId=database_sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': load_gen_sg_id,
+                        'Description': 'Allow inbound from FIS load generator'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: LaunchLoadGenerator
+    action: 'aws:runInstances'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      ImageId: '{{ LatestAmiId }}'
+      InstanceType: '{{ InstanceType }}'
+      MinInstanceCount: 1
+      MaxInstanceCount: 1
+      SubnetId: '{{ SubnetId }}'
+      SecurityGroupIds:
+        - '{{ CreateSecurityGroup.SecurityGroupId }}'
+      IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
+        HttpEndpoint: 'enabled'
+      TagSpecifications:
+        - ResourceType: 'instance'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-DatabaseIO-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseIOExhaustion'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: InstanceId
+        Selector: '$.InstanceIds[0]'
+        Type: String
+
+  - name: WaitForSSMAgent
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.InstanceInformationList[0].PingStatus'
+      DesiredValues:
+        - Online
+
+  - name: InstallDatabaseClient
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 600
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            ENGINE="{{ DatabaseEngine }}"
+
+            echo "Installing database client for engine: $ENGINE"
+
+            if [ "$ENGINE" = "postgres" ]; then
+                dnf install -y postgresql15 python3-pip
+                pip3 install psycopg2-binary
+                echo "PostgreSQL client installed"
+
+            elif [ "$ENGINE" = "mysql" ]; then
+                dnf install -y mariadb105 python3-pip
+                pip3 install mysql-connector-python
+                echo "MySQL client installed"
+
+            elif [ "$ENGINE" = "sqlserver" ]; then
+                curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
+                ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
+                pip3 install pyodbc
+                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+                source ~/.bashrc
+                echo "SQL Server tools installed"
+
+            elif [ "$ENGINE" = "oracle" ]; then
+                dnf install -y python3-pip libaio
+                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm
+                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm
+                pip3 install oracledb
+                echo "Oracle Instant Client and oracledb installed"
+            else
+                echo "Unsupported database engine: $ENGINE"
+                exit 1
+            fi
+
+            # Install AWS CLI and boto3 for Secrets Manager access
+            dnf install -y aws-cli
+            pip3 install boto3
+
+            echo "Installation complete"
+
+  - name: ExhaustDatabaseIO
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 7200
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            cat > /tmp/exhaust_io.py << 'PYTHON_EOF'
+            import re
+            import sys
+            import time
+            import json
+            import threading
+            import random
+            import string
+            import boto3
+            from datetime import datetime
+
+            def parse_iso8601_duration(duration):
+                seconds = 0
+                duration = duration.replace('PT', '')
+
+                if 'H' in duration:
+                    hours, duration = duration.split('H')
+                    seconds += int(hours) * 3600
+
+                if 'M' in duration:
+                    minutes, duration = duration.split('M')
+                    seconds += int(minutes) * 60
+
+                if 'S' in duration:
+                    secs = duration.replace('S', '')
+                    if secs:
+                        seconds += int(secs)
+
+                return seconds
+
+            def generate_random_data(size_bytes=1024):
+                return ''.join(random.choices(string.ascii_letters + string.digits, k=size_bytes))
+
+            def generate_seed_rows(seed_rows):
+                return [
+                    (generate_random_data(4096), bytes(random.getrandbits(8) for _ in range(8192)))
+                    for _ in range(seed_rows)
+                ]
+
+            def io_worker_postgres(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
+                import psycopg2
+                ops_count = 0
+                error_count = 0
+                conn = None
+                try:
+                    conn = psycopg2.connect(
+                        host=endpoint, port=port, database=dbname,
+                        user=user, password=password, connect_timeout=10
+                    )
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id SERIAL PRIMARY KEY, data TEXT, padding BYTEA, created_at TIMESTAMP DEFAULT NOW())")
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", generate_seed_rows(seed_rows))
+
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY random() LIMIT 100")
+                                    cursor.fetchall()
+                                    cursor.execute(f"SELECT COUNT(*), pg_size_pretty(pg_total_relation_size('{table_name}')) FROM {table_name}")
+                                    cursor.fetchone()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE {table_name} SET data = %s WHERE id = (SELECT id FROM {table_name} ORDER BY random() LIMIT 1)", (data,))
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        except Exception:
+                            pass
+                        cursor.close()
+
+                    return {'ops': ops_count, 'errors': error_count}
+
+                except Exception as e:
+                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
+
+            def io_worker_mysql(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
+                import mysql.connector
+                ops_count = 0
+                error_count = 0
+                conn = None
+                try:
+                    conn = mysql.connector.connect(
+                        host=endpoint, port=port, database=dbname,
+                        user=user, password=password, connection_timeout=10
+                    )
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id INT AUTO_INCREMENT PRIMARY KEY, data TEXT, padding LONGBLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", generate_seed_rows(seed_rows))
+
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY RAND() LIMIT 100")
+                                    cursor.fetchall()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE {table_name} SET data = %s ORDER BY RAND() LIMIT 1", (data,))
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        except Exception:
+                            pass
+                        cursor.close()
+
+                    return {'ops': ops_count, 'errors': error_count}
+
+                except Exception as e:
+                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
+
+            def io_worker_sqlserver(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
+                import pyodbc
+                ops_count = 0
+                error_count = 0
+                conn = None
+                try:
+                    conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes'
+                    conn = pyodbc.connect(conn_str, timeout=10)
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    cursor.execute(f"""
+                        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
+                        CREATE TABLE {table_name} (id INT IDENTITY(1,1) PRIMARY KEY, data NVARCHAR(MAX), padding VARBINARY(MAX), created_at DATETIME DEFAULT GETDATE())
+                    """)
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", generate_seed_rows(seed_rows))
+
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", (data, padding))
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT TOP 100 * FROM {table_name} ORDER BY NEWID()")
+                                    cursor.fetchall()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE TOP(1) {table_name} SET data = ?", (data,))
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                        except Exception:
+                            pass
+                        cursor.close()
+
+                    return {'ops': ops_count, 'errors': error_count}
+
+                except Exception as e:
+                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
+
+            def io_worker_oracle(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
+                import oracledb
+                ops_count = 0
+                error_count = 0
+                conn = None
+                try:
+                    oracledb.init_oracle_client()
+                    dsn = oracledb.makedsn(endpoint, port, service_name=dbname)
+                    conn = oracledb.connect(user=user, password=password, dsn=dsn)
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    try:
+                        cursor.execute(f"""
+                            BEGIN
+                                EXECUTE IMMEDIATE 'CREATE TABLE {table_name} (id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, data CLOB, padding BLOB, created_at TIMESTAMP DEFAULT SYSTIMESTAMP)';
+                            EXCEPTION
+                                WHEN OTHERS THEN
+                                    IF SQLCODE != -955 THEN RAISE; END IF;
+                            END;
+                        """)
+                    except Exception:
+                        pass
+
+                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", generate_seed_rows(seed_rows))
+
+                    try:
+                        while time.time() < end_time:
+                            try:
+                                if io_pattern in ('write', 'mixed'):
+                                    data = generate_random_data(4096)
+                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", [data, padding])
+                                    ops_count += 1
+
+                                if io_pattern in ('read', 'mixed'):
+                                    cursor.execute(f"SELECT * FROM {table_name} WHERE ROWNUM <= 100 ORDER BY DBMS_RANDOM.VALUE")
+                                    cursor.fetchall()
+                                    ops_count += 1
+
+                                if io_pattern == 'mixed' and random.random() < 0.3:
+                                    data = generate_random_data(4096)
+                                    cursor.execute(f"UPDATE {table_name} SET data = :1 WHERE ROWNUM = 1", [data])
+                                    ops_count += 1
+
+                            except Exception:
+                                error_count += 1
+                                time.sleep(0.1)
+                    finally:
+                        try:
+                            cursor.execute(f"DROP TABLE {table_name} PURGE")
+                        except Exception:
+                            pass
+                        cursor.close()
+
+                    return {'ops': ops_count, 'errors': error_count}
+
+                except Exception as e:
+                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
+                    return {'ops': ops_count, 'errors': error_count + 1}
+                finally:
+                    if conn:
+                        conn.close()
+
+            def main():
+                engine = sys.argv[1]
+                endpoint = sys.argv[2]
+                port = int(sys.argv[3])
+                dbname = sys.argv[4]
+                user = sys.argv[5]
+                secret_arn = sys.argv[6]
+                worker_threads = int(sys.argv[7])
+                experiment_duration_iso = sys.argv[8]
+                io_pattern = sys.argv[9]
+                region = sys.argv[10]
+                execution_id = sys.argv[11]
+                seed_rows = int(sys.argv[12])
+                min_active_percent = float(sys.argv[13])
+
+                experiment_duration = parse_iso8601_duration(experiment_duration_iso)
+
+                # Keep table names short and unique per execution so concurrent runs
+                # (or a stale table from a prior run) can never collide, and cleanup
+                # only ever drops objects this execution created. Kept short to stay
+                # under Oracle's 30-character unquoted identifier limit.
+                exec_suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
+
+                print("=== Database I/O Exhaustion Test ===")
+                print(f"Engine: {engine}")
+                print(f"Endpoint: {endpoint}:{port}")
+                print(f"Database: {dbname}")
+                print(f"User: {user}")
+                print(f"Worker Threads: {worker_threads}")
+                print(f"Experiment Duration: {experiment_duration}s")
+                print(f"I/O Pattern: {io_pattern}")
+                print(f"Seed Rows Per Table: {seed_rows}")
+                print(f"Execution Suffix: {exec_suffix}")
+                print("====================================")
+
+                print("Retrieving database password from Secrets Manager...")
+                try:
+                    sm = boto3.client('secretsmanager', region_name=region)
+                    response = sm.get_secret_value(SecretId=secret_arn)
+                    secret = json.loads(response['SecretString'])
+                    password = secret.get('password', response['SecretString'])
+                except Exception as e:
+                    print(f"ERROR: Failed to retrieve password: {str(e)}")
+                    sys.exit(1)
+
+                print("Password retrieved successfully")
+
+                end_time = time.time() + experiment_duration
+                threads = []
+                results = [None] * worker_threads
+
+                worker_func = {
+                    'postgres': io_worker_postgres,
+                    'mysql': io_worker_mysql,
+                    'sqlserver': io_worker_sqlserver,
+                    'oracle': io_worker_oracle
+                }[engine]
+
+                print(f"Launching {worker_threads} I/O worker threads...")
+
+                for i in range(worker_threads):
+                    table_name = f"fis_io_{exec_suffix}_{i + 1}"
+
+                    def run_worker(idx=i, tbl=table_name):
+                        results[idx] = worker_func(
+                            idx + 1, endpoint, port, dbname, user, password, io_pattern, end_time, tbl, seed_rows
+                        )
+
+                    thread = threading.Thread(target=run_worker)
+                    thread.start()
+                    threads.append(thread)
+                    time.sleep(0.1)
+
+                    if (i + 1) % 10 == 0:
+                        print(f"Progress: {i + 1}/{worker_threads} workers launched")
+
+                print(f"All {worker_threads} workers launched, generating I/O load...")
+                print(f"Experiment will run for {experiment_duration} seconds")
+
+                for thread in threads:
+                    thread.join()
+
+                total_ops = sum(r['ops'] for r in results if r)
+                total_errors = sum(r['errors'] for r in results if r)
+                active_workers = sum(1 for r in results if r and r['ops'] > 0)
+                active_percent = (active_workers / worker_threads * 100) if worker_threads else 0
+
+                print("=== I/O Exhaustion Test Complete ===")
+                print(f"Active workers: {active_workers}/{worker_threads} ({active_percent:.1f}%)")
+                print(f"Total I/O operations: {total_ops}")
+                print(f"Total operation errors: {total_errors}")
+                print(f"Avg ops/worker: {total_ops // max(active_workers, 1)}")
+                print("====================================")
+
+                fault_injected = total_ops > 0 and active_percent >= min_active_percent
+
+                result = {
+                    "ActiveWorkers": active_workers,
+                    "TotalWorkers": worker_threads,
+                    "TotalIOOperations": total_ops,
+                    "TotalOperationErrors": total_errors,
+                    "DurationSeconds": experiment_duration,
+                    "IOPattern": io_pattern,
+                    "FaultInjected": fault_injected
+                }
+                print(json.dumps(result))
+
+                if not fault_injected:
+                    print(f"ERROR: Fault was not reliably injected - {active_percent:.1f}% of workers were active "
+                          f"(minimum required: {min_active_percent}%) and {total_ops} I/O operations were recorded.")
+                    sys.exit(1)
+
+            if __name__ == '__main__':
+                main()
+            PYTHON_EOF
+
+            python3 /tmp/exhaust_io.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ WorkerThreads }}" \
+              "{{ ExperimentDuration }}" \
+              "{{ IOPattern }}" \
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}" \
+              "{{ SeedRowCount }}" \
+              "{{ MinActiveWorkerPercentage }}"
+
+  - name: TerminateInstance
+    action: 'aws:changeInstanceState'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      DesiredState: terminated
+
+  - name: WaitForInstanceTermination
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'Continue'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - terminated
+
+  - name: RevokeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Runtime: python3.11
+      Handler: revoke_ingress
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def revoke_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            try:
+                response = ec2.revoke_security_group_ingress(
+                    GroupId=database_sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': port,
+                        'ToPort': port,
+                        'UserIdGroupPairs': [{
+                            'GroupId': load_gen_sg_id
+                        }]
+                    }]
+                )
+                return {'StatusCode': 200, 'Response': response}
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                    return {'StatusCode': 200, 'Response': 'Ingress rule already absent'}
+                return {'StatusCode': 500, 'Error': str(e)}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: CleanupSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: DeleteSecurityGroup
+      GroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+
+outputs:
+  - LaunchLoadGenerator.InstanceId
+  - CreateSecurityGroup.SecurityGroupId
