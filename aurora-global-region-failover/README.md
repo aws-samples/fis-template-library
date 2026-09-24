@@ -66,14 +66,9 @@ The experiment will automatically detect the secondary cluster and promote it to
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the failover/switchover automation completes.
+The experiment does not have any specific stop conditions defined by default. It will continue to run until the failover/switchover automation completes or the experiment is manually stopped.
 
-## Observability and stop conditions
-
-Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
-business metric requiring an immediate end of the fault injection. This 
-template makes no assumptions about your application and the relevant metrics 
-and does not include stop conditions by default.
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
 ## Next Steps
 As you adapt this scenario to your needs, we recommend:
