@@ -26,8 +26,6 @@ Before running this experiment, ensure that:
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until all targeted resources have been interrupted.
 
-## Observability and stop conditions
-
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 business metric requiring an immediate end of the fault injection. This 
 template makes no assumptions about your application and the relevant metrics 
