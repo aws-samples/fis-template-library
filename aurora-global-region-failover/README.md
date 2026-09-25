@@ -1,6 +1,17 @@
-# Aurora Global Database Regional Failover
+# AWS Fault Injection Service Experiment: Aurora Global Database Regional Failover
+
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
 This experiment performs Aurora Global Database regional failover/switchover to test disaster recovery procedures and measure RTO/RPO.
+
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+
+## Hypothesis
+
+When an Aurora Global Database performs a regional failover/switchover, the secondary Region cluster is promoted to primary and the application resumes read/write operations against the new primary within a recovery time objective (RTO) of 5 minutes, with a recovery point objective (RPO) of zero for a planned switchover (no data loss). A CloudWatch alarm on application error rate or database connection failures returns to its OK state within 5 minutes of the promotion completing.
 
 ## Prerequisites
 
@@ -59,3 +70,20 @@ aws fis start-experiment --experiment-template-id <TEMPLATE-ID>
 ```
 
 The experiment will automatically detect the secondary cluster and promote it to primary based on the configured failover type.
+
+## Stop Conditions
+
+The experiment does not have any specific stop conditions defined by default. It will continue to run until the failover/switchover automation completes or the experiment is manually stopped.
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+
+## Next Steps
+As you adapt this scenario to your needs, we recommend:
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to the Aurora Global Database and the applications that depend on it.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the regional failover/switchover.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Confirming your recovery time objective (RTO) and recovery point objective (RPO) targets against the observed failover/switchover behavior.
+
+## Import Experiment
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
