@@ -11,7 +11,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
 
 ## Hypothesis
 
-When an Aurora Global Database performs a regional failover/switchover, the secondary Region cluster is promoted to primary and the application resumes read/write operations against the new primary within a recovery time objective (RTO) of 5 minutes, with a recovery point objective (RPO) of zero for a planned switchover (no data loss). A CloudWatch alarm on application error rate or database connection failures returns to its OK state within 5 minutes of the promotion completing.
+When the experiment switches the Aurora Global Database over to the secondary Region (`failoverType` is `switchover` by default), the secondary cluster becomes the primary and the application resumes reads and writes against it within 5 minutes of the switchover starting, a recovery time objective (RTO) of 5 minutes. Writes that fail while the old primary is read-only or the database is briefly unavailable are retried against the new primary, so the application records no write that failed after its retries. A CloudWatch alarm on application error rate or database connection failures returns to its OK state within 5 minutes of the switchover completing.
+
+With `failoverType` set to `failover`, which is what a real Regional outage calls for, Aurora promotes the secondary without waiting for it to catch up, so writes committed in the last seconds before the failover can be lost. Expect the lost writes to span no more time than the `AuroraGlobalDBRPOLag` metric (`AuroraGlobalDBReplicationLag` on older Aurora MySQL versions) showed just before the failover.
 
 ## Prerequisites
 
