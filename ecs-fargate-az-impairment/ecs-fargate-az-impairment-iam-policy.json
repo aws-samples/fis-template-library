@@ -76,12 +76,27 @@
       "Effect": "Allow",
       "Action": [
         "ec2:CreateNetworkAcl",
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*",
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
+      ]
+    },
+    {
+      "Sid": "AllowNetworkDisruptConnectivityOnManagedAcl",
+      "Effect": "Allow",
+      "Action": [
         "ec2:CreateNetworkAclEntry",
-        "ec2:CreateTags",
         "ec2:DeleteNetworkAcl",
         "ec2:ReplaceNetworkAclAssociation"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/managedByFIS": "true"
+        }
+      }
     }
   ]
 }

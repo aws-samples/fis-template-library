@@ -25,7 +25,7 @@ When an Availability Zone experiences a network impairment affecting an ECS Farg
 Before running this experiment, ensure that:
 
 1. You have the necessary permissions to execute the FIS experiment and perform ECS task actions and EC2 network ACL operations.
-2. The IAM role specified in the `roleArn` field has been created with the required permissions from `ecs-fargate-az-impairment-fis-role-iam-policy.json`.
+2. The IAM role specified in the `roleArn` field has been created with the required permissions from `ecs-fargate-az-impairment-iam-policy.json`.
 3. The ECS cluster, service, and tasks all have the `FIS-Ready=True` tag, and it propagates to tasks at launch time (`propagateTags: SERVICE` or `TASK_DEFINITION` in the service definition). You can verify with:
    ```bash
    aws ecs describe-tasks --cluster <cluster> --tasks $(aws ecs list-tasks --cluster <cluster> --service-name <service> --query 'taskArns[0]' --output text) --query 'tasks[0].tags'
@@ -130,9 +130,12 @@ Before running the experiment, update these placeholder values:
 | `<YOUR AWS ACCOUNT>` | Your 12-digit AWS account ID |
 | `<YOUR REGION>` | AWS region where resources are deployed |
 | `<YOUR ROLE NAME>` | FIS execution IAM role name |
-| `<YOUR ECS CLUSTER>` | Name of your ECS cluster |
-| `<YOUR ECS SERVICE>` | Name of your ECS service |
 | `<YOUR TARGET AZ>` | Availability Zone to impair |
+
+> Targeting is by the `FIS-Ready=True` tag and Availability Zone only -- there is
+> no explicit ECS cluster/service field to configure. Ensure the tag is applied
+> (and propagated to tasks) only on the cluster/service/subnets you intend to
+> target; see Prerequisites above.
 
 ## Stop Conditions
 
@@ -188,5 +191,5 @@ You can import the json experiment template into your AWS account via cli or aws
 | `README.md` | This documentation file |
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
 | `ecs-fargate-az-impairment-template.json` | FIS experiment template definition |
-| `ecs-fargate-az-impairment-fis-role-iam-policy.json` | IAM policy for the FIS execution role |
+| `ecs-fargate-az-impairment-iam-policy.json` | IAM policy for the FIS execution role |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |

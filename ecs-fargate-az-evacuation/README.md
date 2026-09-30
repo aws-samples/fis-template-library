@@ -36,7 +36,7 @@ Before running this experiment, ensure that:
 4. The subnet(s) in the target Availability Zone have the `FIS-Ready=True` tag (required by the `aws:network:disrupt-connectivity` target).
 5. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required — the automation cannot remove the last subnet).
 6. The SSM automation document (`ecs-fargate-az-evacuation-subnet-automation`) has been deployed to your account.
-7. Your service has sufficient capacity in remaining AZs to absorb the full-service redeploy, not just the tasks from the impaired AZ, during the ~20-minute experiment duration.
+7. Your service has sufficient capacity in remaining AZs to absorb the full-service redeploy, not just the tasks from the impaired AZ, during the ~30-minute worst-case experiment duration (see Actions Detail below for the timing breakdown).
 8. **Task definition requirements for `inject-network-packet-loss`**: see the [`ecs-fargate-az-impairment` prerequisites](../ecs-fargate-az-impairment/README.md#prerequisites) for the SSM sidecar, task role, and managed-instance role setup — identical requirements apply here.
 9. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
@@ -78,10 +78,21 @@ T+5m                      ▼
         SLO alarms?
                           │
 T+20m                     ▼  Packet loss and connectivity disruption end
-T+~20m                    ▼  Evacuation window ends, SSM automation restores
+T+~5m to T+~15m           ▼  Automation waits for service stability after
+                             subnet removal (up to 10 minutes)
+T+~15m to T+~30m          ▼  Evacuation hold: subnet stays removed for the
+                             configured duration (default 15 minutes)
+T+~30m                    ▼  Evacuation window ends, SSM automation restores
                              the subnet; service naturally rebalances on its
                              next deployment
 ```
+
+Worst case, `evacuate-subnet-in-az` alone can take up to ~25 minutes from
+T+5m (10 min stability wait + 15 min evacuation hold), i.e. up to **T+~30m**
+for full completion — which is why the action's `maxDuration` is set to 40
+minutes with headroom. The fault-injection actions (`disrupt-az-connectivity`,
+`inject-network-packet-loss`) end independently at T+20m regardless of how
+long the evacuation automation takes.
 
 ### Actions Detail
 
@@ -92,7 +103,7 @@ T+~20m                    ▼  Evacuation window ends, SSM automation restores
 | `wait-before-stop` | `aws:fis:wait` | Delay to let the fault take effect before hard stop | T+0 | 1 minute |
 | `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
 | `wait-for-detection` | `aws:fis:wait` | Simulated detection/decision delay before evacuation begins | T+1m | 4 minutes (default — tune to your SLA) |
-| `evacuate-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes the subnet at T+5m, forcing evacuation; restores it after the evacuation window. Handles cleanup on cancel/failure. | T+5m | 40 min max |
+| `evacuate-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes the subnet at T+5m, forcing evacuation; restores it after the evacuation window. Handles cleanup on cancel/failure. | T+5m | Up to ~25 min (10 min stability wait + 15 min evacuation hold); `maxDuration` 40 min |
 
 ### SSM Automation Document
 
@@ -147,9 +158,19 @@ Before running the experiment, update these placeholder values:
 | `<YOUR SUBNET ID>` | Subnet ID to remove/restore during evacuation |
 | `<YOUR TARGET AZ>` | Availability Zone to impair and evacuate |
 
+> **`<YOUR SUBNET ID>` and `<YOUR TARGET AZ>` must refer to the same subnet.**
+> `<YOUR TARGET AZ>` filters the `subnet-in-az` target (the subnet whose
+> connectivity is disrupted) by Availability Zone, while `<YOUR SUBNET ID>` is
+> passed explicitly to the SSM evacuation automation as the subnet to remove
+> from the ECS service. These are two independently-configured values with no
+> automatic cross-check — if `<YOUR SUBNET ID>` does not match the subnet(s)
+> actually resolved by `<YOUR TARGET AZ>`, the experiment will disrupt
+> connectivity to one subnet but evacuate a different one, invalidating the
+> drill. Confirm both values point at the same subnet before running.
+
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 20-25 minutes total).
+The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 30 minutes total in the worst case — see the Experiment Flow timing breakdown above; `evacuate-subnet-in-az`'s `maxDuration` of 40 minutes provides headroom above this).
 
 > **Note:** The experiment uses `emptyTargetResolutionMode: "skip"` because tasks may not exist in the target Availability Zone if the service hasn't scheduled tasks there yet. This prevents the experiment from failing when no tasks match the AZ filter at the time of execution.
 
