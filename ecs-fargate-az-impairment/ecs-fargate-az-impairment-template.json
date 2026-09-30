@@ -70,6 +70,10 @@
                 {
                     "path": "AvailabilityZone",
                     "values": ["<YOUR TARGET AZ>"]
+                },
+                {
+                    "path": "LastStatus",
+                    "values": ["RUNNING"]
                 }
             ],
             "selectionMode": "ALL"
@@ -83,6 +87,10 @@
                 {
                     "path": "AvailabilityZone",
                     "values": ["<YOUR TARGET AZ>"]
+                },
+                {
+                    "path": "LastStatus",
+                    "values": ["RUNNING"]
                 }
             ],
             "selectionMode": "ALL"

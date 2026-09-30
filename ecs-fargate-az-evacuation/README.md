@@ -121,6 +121,17 @@ Steps 4–6 have `onFailure` and `onCancel` routing to the restore step, ensurin
 - Tasks must be running in the specified ECS cluster and service
 - Subnets and tasks must be in the target Availability Zone
 
+> **Note on the `LastStatus=RUNNING` task filter:** both task targets filter on
+> `LastStatus=RUNNING` in addition to the Availability Zone. This is required for
+> reliability: ECS keeps STOPPED tasks queryable (and tagged `FIS-Ready=True`) for
+> up to ~1 hour after they stop, and FIS resolves `aws:ecs:task` targets from the
+> tagging API + `DescribeTasks`. Without the `LastStatus` filter, tasks stopped by
+> a previous experiment run (or by this experiment's own `stop-tasks-in-az` action)
+> are still matched by tag + AZ, and the `aws:ecs:task-network-packet-loss` action
+> then fails its SSM-managed-instance validation against those dead tasks' sidecars
+> (`"At least one ECS Task is not registered as a SSM managed instance"`). The
+> filter scopes resolution to live tasks so repeated runs stay reliable.
+
 ## Parameters to Configure
 
 Before running the experiment, update these placeholder values:
