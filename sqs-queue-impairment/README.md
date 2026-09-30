@@ -52,9 +52,11 @@ During the impairment periods, you should see "AccessDenied" errors when attempt
 
 ![FIS Console showing actions](./images/sqs.png "FIS Console showing actions")
 
-## Observability and stop conditions
+## Stop Conditions
 
-Stop conditions are based on an AWS CloudWatch alarm tied to an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics, so it does not include stop conditions by default (`"stopConditions": [{ "source": "none" }]`).
+The experiment does not have any specific stop conditions defined (`"stopConditions": [{ "source": "none" }]`). It will continue to run until manually stopped or until the fourth impairment has finished and the SSM Automation Document has removed its deny statement from the queue policy.
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
 **Choose the stop-condition metric carefully.** Do *not* alarm on the queue metrics this experiment perturbs (`ApproximateAgeOfOldestMessage`, `NumberOfMessagesSent`, `ApproximateNumberOfMessagesVisible` on the source queue). Those are expected to move during impairment, so an alarm on them would abort the experiment during the first short phase — before the longer phases surface the failure modes you care about. Instead, alarm on a signal that should stay healthy if your resilience works, i.e. real customer/business impact:
 
@@ -95,7 +97,7 @@ As you adapt this scenario to your needs, we recommend:
 
 1. Reviewing the tag names you use to ensure they fit your specific use case.
 2. Identifying business metrics tied to your SQS queue processing, such as application transaction rates.
-3. **Before running anything beyond a short test, add a stop condition** tied to a customer-impact alarm so the experiment aborts automatically if critical thresholds are breached (see [Observability and stop conditions](#observability-and-stop-conditions) for how to choose the metric and an example alarm).
+3. **Before running anything beyond a short test, add a stop condition** tied to a customer-impact alarm so the experiment aborts automatically if critical thresholds are breached (see [Stop Conditions](#stop-conditions) for how to choose the metric and an example alarm).
 4. Implementing appropriate circuit breakers in your application to handle SQS service impairments gracefully.
 6. Testing your application's recovery mechanisms to ensure they work as expected after the SQS service is restored.
 7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
