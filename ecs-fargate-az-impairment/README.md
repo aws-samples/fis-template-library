@@ -7,28 +7,31 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTIO
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+> **Looking for the operator-response drill instead?** This template injects the AZ fault only and makes **no control-plane changes** to your ECS service. If you want to test whether your team/automation correctly detects the impairment and evacuates the AZ (removing the subnet, forcing a redeploy into healthy AZs), see the companion template: [`ecs-fargate-az-evacuation`](../ecs-fargate-az-evacuation/README.md).
+
 ## Hypothesis
 
-When an Availability Zone experiences an impairment affecting an ECS Fargate service, the service should continue operating with reduced capacity using tasks in the remaining healthy AZs. Specifically:
+When an Availability Zone experiences a network impairment affecting an ECS Fargate service, the service should detect degraded health in the affected AZ and continue operating with reduced capacity using tasks in the remaining healthy AZs. Specifically:
 
-- When tasks are stopped in the target AZ, ECS should reschedule them to healthy AZs
-- When the subnet is removed from the service configuration, new tasks should only launch in remaining subnets
-- When network packet loss is injected, affected tasks should be detected as unhealthy
-- The application should remain available throughout the experiment with degraded but functional capacity
-- When the subnet is restored, the service should automatically rebalance tasks across all AZs
+- When network connectivity to/from the target AZ is disrupted, tasks in that AZ should be detected as unreachable/unhealthy (via health checks, target group, or application-level signals).
+- When network packet loss is injected, affected tasks should be detected as unhealthy.
+- When tasks are stopped in the target AZ, ECS reschedules them to satisfy `desiredCount`.
+- **This template makes no change to the ECS service's network configuration.** Because the impaired subnet remains a valid placement target for the ECS scheduler, replacement tasks may be scheduled back into the impaired AZ during the experiment window. This is expected and is part of what the experiment measures — it surfaces whether your detection signals (alarms, health checks, dashboards) correctly flag the AZ as degraded even while ECS keeps placing tasks there. If your goal is to prevent replacements from landing in the bad AZ, run the [`ecs-fargate-az-evacuation`](../ecs-fargate-az-evacuation/README.md) template instead, which removes the subnet as part of the drill.
+- The application should remain available throughout the experiment with degraded but functional capacity.
+- All injected faults are automatically reverted at the end of their configured duration; no manual cleanup or restoration step is required.
 
 ## Prerequisites
 
 Before running this experiment, ensure that:
 
-1. You have the necessary permissions to execute the FIS experiment and perform ECS service updates, SSM automation executions, and EC2 network operations.
-2. The IAM roles have been created with the required permissions from `ecs-fargate-az-impairment-fis-role-iam-policy.json` (FIS execution role) and `ecs-fargate-az-impairment-ssm-automation-role-iam-policy.json` (SSM automation role).
-3. The ECS cluster, **service**, and tasks all have the `FIS-Ready=True` tag. The service must be tagged directly (required by the SSM automation role policy — `ecs:DescribeServices` and `ecs:UpdateService` are conditioned on `aws:ResourceTag/FIS-Ready: True`; an untagged service causes AccessDenied at the first automation step before any subnet is removed). Tags must also propagate to tasks at launch time (`propagateTags: SERVICE` or `TASK_DEFINITION` in the service definition). You can verify with:
+1. You have the necessary permissions to execute the FIS experiment and perform ECS task actions and EC2 network ACL operations.
+2. The IAM role specified in the `roleArn` field has been created with the required permissions from `ecs-fargate-az-impairment-fis-role-iam-policy.json`.
+3. The ECS cluster, service, and tasks all have the `FIS-Ready=True` tag, and it propagates to tasks at launch time (`propagateTags: SERVICE` or `TASK_DEFINITION` in the service definition). You can verify with:
    ```bash
    aws ecs describe-tasks --cluster <cluster> --tasks $(aws ecs list-tasks --cluster <cluster> --service-name <service> --query 'taskArns[0]' --output text) --query 'tasks[0].tags'
    ```
-4. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required - the experiment cannot remove the last subnet).
-5. The SSM automation document (`ecs-fargate-az-impairment-subnet-automation`) has been deployed to your account.
+4. The subnet(s) in the target Availability Zone have the `FIS-Ready=True` tag (required by the `aws:network:disrupt-connectivity` target).
+5. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones.
 6. Your service has sufficient capacity in remaining AZs to handle the workload during the 15-minute experiment duration.
 7. **Task definition requirements for `inject-network-packet-loss`**: The `aws:ecs:task-network-packet-loss` action uses an SSM agent sidecar inside each task to inject faults. Without it, the action fails with `"At least one ECS Task is not registered as a SSM managed instance."` Your task definition must:
    - Set `pidMode: task` (required for the sidecar to access the task's network namespace)
@@ -56,67 +59,67 @@ Before running this experiment, ensure that:
 
 ## How It Works
 
-This experiment simulates a complete Availability Zone impairment using a sequenced approach that mirrors real-world AZ failures. Network degradation begins first, followed by a hard task stop — making the failure more realistic and catastrophic than simply stopping tasks. The SSM automation document manages the subnet impairment lifecycle (remove → wait → restore) with built-in cleanup on cancel or failure:
+This experiment simulates an Availability Zone network impairment using **only data-plane / network-layer faults**. It makes **no API calls against the ECS service** (no `UpdateService`, no network configuration changes) — the ECS scheduler behaves exactly as it would during a real, undeclared AZ network event.
 
 ### Experiment Flow
 
 ```
 T+0     ┌─────────────────────────────────────────────────────────────────────┐
+        │  disrupt-az-connectivity (deny intra-VPC traffic to/from other AZs) │
         │  inject-network-packet-loss (100% packet loss, 15 min)              │
         │  wait-before-stop (1 min delay)                                     │
-        │  impair-subnet-in-az (SSM: remove subnet → wait → restore)         │
         └─────────────────────────────────────────────────────────────────────┘
-                          │
-T+~30s  SSM automation removes subnet from ECS service network config
-        ECS can no longer reschedule tasks into the impaired AZ
                           │
 T+1m                      ▼
         ┌─────────────────────────────────────────────────────────────────────┐
         │  stop-tasks-in-az (force stop all tasks in target AZ)               │
         └─────────────────────────────────────────────────────────────────────┘
-        ECS reschedules stopped tasks into surviving subnets only ✓
+        ECS immediately tries to satisfy desiredCount. The impaired subnet is
+        still a valid placement target, so replacement tasks CAN be scheduled
+        back into the bad AZ — this is expected. What you're measuring is
+        whether those replacements are then detected as degraded (via
+        `disrupt-az-connectivity` and packet loss) rather than whether ECS
+        avoids the AZ altogether.
                           │
 T+15m                     ▼  Packet loss duration ends
-T+17m                     ▼  SSM automation restores subnet
-                          ▼  ECS rebalances tasks across AZs
+T+15m                     ▼  disrupt-az-connectivity duration ends, FIS restores
+                             the subnet's original network ACL association automatically
 ```
 
-**Why `impair-subnet-in-az` starts at T+0:** ECS does not evict running tasks when a subnet is removed from the service network config — only new task placements are blocked. If the subnet removal runs concurrently with or after the task stop, ECS can reschedule the just-stopped tasks back into the impaired AZ before the SSM automation has updated the service. Starting the SSM automation at T+0 ensures the subnet is fully removed (~30 seconds of SSM startup + API call) before `stop-tasks-in-az` fires at T+1m, giving ECS no healthy subnet to place replacements in for that AZ.
+**Why `disrupt-az-connectivity` runs for the full 15 minutes:** `aws:network:disrupt-connectivity` (`scope: availability-zone`) works by temporarily cloning the subnet's network ACL, adding deny rules for intra-VPC traffic to/from other AZs, and associating the clone with the subnet — a purely network-layer, non-invasive fault. FIS automatically restores the original network ACL association when the action's duration elapses; no cleanup step is required. This is what makes any task placed in that AZ (old or freshly replaced) observably unreachable from the rest of the VPC for the duration of the experiment, independent of whatever ECS does with task placement.
 
 ### Actions Detail
 
 | Action | Action ID | Description | Starts | Duration |
 |--------|-----------|-------------|--------|----------|
+| `disrupt-az-connectivity` | `aws:network:disrupt-connectivity` | Denies intra-VPC traffic to/from the target AZ's subnet, simulating an AZ network partition. Auto-restored by FIS at the end of duration. | T+0 | 15 minutes |
 | `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | T+0 | 15 minutes |
-| `wait-before-stop` | `aws:fis:wait` | Delay to let packet loss and subnet removal take effect before hard stop | T+0 | 1 minute |
-| `impair-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes subnet at T+0, waits for duration, then restores. Cleans up on cancel/failure. | T+0 | 40 min max |
+| `wait-before-stop` | `aws:fis:wait` | Delay to let the network disruption and packet loss take effect before hard stop | T+0 | 1 minute |
 | `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
-
-### SSM Automation Document
-
-The experiment uses a single SSM Automation document (`ecs-fargate-az-impairment-subnet-automation`) that manages the complete fault lifecycle:
-
-1. Validates input parameters (subnet ID format, cluster/service existence)
-2. Retrieves current ECS service network configuration
-3. Validates the subnet exists and is not the last one in the configuration
-4. **Removes the subnet** from the ECS service network configuration
-5. Waits for service stability (up to 10 minutes)
-6. **Waits for the impairment duration** (configurable, default 15 minutes)
-7. **Restores the subnet** to the ECS service configuration
-
-Steps 4–6 have `onFailure` and `onCancel` routing to the restore step, ensuring the subnet is always restored even if the experiment is cancelled or encounters an error. The restore step is self-contained and idempotent — it re-discovers the current service configuration and skips the update if the subnet is already present.
 
 ## Targets
 
 | Target Name | Resource Type | Selection Mode | Description |
 |-------------|---------------|----------------|-------------|
+| `subnet-in-az` | `aws:ec2:subnet` | ALL | Subnet(s) in the target AZ to disrupt connectivity for |
 | `ecs-tasks-for-stop` | `aws:ecs:task` | ALL | ECS tasks in the target AZ to be stopped |
 | `ecs-tasks-for-packet-loss` | `aws:ecs:task` | ALL | ECS tasks in the target AZ to receive packet loss injection |
 
 ### Target Requirements
-- Tasks must have the `FIS-Ready=True` tag
+- Subnets and tasks must have the `FIS-Ready=True` tag
 - Tasks must be running in the specified ECS cluster and service
-- Tasks must be in the target Availability Zone
+- Subnets and tasks must be in the target Availability Zone
+
+> **Note on the `LastStatus=RUNNING` task filter:** both task targets filter on
+> `LastStatus=RUNNING` in addition to the Availability Zone. This is required for
+> reliability: ECS keeps STOPPED tasks queryable (and tagged `FIS-Ready=True`) for
+> up to ~1 hour after they stop, and FIS resolves `aws:ecs:task` targets from the
+> tagging API + `DescribeTasks`. Without the `LastStatus` filter, tasks stopped by
+> a previous experiment run are still matched by tag + AZ, and the
+> `aws:ecs:task-network-packet-loss` action then fails its SSM-managed-instance
+> validation against those dead tasks' sidecars
+> (`"At least one ECS Task is not registered as a SSM managed instance"`). The
+> filter scopes resolution to live tasks so repeated runs stay reliable.
 
 ## Parameters to Configure
 
@@ -127,15 +130,13 @@ Before running the experiment, update these placeholder values:
 | `<YOUR AWS ACCOUNT>` | Your 12-digit AWS account ID |
 | `<YOUR REGION>` | AWS region where resources are deployed |
 | `<YOUR ROLE NAME>` | FIS execution IAM role name |
-| `<YOUR SSM ROLE NAME>` | SSM automation IAM role name |
 | `<YOUR ECS CLUSTER>` | Name of your ECS cluster |
 | `<YOUR ECS SERVICE>` | Name of your ECS service |
-| `<YOUR SUBNET ID>` | Subnet ID to remove/restore |
 | `<YOUR TARGET AZ>` | Availability Zone to impair |
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 30-45 minutes total).
+The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 15-16 minutes total).
 
 > **Note:** The experiment uses `emptyTargetResolutionMode: "skip"` because tasks may not exist in the target Availability Zone if the service hasn't scheduled tasks there yet. This prevents the experiment from failing when no tasks match the AZ filter at the time of execution.
 
@@ -170,9 +171,9 @@ As you adapt this scenario to your needs, we recommend:
 2. Identifying business metrics tied to your ECS Fargate service health (request latency, error rates, task health, throughput).
 3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of AZ impairment on service availability.
 4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. Testing in a non-production environment first to validate the automation behavior before running against production services.
+5. **Running a real end-to-end test in a non-production environment before trusting this template's documented behavior.** Confirm with your own service that: replacement tasks placed in the impaired AZ during the window are actually observed as unreachable by your health checks/alarms, and that packet loss + connectivity disruption are both cleanly reverted at T+15m with no lingering network ACL association.
 6. Adjusting the experiment duration (default 15 minutes) based on your testing requirements and recovery time objectives.
-7. Running the experiment in a non-production environment first to understand the impact on your specific application.
+7. Once you've validated detection behavior with this template, consider running [`ecs-fargate-az-evacuation`](../ecs-fargate-az-evacuation/README.md) to test whether your operational response (automated or manual) correctly evacuates the AZ.
 8. Documenting the expected behavior and actual results to build a runbook for real AZ failures.
 9. Gradually increasing the scope of the experiment (e.g., longer duration, multiple services) as confidence grows.
 
@@ -188,7 +189,4 @@ You can import the json experiment template into your AWS account via cli or aws
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
 | `ecs-fargate-az-impairment-template.json` | FIS experiment template definition |
 | `ecs-fargate-az-impairment-fis-role-iam-policy.json` | IAM policy for the FIS execution role |
-| `ecs-fargate-az-impairment-ssm-automation-role-iam-policy.json` | IAM policy for the SSM automation role |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
-| `ssm-iam-trust-relationship.json` | Trust policy for SSM service |
-| `ecs-fargate-az-impairment-subnet-automation.yaml` | SSM Automation document (remove, wait, restore with cleanup on cancel/failure) |

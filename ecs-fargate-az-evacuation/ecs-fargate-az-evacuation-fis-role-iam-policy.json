@@ -47,6 +47,18 @@
       "Resource": "*"
     },
     {
+      "Sid": "AllowNetworkDisruptConnectivity",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAcl",
+        "ec2:CreateNetworkAclEntry",
+        "ec2:CreateTags",
+        "ec2:DeleteNetworkAcl",
+        "ec2:ReplaceNetworkAclAssociation"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "AllowSSMSendCommand",
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
@@ -72,16 +84,24 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowNetworkDisruptConnectivity",
+      "Sid": "AllowSSMDocumentExecution",
       "Effect": "Allow",
       "Action": [
-        "ec2:CreateNetworkAcl",
-        "ec2:CreateNetworkAclEntry",
-        "ec2:CreateTags",
-        "ec2:DeleteNetworkAcl",
-        "ec2:ReplaceNetworkAclAssociation"
+        "ssm:StartAutomationExecution",
+        "ssm:GetAutomationExecution",
+        "ssm:StopAutomationExecution"
       ],
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-evacuation-subnet-automation",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ecs-fargate-az-evacuation-subnet-automation:*",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+      ]
+    },
+    {
+      "Sid": "AllowPassRole",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": ["arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>"]
     }
   ]
 }

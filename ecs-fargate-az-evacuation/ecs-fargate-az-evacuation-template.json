@@ -1,5 +1,5 @@
 {
-    "description": "ECS Fargate AZ Impairment (fault only) - Simulates availability zone network failure with task stop, network packet loss, and AZ connectivity disruption. No control-plane changes are made to the service.",
+    "description": "ECS Fargate AZ Evacuation - Drills the operator/automation response to an AZ impairment: injects the fault, waits for a detection delay, then evacuates the AZ by removing its subnet from the ECS service, forcing all tasks into the remaining healthy AZs.",
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
     "actions": {
         "disrupt-az-connectivity": {
@@ -7,7 +7,7 @@
             "description": "Deny intra-VPC traffic between the target subnet and subnets in other Availability Zones, simulating an AZ network partition",
             "parameters": {
                 "scope": "availability-zone",
-                "duration": "PT15M"
+                "duration": "PT20M"
             },
             "targets": {
                 "Subnets": "subnet-in-az"
@@ -17,7 +17,7 @@
             "actionId": "aws:ecs:task-network-packet-loss",
             "description": "Injects 100% packet loss for tasks in the target availability zone",
             "parameters": {
-                "duration": "PT15M",
+                "duration": "PT20M",
                 "lossPercent": "100",
                 "sources": "0.0.0.0/0",
                 "useEcsFaultInjectionEndpoints": "true"
@@ -40,6 +40,24 @@
                 "Tasks": "ecs-tasks-for-stop"
             },
             "startAfter": ["wait-before-stop"]
+        },
+        "wait-for-detection": {
+            "actionId": "aws:fis:wait",
+            "description": "Detection delay: simulates the time it takes for an operator or automated alarm to detect the AZ impairment and decide to evacuate. Adjust to match your real detection SLA.",
+            "parameters": {
+                "duration": "PT4M"
+            },
+            "startAfter": ["stop-tasks-in-az"]
+        },
+        "evacuate-subnet-in-az": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Evacuates the AZ by removing its subnet from the ECS service network configuration, forcing all tasks (including those already stopped and any replacements) into the remaining healthy AZs. Restores the subnet automatically at the end of the evacuation window or on cancel/failure.",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-evacuation-subnet-automation",
+                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\",\"ClusterName\":\"<YOUR ECS CLUSTER>\",\"ServiceName\":\"<YOUR ECS SERVICE>\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"Duration\":\"PT15M\"}",
+                "maxDuration": "PT40M"
+            },
+            "startAfter": ["wait-for-detection"]
         }
     },
     "stopConditions": [
@@ -97,7 +115,7 @@
         }
     },
     "tags": {
-        "Name": "ecs-fargate-az-impairment",
+        "Name": "ecs-fargate-az-evacuation",
         "Purpose": "chaos-engineering",
         "Environment": "test"
     },
