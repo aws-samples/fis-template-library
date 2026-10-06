@@ -5,7 +5,7 @@ This is an experiment template for use with AWS Fault Injection Service (FIS) an
 THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
 HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 > **Looking for the fault-only experiment instead?** This template deliberately makes a **control-plane change** (it removes the impaired AZ's subnet from your ECS service) to drill the evacuation response, and that change forces a full rolling redeployment of the service — by design, see the Hypothesis below. If you only want to inject the AZ fault and observe detection behavior without any control-plane change, see the companion template: [`ecs-fargate-az-impairment`](../ecs-fargate-az-impairment/README.md).
 
@@ -172,11 +172,9 @@ Before running the experiment, update these placeholder values:
 
 The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 30 minutes total in the worst case — see the Experiment Flow timing breakdown above; `evacuate-subnet-in-az`'s `maxDuration` of 40 minutes provides headroom above this).
 
-> **Note:** The experiment uses `emptyTargetResolutionMode: "skip"` because tasks may not exist in the target Availability Zone if the service hasn't scheduled tasks there yet. This prevents the experiment from failing when no tasks match the AZ filter at the time of execution.
-
-## Observability and stop conditions
-
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+
+> **Note:** The experiment uses `emptyTargetResolutionMode: "skip"` because tasks may not exist in the target Availability Zone if the service hasn't scheduled tasks there yet. This prevents the experiment from failing when no tasks match the AZ filter at the time of execution.
 
 ### Recommended Metrics for Stop Conditions
 
