@@ -5,7 +5,7 @@ This is an experiment template for use with AWS Fault Injection Service (FIS) an
 THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
 HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 > **Looking for the operator-response drill instead?** This template injects the AZ fault only and makes **no control-plane changes** to your ECS service. If you want to test whether your team/automation correctly detects the impairment and evacuates the AZ (removing the subnet, forcing a redeploy into healthy AZs), see the companion template: [`ecs-fargate-az-evacuation`](../ecs-fargate-az-evacuation/README.md).
 

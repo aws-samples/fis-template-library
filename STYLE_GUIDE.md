@@ -46,7 +46,7 @@ This is an experiment template for use with AWS Fault Injection Service (FIS) an
 THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
 HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 #### 4. Hypothesis
@@ -73,16 +73,12 @@ Before running this experiment, ensure that:
 #### 6. How it works (optional but recommended)
 Explain the technical details of what the experiment does.
 
-#### 7. Stop Conditions
+#### 7. Stop Conditions (required - second paragraph is exact text)
+Use one section for both stop conditions and observability. Adapt the first paragraph to how your experiment ends, and keep the second paragraph (the CloudWatch alarm text) exactly as written. Do not add a separate `## Observability and stop conditions` section.
 ```markdown
 ## Stop Conditions
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until [completion condition].
-```
-
-#### 8. Observability and stop conditions (required - exact text)
-```markdown
-## Observability and stop conditions
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 business metric requiring an immediate end of the fault injection. This 
@@ -90,7 +86,7 @@ template makes no assumptions about your application and the relevant metrics
 and does not include stop conditions by default.
 ```
 
-#### 9. Next Steps (required)
+#### 8. Next Steps (required)
 ```markdown
 ## Next Steps
 As you adapt this scenario to your needs, we recommend:
@@ -101,7 +97,7 @@ As you adapt this scenario to your needs, we recommend:
 5. [Any experiment-specific recommendations]
 ```
 
-#### 10. Import Experiment (required - exact text)
+#### 9. Import Experiment (required - exact text)
 ```markdown
 ## Import Experiment
 You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
