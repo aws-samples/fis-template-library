@@ -1,5 +1,5 @@
 schemaVersion: '0.3'
-description: Remove a subnet from ECS Fargate service configuration to simulate AZ impairment, wait for specified duration, then restore the subnet. Handles cleanup on cancel or failure.
+description: Evacuate an Availability Zone by removing its subnet from an ECS Fargate service configuration, forcing all tasks into the remaining healthy AZs. Waits for the specified evacuation duration, then restores the subnet. Handles cleanup on cancel or failure.
 assumeRole: '{{ AutomationAssumeRole }}'
 parameters:
   AutomationAssumeRole:

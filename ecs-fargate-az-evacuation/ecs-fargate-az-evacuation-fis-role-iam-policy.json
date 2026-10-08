@@ -38,9 +38,40 @@
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances",
-        "ec2:DescribeSubnets"
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeNetworkAcls",
+        "ec2:DescribeManagedPrefixLists",
+        "ec2:GetManagedPrefixListEntries"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AllowNetworkDisruptConnectivity",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAcl",
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*",
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
+      ]
+    },
+    {
+      "Sid": "AllowNetworkDisruptConnectivityOnManagedAcl",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAclEntry",
+        "ec2:DeleteNetworkAcl",
+        "ec2:ReplaceNetworkAclAssociation"
+      ],
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/managedByFIS": "true"
+        }
+      }
     },
     {
       "Sid": "AllowSSMSendCommand",
@@ -76,8 +107,8 @@
         "ssm:StopAutomationExecution"
       ],
       "Resource": [
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-impairment-subnet-automation",
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ecs-fargate-az-impairment-subnet-automation:*",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ecs-fargate-az-evacuation-subnet-automation",
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/ecs-fargate-az-evacuation-subnet-automation:*",
         "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
       ]
     },

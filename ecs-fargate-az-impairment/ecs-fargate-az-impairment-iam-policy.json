@@ -1,0 +1,102 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowFISExperimentLogging",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogDelivery",
+        "logs:PutResourcePolicy",
+        "logs:DescribeResourcePolicies",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowECSTaskActions",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeTasks",
+        "ecs:StopTask"
+      ],
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/*/*"
+    },
+    {
+      "Sid": "AllowECSDescribeContainerInstances",
+      "Effect": "Allow",
+      "Action": "ecs:DescribeContainerInstances",
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:container-instance/*/*"
+    },
+    {
+      "Sid": "AllowECSListTasks",
+      "Effect": "Allow",
+      "Action": "ecs:ListTasks",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowEC2Describe",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeNetworkAcls",
+        "ec2:DescribeManagedPrefixLists",
+        "ec2:GetManagedPrefixListEntries"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSSMSendCommand",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:managed-instance/*",
+        "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-ECS",
+        "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-Sources"
+      ]
+    },
+    {
+      "Sid": "AllowSSMCommandStatus",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:ListCommands",
+        "ssm:CancelCommand"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowTargetResolutionByTags",
+      "Effect": "Allow",
+      "Action": "tag:GetResources",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowNetworkDisruptConnectivity",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAcl",
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*",
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
+      ]
+    },
+    {
+      "Sid": "AllowNetworkDisruptConnectivityOnManagedAcl",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkAclEntry",
+        "ec2:DeleteNetworkAcl",
+        "ec2:ReplaceNetworkAclAssociation"
+      ],
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/managedByFIS": "true"
+        }
+      }
+    }
+  ]
+}
