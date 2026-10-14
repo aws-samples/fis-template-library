@@ -53,22 +53,27 @@ Note that the NACL network disruption (`disrupt-az-network`) is unaffected by th
 
 Before running this experiment, ensure that:
 
-1. **IAM Roles**: Create the FIS execution role and SSM automation role with the policies from the included IAM policy files.
+1. **IAM Roles**: Create three roles:
+   - **FIS execution role** — uses `eks-automode-az-impairment-iam-policy.json`. Starts the SSM automation and drives the NACL network-disruption action. It never calls the Kubernetes API.
+   - **SSM automation role** — uses `eks-automode-az-impairment-ssm-automation-iam-policy.json`. Orchestrates the automation: launches/terminates the ephemeral client instance, manages its security group, and sends the `runCommand`s.
+   - **EC2 instance profile role** — attach the AWS managed policy `AmazonSSMManagedInstanceCore` (so the SSM Agent registers) **plus** the inline policy `eks-automode-az-impairment-instance-profile-iam-policy.json` (grants `eks:DescribeCluster`, `eks:AccessKubernetesApi`, `ec2:DescribeSubnets`, and `sts:GetCallerIdentity`). This is the role the Kubernetes work actually runs under — see the note below.
 
-2. **EKS Cluster Access**: The SSM automation role must have Kubernetes API access. Create an EKS Access Entry:
+   > **Which identity calls the Kubernetes API?** The cordon/patch/delete/restore logic runs **on the ephemeral EC2 instance**, so it uses the **instance profile role's** credentials, and the EKS bearer token is minted for that role. The SSM automation role only orchestrates; it does not call the Kubernetes API. Therefore the EKS Access Entry and RBAC below must map the **instance profile role**, not the SSM automation role.
+
+2. **EKS Cluster Access**: Grant the **instance profile role** Kubernetes API access by creating an EKS Access Entry mapped to the username the RBAC binds (`fis-az-impairment-client`):
    ```bash
    aws eks create-access-entry \
-     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME> \
-     --username fis-ssm-automation \
+     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR INSTANCE PROFILE ROLE NAME> \
+     --username fis-az-impairment-client \
      --cluster-name <YOUR EKS CLUSTER>
    ```
-   Only the SSM automation role needs Kubernetes access. The FIS execution role never calls the Kubernetes API — it only starts the SSM automation and drives the NACL action — so it does not need an access entry.
+   The FIS execution role and the SSM automation role do **not** need an access entry — neither calls the Kubernetes API.
 
 3. **Kubernetes RBAC**: Apply the RBAC configuration to your cluster:
    ```bash
    kubectl apply -f eks-automode-az-impairment-rbac.yaml
    ```
-   This grants the SSM automation permission to cordon/uncordon nodes, delete pods, and patch the NodePool.
+   This grants the client (the `fis-az-impairment-client` user mapped to the instance profile role) permission to cordon/uncordon nodes, delete pods, and patch the NodePool. The username in the RBAC `ClusterRoleBinding` must match the `--username` in the access entry above.
 
 4. **SSM Automation Document**: Deploy the SSM automation document:
    ```bash
@@ -100,15 +105,15 @@ Before running this experiment, ensure that:
 9. **In-VPC client connectivity to the EKS API**: The SSM Automation launches a short-lived EC2 instance **inside your VPC** (via `aws:runInstances` into `SubnetId`) and runs all Kubernetes operations on that instance via `aws:runCommand`. Because the traffic originates from inside the VPC, the experiment works against a **private** EKS endpoint without opening public access. For this to work:
    - **`SubnetId`** must be a subnet that (a) can reach the cluster's Kubernetes API endpoint — i.e. the cluster has **private endpoint access enabled** and this subnet is allowed to reach it — and (b) can reach the AWS Systems Manager endpoints so the SSM Agent can register and receive the command. Provide SSM reachability either via a **NAT gateway** or via the `com.amazonaws.<region>.ssm`, `.ssmmessages`, and `.ec2messages` **interface VPC endpoints**.
    - **Do not use a subnet in the target AZ.** The network-disruption action denies traffic in the impaired AZ's subnets; launching the client there would sever it from the API too. Use a subnet in a surviving AZ.
-   - **`InstanceProfileName`** must be an existing EC2 instance profile whose role has the `AmazonSSMManagedInstanceCore` managed policy, so the instance registers with SSM.
-   - The SSM automation role's EKS Access Entry (step 2) and RBAC (step 3) still apply — they authorize the Kubernetes calls the instance makes. A connection **timeout** at the `CordonPatchDelete`/`RestoreNodePool` step means the subnet cannot reach the API endpoint (fix reachability); a `403` means the network path works but the access entry/RBAC is missing. **Validate this path before a full run** — see [Validating SSM-to-EKS connectivity](#validating-ssm-to-eks-connectivity) below.
+   - **`InstanceProfileName`** must be an existing EC2 instance profile whose role has `AmazonSSMManagedInstanceCore` (so the instance registers with SSM) **plus** the inline permissions listed in prerequisite 1 (`eks:DescribeCluster`, `eks:AccessKubernetesApi`, `ec2:DescribeSubnets`, `sts:GetCallerIdentity`) and the EKS Access Entry/RBAC from prerequisites 2–3, since the Kubernetes calls run under this role.
+   - The **instance profile role's** EKS Access Entry (step 2) and RBAC (step 3) authorize the Kubernetes calls the instance makes. A connection **timeout** at the `CordonPatchDelete`/`RestoreNodePool` step means the subnet cannot reach the API endpoint (fix reachability); a `403` means the network path works but the instance profile role's access entry/RBAC is missing or misnamed. **Validate this path before a full run** — see [Validating SSM-to-EKS connectivity](#validating-ssm-to-eks-connectivity) below.
 
 ## Validating SSM-to-EKS connectivity
 
 The automation's Kubernetes calls run from an **ephemeral EC2 instance launched inside your VPC** (`CordonPatchDelete` and `RestoreNodePool` use `aws:runCommand` on that instance), so the traffic to the cluster's Kubernetes API endpoint originates from `SubnetId` and is subject to your security groups and the EKS **private** endpoint — not to public endpoint access. Distinguish the two failure modes:
 
 - A **connection timeout** at `CordonPatchDelete` or `RestoreNodePool` means packets from the client subnet never reached the API server — a *network reachability* problem (the cluster lacks private endpoint access, or the subnet/security group/route cannot reach it).
-- A `403` means the network path works but the SSM automation role lacks Kubernetes RBAC — fix the EKS Access Entry / `eks-automode-az-impairment-rbac.yaml` in that case.
+- A `403` means the network path works but the **instance profile role** lacks Kubernetes access — fix its EKS Access Entry / the subject in `eks-automode-az-impairment-rbac.yaml` in that case.
 
 Two other reachability notes:
 
@@ -323,7 +328,7 @@ The template defines only this one FIS target. It is resolved by the `FIS-Ready=
 ### Target Requirements
 - The subnet must carry the `FIS-Ready=True` tag and be in the AZ named by both the target's `availabilityZoneIdentifier` parameter and the automation's `TargetAZ` parameter, so the network disruption and the Kubernetes-level impairment affect the same AZ
 - Nodes must carry the standard `topology.kubernetes.io/zone` label (EKS applies this automatically) — the automation uses it to find nodes and pods in the target AZ
-- The SSM automation role must have Kubernetes API access via an EKS Access Entry plus the RBAC in `eks-automode-az-impairment-rbac.yaml`
+- The EC2 instance profile role must have Kubernetes API access via an EKS Access Entry (username `fis-az-impairment-client`) plus the RBAC in `eks-automode-az-impairment-rbac.yaml`
 
 ## Parameters to Configure
 
@@ -457,7 +462,7 @@ As you adapt this scenario to your needs, we recommend:
 2. Identifying business metrics tied to your EKS workload health.
 3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the AZ impairment.
 4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. Reviewing the RBAC ClusterRole and confirming the `fis-ssm-automation` username matches the one in your EKS Access Entry.
+5. Reviewing the RBAC ClusterRole and confirming the `fis-az-impairment-client` username matches the one in the instance profile role's EKS Access Entry.
 6. Narrowing the blast radius if needed — by default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter to the pod-deletion logic in the `CordonPatchDelete` step to scope it.
 7. **Testing in a non-production environment first** to validate automation behavior and timing.
 8. Documenting expected vs actual behavior to build an AZ failure runbook.
@@ -476,7 +481,8 @@ You can import the json experiment template into your AWS account via cli or aws
 | `eks-automode-az-impairment-template.json` | FIS experiment template definition |
 | `eks-automode-az-impairment-automation.yaml` | SSM Automation document — launches an ephemeral in-VPC EC2 client, then cordons, patches the NodePool, deletes pods, waits, restores, and cleans up |
 | `eks-automode-az-impairment-iam-policy.json` | IAM policy for the FIS execution role |
-| `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role |
+| `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role (orchestration: launch/terminate instance, security group, runCommand) |
+| `eks-automode-az-impairment-instance-profile-iam-policy.json` | Inline IAM policy for the EC2 instance profile role (EKS describe + Kubernetes API access + subnet describe); attach alongside `AmazonSSMManagedInstanceCore` |
 | `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the SSM automation role |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ssm-iam-trust-relationship.json` | Trust policy for SSM service |

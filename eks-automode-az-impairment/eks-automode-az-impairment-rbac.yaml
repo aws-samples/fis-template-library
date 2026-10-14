@@ -7,9 +7,12 @@
 #   - list pods on those nodes, and delete them                    (pods: list, delete)
 #   - read and patch the NodePool's zone requirements              (nodepools: get, patch)
 #
-# The subject is the username given to the SSM automation role in its EKS Access
-# Entry (see the Prerequisites section of the README). Change `fis-ssm-automation`
-# here if you used a different --username.
+# The subject is the username given to the EC2 instance profile role in its EKS
+# Access Entry (see the Prerequisites section of the README). The impairment
+# logic runs on the ephemeral in-VPC instance, so the Kubernetes token is minted
+# for the instance profile role — bind RBAC to that identity, not the SSM
+# automation role. Change `fis-az-impairment-client` here if you used a different
+# --username.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -39,7 +42,7 @@ metadata:
 subjects:
 - apiGroup: rbac.authorization.k8s.io
   kind: User
-  name: fis-ssm-automation
+  name: fis-az-impairment-client
 roleRef:
   kind: ClusterRole
   name: fis-az-impairment-cluster-role
