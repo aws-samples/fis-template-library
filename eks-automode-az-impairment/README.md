@@ -95,7 +95,35 @@ Before running this experiment, ensure that:
      --resources <YOUR SUBNET ID IN TARGET AZ> \
      --tags Key=FIS-Ready,Value=True
    ```
-   The IAM policy's `ec2:ReplaceNetworkAclAssociation` permission is conditioned on this tag, so the network-disruption action can only associate the deny-NACL with a subnet you have explicitly marked `FIS-Ready=True`.
+   The template scopes the network-disruption target to subnets tagged `FIS-Ready=True` in `<YOUR TARGET AZ>`, so the deny-NACL is only ever associated with a subnet you have explicitly marked.
+
+9. **SSM-to-EKS API connectivity**: The SSM Automation's `aws:executeScript` steps run on **AWS-managed compute that is not inside your VPC**, so they reach your cluster only over its **Kubernetes API endpoint** as routed from outside the VPC. If your cluster's public endpoint is disabled, or is enabled but restricted by a `publicAccessCidrs` allowlist that does not include the path SSM takes, the `CordonNodesInAZ` step (the first step that calls the Kubernetes API) will fail with a **connection timeout** — and so will the restore/cleanup step. The `ValidateAndGetCluster` step still succeeds in that case because it only calls the AWS `eks:DescribeCluster` control-plane API, which is always reachable. **Validate this path before a full run** — see [Validating SSM-to-EKS connectivity](#validating-ssm-to-eks-connectivity) below.
+
+## Validating SSM-to-EKS connectivity
+
+The automation's Kubernetes calls (`CordonNodesInAZ`, `PatchNodePoolExcludeAZ`, `DeletePodsInAZ`, `RestoreNodePool`) run from **SSM-managed compute outside your VPC** and talk to the cluster's Kubernetes API endpoint. A failure here presents as a **connection timeout**, not an HTTP `401`/`403`:
+
+- A **timeout** means packets never reached the API server — a *network reachability* problem (endpoint access mode or `publicAccessCidrs`), not RBAC or the token.
+- A `403` would instead mean the network path works but the SSM role lacks Kubernetes RBAC — fix the access entry / RBAC in that case.
+
+The running NACL network disruption is **not** the cause of a timeout here: the deny-NACL only affects the target AZ's subnets, and the SSM compute is not in those subnets.
+
+**Check the cluster's endpoint access mode:**
+```bash
+aws eks describe-cluster --name <YOUR EKS CLUSTER> \
+  --query 'cluster.resourcesVpcConfig.{public:endpointPublicAccess,private:endpointPrivateAccess,cidrs:publicAccessCidrs}'
+```
+
+**Independent pre-check (no disruption).** Run a one-off SSM Automation containing only a single `aws:executeScript` step that mirrors what `CordonNodesInAZ` does — `describe_cluster`, build the token, then `GET {endpoint}/api/v1/nodes` — and print the HTTP status. A `200` (or `403`) confirms the network path is open; a **timeout** confirms the endpoint/CIDR block is still in the way. From a host inside the VPC you can equivalently run:
+```bash
+curl -sk --max-time 5 https://<CLUSTER ENDPOINT HOST>/livez && echo " reachable"
+```
+A fast `ok` confirms reachability; a hang confirms the block.
+
+**Getting SSM-to-EKS working without opening public access.** The recommended pattern is to keep the Kubernetes API private and originate the calls from inside the VPC:
+
+- Enable **private endpoint access** on the cluster, then run the cordon/patch/restore logic from an **in-VPC SSM target** — e.g. `aws:runCommand`/`aws:runShellScript` on a small SSM-managed EC2 instance (or an existing bastion) in a subnet and security group the private endpoint permits — rather than from `aws:executeScript`, which cannot be placed inside your VPC.
+- If you must keep using the public endpoint, add the appropriate CIDR to `publicAccessCidrs` for the experiment window; because the SSM-managed compute has no stable published IP range, prefer the in-VPC approach above over broadly widening public access.
 
 ## Cluster configuration determines the outcome
 
