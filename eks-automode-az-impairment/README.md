@@ -483,6 +483,6 @@ You can import the json experiment template into your AWS account via cli or aws
 | `eks-automode-az-impairment-iam-policy.json` | IAM policy for the FIS execution role |
 | `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role (orchestration: launch/terminate instance, security group, runCommand) |
 | `eks-automode-az-impairment-instance-profile-iam-policy.json` | Inline IAM policy for the EC2 instance profile role (EKS describe + Kubernetes API access + subnet describe); attach alongside `AmazonSSMManagedInstanceCore` |
-| `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the SSM automation role |
+| `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the EC2 instance profile role (bound via the `fis-az-impairment-client` username) |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ssm-iam-trust-relationship.json` | Trust policy for SSM service |
