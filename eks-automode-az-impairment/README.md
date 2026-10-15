@@ -376,8 +376,6 @@ To calibrate:
 
 The experiment does not include stop conditions by default. It will continue until all actions complete (approximately 30-45 minutes total).
 
-## Observability and stop conditions
-
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 business metric requiring an immediate end of the fault injection. This 
 template makes no assumptions about your application and the relevant metrics 

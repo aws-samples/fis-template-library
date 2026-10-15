@@ -1,4 +1,4 @@
-# Kubernetes RBAC for the SSM automation used by this experiment.
+# Kubernetes RBAC for the EC2 instance profile role used by this experiment.
 # Apply this to your cluster: kubectl apply -f eks-automode-az-impairment-rbac.yaml
 #
 # The permissions below are exactly what eks-automode-az-impairment-automation.yaml
