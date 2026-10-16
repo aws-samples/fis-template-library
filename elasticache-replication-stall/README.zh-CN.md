@@ -118,7 +118,7 @@
 - 发一次 `CLIENT PAUSE 1 <mode>` 作为可用性探针。1 毫秒不会产生可测量的影响，但能在真正注入之前证明该命令在这个集群上是放行的。
 - 如果实例上还残留着上一次运行的状态文件，直接拒绝启动。
 
-**InjectReplicationStall（注入）**——先记录主节点侧的视图，然后对每个已解析出的副本执行 `CLIENT PAUSE <PauseMilliseconds> <PauseMode>`，随后在 `DurationSeconds` 期间持续采样主节点的 `INFO replication`，把 `master_repl_offset` 与每个副本已确认的 `offset`、`lag`、`state` 一并记入日志。
+**InjectReplicationStall（注入）**——先记录主节点侧的视图，然后对每个已解析出的副本执行 `CLIENT PAUSE <PauseMilliseconds> <PauseMode>`（`DutyCyclePercent` 大于 0 时改为周期性的短暂停，见[占空比模式](#占空比模式)），随后在 `DurationSeconds` 期间持续采样主节点的 `INFO replication`，把 `master_repl_offset` 与每个副本已确认的 `offset`、`lag`、`state` 一并记入日志。
 
 观测取自**主节点**而不是副本，因为 `PauseMode=ALL` 会把被暂停副本上的 `INFO` 也一起挂住。
 
@@ -149,6 +149,28 @@ slave0(offset=0, lag=0s, state=wait_bgsave)   <- 链路断开，进入全量重�
 副本已确认的 offset 全程冻结而主节点持续推进，暂停期间链路始终为 `online`；随后积压超过该节点能承载的量——`sync_full` 计数递增，副本最多落后 1.45 GB，之后才追平。**暂停时长要对着节点规格和写入速率来定，不能只看时钟。**
 
 另外，`RestoreAndVerify` 步骤在设计上就是「尽力而为」。同一次运行中 `CLIENT UNPAUSE` 因副本过载而超时，文档记录了告警并继续执行。恢复并不依赖这次调用——暂停会自行到期。
+
+### 占空比模式
+
+`CLIENT PAUSE` 是二值的：复制流要么被挂住，要么没有。把 `DutyCyclePercent` 设为 1-99，可以模拟部分降级。文档会在每个 `CyclePeriodMilliseconds` 开始时下发 `CLIENT PAUSE <周期 × 百分比 / 100> <PauseMode>`，暂停自行到期后进入下一个周期，持续 `DurationSeconds`。副本反复落后、反复追上，这比「一次长时间冻结后一次性追平」更接近被丢包或限流拖慢的复制链路。此模式下 `PauseMilliseconds` 不生效。
+
+两个参数分别控制什么（`cache.t4g.micro`，写入约 12 MiB/s 实测）：
+
+| 参数 | 控制 | 实测 |
+|---|---|---|
+| `CyclePeriodMilliseconds` × `DutyCyclePercent` / 100，即暂停片长 | 每个周期的积压峰值，约等于写入速率 × 暂停片长 | 4000 ms 的 50%：每个周期峰值 32-37 MiB，回落到 0-3 MiB；基线峰值 10-11 MiB |
+| `DutyCyclePercent` | 复制流被挂住的时间占比 | 请求 50% / 75%，实际 50.0% / 75.0% |
+
+**平均吞吐不是旋钮。** 同一组测量中，占空比一直到 90%，副本平均都能跟上，因为它在间隙里应用积压的速度远快于写入到达的速度。要让副本平均跟不上，需要写入接近副本的应用速度，或者占空比接近 100%，也就是单次暂停模式。
+
+此模式下的安全措施：
+
+- 每次下发暂停前，都会在数据面重新读取副本的角色。如果节点不再报告 `role:slave`（例如发生故障转移后被提升为主），它会被移出注入，而不是被当作主节点暂停。
+- 如果循环落后于计划（副本响应慢，或观测耗时超过间隙），错过的周期直接跳过，绝不连续补发。结束时会报告实际占空比与跳过的周期数。
+- 观测采样放在暂停片即将到期的时刻，也就是积压峰值处。若在暂停片开始时采样，只会看到锯齿的波谷。
+- FIS 动作的 `duration` 要覆盖 `DurationSeconds` 加上校验与恢复两步的时间。模板默认的 `PT3M` 是按单次暂停的默认值配的。
+
+**CloudWatch 看不到短暂停片。** 以 4000 ms 的 50% 运行 60 秒期间，被暂停副本的 CloudWatch `ReplicationLag` 最大值一直是 0.001-0.009 秒，而 offset 差每个周期都涨到 37 MiB。几秒级的停滞，`ReplicationLag` 和 `INFO replication` 的 `lag` 字段都分辨不出来。请使用主节点上的 `master_repl_offset` 减去副本 `offset`（文档会记录这个值），或应用自身的数据新鲜度信号。
 
 ## 验证记录（Validation）
 
@@ -182,6 +204,8 @@ master_repl_offset=109218366559  slave0(offset=109021347493, lag=28s, state=onli
 
 **开启 `min-replicas-to-write=1` 时的拒写**（集群模式关闭，4 个写入线程 × 4 KiB × pipeline 50，定长键空间 80 MiB，`PauseMode=ALL`，暂停 30 秒）：注入后 15.3 秒出现首个 `-NOREPLICAS`，之后全部写入被拒，直到第 183 秒。副本 `SwapUsage` 从 176 MiB 涨到 323 MiB，而引擎 CPU 只有 0-5%；链路约在第 73 秒断开，全量重同步完成后才恢复。
 
+**占空比模式。** 集群模式关闭，`DutyCyclePercent=50`、`CyclePeriodMilliseconds=4000`、40 秒，定长键空间写入约 12 MiB/s：下发 10 次暂停、0 次失败，实际占空比 50.0%；副本 offset 差峰值 37 MiB（基线 10 MiB），链路始终 `online`，写入 0 失败。集群模式开启，对有两个副本的分片设 `TargetShardId=0002`、`DutyCyclePercent=75`，向该分片写入约 8 MiB/s：被定向的副本峰值 31 MiB，同分片另一个副本保持在 7.5 MiB 的基线。同一集群上的单次暂停（`DutyCyclePercent=0`）行为与之前一致。
+
 另外还验证了：幂等闸门会拒绝第二次 `validate`；不存在的 `TargetShardId` 会在注入任何
 东西之前被拒绝；**没有写流量**的运行正确地显示无复制差距——这正是「必须有写流量」被
 列为硬性前提的原因。
@@ -198,7 +222,7 @@ master_repl_offset=109218366559  slave0(offset=109021347493, lag=28s, state=onli
 
 1. 复核你使用的标签名是否契合自身场景。本模板刻意要求注入机同时具备 `FIS-Ready=True` 与 `FIS-Role=ElastiCacheInjector` 两个标签，以免命令被发给无关实例。
 2. 识别与缓存读取相关的业务指标——例如缓存命中率、读延迟，以及任何能暴露陈旧读的正确性信号。
-3. 创建 CloudWatch 指标与告警来监控复制停滞的影响。首选信号是 `ReplicationLag`。**不要**把告警建在 `INFO replication` 的 `lag` 字段或 `connected_slaves` 上：复制流停滞期间这两者都不动。
+3. 创建 CloudWatch 指标与告警来监控复制停滞的影响。持续几十秒以上的停滞，首选信号是 `ReplicationLag`；它分辨不出占空比模式下几秒级的暂停片，该模式请改用 offset 差告警。**不要**把告警建在 `INFO replication` 的 `lag` 字段或 `connected_slaves` 上：复制流停滞期间这两者都不动。
 4. 把告警接成停止条件，以便在越过关键阈值时自动中止实验。
 5. 先在非生产环境运行，并在那里先确认 `CLIENT PAUSE` 在你的集群与引擎版本上确实放行，之后再考虑安排到其他环境。
 6. 如果你的集群使用 auth token 或 RBAC，扩展本文档以从 AWS Secrets Manager 读取令牌。

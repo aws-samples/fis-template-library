@@ -37,9 +37,31 @@ parameters:
     type: String
     default: "60"
     description: >-
-      How long this document keeps observing after injection. Set it at or above
-      PauseMilliseconds / 1000 so that recovery is captured in the output.
-    allowedPattern: "^([1-9][0-9]{0,3})$"
+      Single-pause mode (DutyCyclePercent=0): how long this document keeps observing
+      after injection; set it at or above PauseMilliseconds / 1000 so that recovery is
+      captured. Duty-cycle mode: how long the repeating pauses are issued. 1-3600,
+      bounded by the InjectReplicationStall step timeout.
+    allowedPattern: "^([1-9][0-9]{0,2}|[1-2][0-9]{3}|3[0-5][0-9]{2}|3600)$"
+  DutyCyclePercent:
+    type: String
+    default: "0"
+    description: >-
+      0 (default) issues one CLIENT PAUSE of PauseMilliseconds. 1-99 switches to
+      duty-cycle mode, which issues a pause of CyclePeriodMilliseconds x
+      DutyCyclePercent / 100 at the start of every period for DurationSeconds, so the
+      replica repeatedly falls behind and catches up. PauseMilliseconds is ignored in
+      this mode. The replica's role is re-checked before every pause and a node that
+      no longer reports role:slave is dropped from the injection.
+    allowedPattern: "^([0-9]|[1-9][0-9])$"
+  CyclePeriodMilliseconds:
+    type: String
+    default: "1000"
+    description: >-
+      Duty-cycle mode only. Length of one pause-plus-gap cycle, 100-60000. The peak
+      backlog per cycle is roughly the write rate multiplied by the pause slice
+      (CyclePeriodMilliseconds x DutyCyclePercent / 100), so the period sets the
+      amplitude of the lag sawtooth.
+    allowedPattern: "^([1-9][0-9]{2,3}|[1-5][0-9]{4}|60000)$"
   Region:
     type: String
     default: "{{global:REGION}}"
@@ -461,12 +483,34 @@ mainSteps:
               return out
 
 
+          def duty_pause_ms(args):
+              return args.cycle_period_ms * args.duty_cycle_percent // 100
+
+
           def action_validate(args):
               if os.path.exists(STATE):
                   raise SystemExit(
                       "ERROR: %s already exists, so another run of this experiment is still in "
                       "flight on this instance. Remove the file only after confirming that no "
                       "pause is active." % STATE)
+
+              if not 0 <= args.duty_cycle_percent <= 99:
+                  raise SystemExit("ERROR: DutyCyclePercent must be 0-99, got %s"
+                                   % args.duty_cycle_percent)
+              if args.duty_cycle_percent:
+                  if not 100 <= args.cycle_period_ms <= 60000:
+                      raise SystemExit("ERROR: CyclePeriodMilliseconds must be 100-60000, got %s"
+                                       % args.cycle_period_ms)
+                  if duty_pause_ms(args) < 1:
+                      raise SystemExit("ERROR: CyclePeriodMilliseconds x DutyCyclePercent / 100 "
+                                       "rounds down to 0 ms; nothing would be paused.")
+                  log("Duty-cycle mode: CLIENT PAUSE %d %s every %d ms (%d%%) for %d s. "
+                      "PauseMilliseconds is ignored in this mode."
+                      % (duty_pause_ms(args), args.pause_mode, args.cycle_period_ms,
+                         args.duty_cycle_percent, args.duration_seconds))
+              else:
+                  log("Single-pause mode: CLIENT PAUSE %d %s, observed for %d s."
+                      % (args.pause_milliseconds, args.pause_mode, args.duration_seconds))
 
               replicas, primaries, cluster_enabled = resolve(args)
               log("Topology: cluster_mode_enabled=%s, %d replica target(s), %d primary node(s)."
@@ -496,6 +540,96 @@ mainSteps:
               log("Prerequisites validated. State written to %s" % STATE)
 
 
+          def log_primary_view(primaries, use_tls):
+              for label, data in sorted(primary_view(primaries, use_tls).items()):
+                  if "error" in data:
+                      log("  primary %s unreachable: %s" % (label, data["error"]))
+                      continue
+                  detail = ", ".join(
+                      "%s(offset=%s,lag=%ss,state=%s)"
+                      % (k, v.get("offset"), v.get("lag"), v.get("state"))
+                      for k, v in sorted((data.get("replicas") or {}).items()))
+                  log("  primary %s master_repl_offset=%s  %s"
+                      % (label, data.get("master_repl_offset"), detail))
+
+
+          def inject_duty_cycle(args, replicas, primaries):
+              """Issue a short pause at the start of every period until DurationSeconds.
+
+              CLIENT PAUSE expires on its own, so the gap in each cycle is simply the time
+              in which no new pause is issued. Before every pause the replica's role is
+              re-read over the data plane: if a failover has promoted it, it is dropped
+              from the injection rather than paused as a primary.
+              """
+              period = args.cycle_period_ms / 1000.0
+              pause_ms = duty_pause_ms(args)
+              obs_interval = min(10, max(1, args.duration_seconds // 6))
+              active = list(replicas)
+              issued = dict((n["id"], 0) for n in replicas)
+              failed = dict((n["id"], 0) for n in replicas)
+              skipped = 0
+              start = time.time()
+              deadline = start + args.duration_seconds
+              next_obs = start + obs_interval
+              cycle = 0
+              log("INJECTING duty cycle: CLIENT PAUSE %d %s every %d ms on %d replica(s)."
+                  % (pause_ms, args.pause_mode, args.cycle_period_ms, len(active)))
+              while active and time.time() < deadline:
+                  cycle_start = start + cycle * period
+                  for node in list(active):
+                      try:
+                          role = info_replication(node["host"], node["port"], args.use_tls,
+                                                  timeout=2.0).get("role")
+                          if role != "slave":
+                              log("STOPPED on %s: it now reports role=%r. It is no longer "
+                                  "paused." % (node["id"], role))
+                              active.remove(node)
+                              continue
+                          send(node["host"], node["port"], args.use_tls,
+                               "CLIENT", "PAUSE", pause_ms, args.pause_mode, timeout=2.0)
+                          issued[node["id"]] += 1
+                      except Exception as exc:
+                          failed[node["id"]] += 1
+                          if failed[node["id"]] in (1, 10, 100) or failed[node["id"]] % 1000 == 0:
+                              log("WARNING: cycle %d on %s failed (%s: %s); %d failure(s) so far."
+                                  % (cycle, node["id"], type(exc).__name__, exc,
+                                     failed[node["id"]]))
+                  if time.time() >= next_obs:
+                      # Sample just before this cycle's pause expires, where the backlog
+                      # peaks. Sampling right after issuing the pause would only ever see
+                      # the trough of the sawtooth and under-report the fault.
+                      peak_at = cycle_start + pause_ms * 0.95 / 1000.0
+                      time.sleep(max(0.0, min(peak_at, deadline) - time.time()))
+                      log("  sample near the end of a %d ms pause slice (backlog peak):"
+                          % pause_ms)
+                      log_primary_view(primaries, args.use_tls)
+                      while next_obs <= time.time():
+                          next_obs += obs_interval
+                  cycle += 1
+                  due = start + cycle * period
+                  now = time.time()
+                  if now > due:
+                      # Fell behind (slow replica or observation): skip, never burst.
+                      late = int((now - due) // period) + 1
+                      skipped += late
+                      cycle += late
+                      due = start + cycle * period
+                  time.sleep(max(0.0, min(due, deadline) - time.time()))
+
+              elapsed = max(time.time() - start, 0.001)
+              for node in replicas:
+                  effective = 100.0 * issued[node["id"]] * pause_ms / (elapsed * 1000.0)
+                  log("Duty cycle summary %s: %d pause(s) issued, %d failed, effective duty "
+                      "%.1f%% (requested %d%%)."
+                      % (node["id"], issued[node["id"]], failed[node["id"]], effective,
+                         args.duty_cycle_percent))
+              if skipped:
+                  log("Note: %d cycle(s) were skipped because the loop fell behind schedule."
+                      % skipped)
+              if not any(issued.values()):
+                  raise SystemExit("ERROR: no pause was issued in duty-cycle mode.")
+
+
           def action_inject(args):
               with open(STATE) as fh:
                   state = json.load(fh)
@@ -503,6 +637,12 @@ mainSteps:
 
               log("Primary-side view BEFORE injection:")
               log(json.dumps(primary_view(primaries, args.use_tls), indent=2))
+
+              if args.duty_cycle_percent:
+                  inject_duty_cycle(args, replicas, primaries)
+                  log("Duty cycle finished. The last pause expires on its own within %d ms."
+                      % duty_pause_ms(args))
+                  return
 
               for node in replicas:
                   reply = send(node["host"], node["port"], args.use_tls,
@@ -515,16 +655,7 @@ mainSteps:
               deadline = time.time() + args.duration_seconds
               while time.time() < deadline:
                   time.sleep(interval)
-                  for label, data in sorted(primary_view(primaries, args.use_tls).items()):
-                      if "error" in data:
-                          log("  primary %s unreachable: %s" % (label, data["error"]))
-                          continue
-                      detail = ", ".join(
-                          "%s(offset=%s,lag=%ss,state=%s)"
-                          % (k, v.get("offset"), v.get("lag"), v.get("state"))
-                          for k, v in sorted((data.get("replicas") or {}).items()))
-                      log("  primary %s master_repl_offset=%s  %s"
-                          % (label, data.get("master_repl_offset"), detail))
+                  log_primary_view(primaries, args.use_tls)
 
               log("Observation window finished. The pause expires on its own after %s ms."
                   % args.pause_milliseconds)
@@ -576,14 +707,17 @@ mainSteps:
                                   choices=["ONE_PER_SHARD", "ALL"])
               parser.add_argument("--target-shard-id", default="")
               parser.add_argument("--use-tls", default="false")
+              parser.add_argument("--duty-cycle-percent", type=int, default=0)
+              parser.add_argument("--cycle-period-ms", type=int, default=1000)
               args = parser.parse_args()
               args.use_tls = str(args.use_tls).lower() == "true"
               args.target_shard_id = (args.target_shard_id or "").strip()
               log("action=%s replication_group=%s region=%s mode=%s pause_ms=%s duration=%s "
-                  "scope=%s shard=%s tls=%s"
+                  "scope=%s shard=%s tls=%s duty=%s%% period_ms=%s"
                   % (args.action, args.replication_group_id, args.region, args.pause_mode,
                      args.pause_milliseconds, args.duration_seconds, args.replica_scope,
-                     args.target_shard_id or "<all>", args.use_tls))
+                     args.target_shard_id or "<all>", args.use_tls,
+                     args.duty_cycle_percent, args.cycle_period_ms))
               {"validate": action_validate,
                "inject": action_inject,
                "restore": action_restore}[args.action](args)
@@ -602,7 +736,9 @@ mainSteps:
             --duration-seconds '{{DurationSeconds}}' \
             --replica-scope '{{ReplicaScope}}' \
             --target-shard-id '{{TargetShardId}}' \
-            --use-tls '{{UseTls}}'
+            --use-tls '{{UseTls}}' \
+            --duty-cycle-percent '{{DutyCyclePercent}}' \
+            --cycle-period-ms '{{CyclePeriodMilliseconds}}'
 
   - action: aws:runShellScript
     name: InjectReplicationStall
@@ -624,7 +760,9 @@ mainSteps:
             --duration-seconds '{{DurationSeconds}}' \
             --replica-scope '{{ReplicaScope}}' \
             --target-shard-id '{{TargetShardId}}' \
-            --use-tls '{{UseTls}}'
+            --use-tls '{{UseTls}}' \
+            --duty-cycle-percent '{{DutyCyclePercent}}' \
+            --cycle-period-ms '{{CyclePeriodMilliseconds}}'
 
   - action: aws:runShellScript
     name: RestoreAndVerify
@@ -647,7 +785,9 @@ mainSteps:
             --duration-seconds '{{DurationSeconds}}' \
             --replica-scope '{{ReplicaScope}}' \
             --target-shard-id '{{TargetShardId}}' \
-            --use-tls '{{UseTls}}'
+            --use-tls '{{UseTls}}' \
+            --duty-cycle-percent '{{DutyCyclePercent}}' \
+            --cycle-period-ms '{{CyclePeriodMilliseconds}}'
           rc=$?
           rm -f /tmp/fis/ec_replication_stall.py
           exit $rc

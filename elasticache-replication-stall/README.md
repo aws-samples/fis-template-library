@@ -124,7 +124,7 @@ The experiment sends one SSM Command document to a single tagged injector instan
 - issues `CLIENT PAUSE 1 <mode>` as an availability probe. One millisecond has no measurable effect, but it proves the command is permitted on this cluster before the real injection.
 - refuses to start if a state file from an earlier run is still present on the instance.
 
-**InjectReplicationStall** — records the primary-side view, issues `CLIENT PAUSE <PauseMilliseconds> <PauseMode>` on each resolved replica, then samples the primary's `INFO replication` until `DurationSeconds` elapses, logging `master_repl_offset` alongside each replica's acknowledged `offset`, `lag` and `state`.
+**InjectReplicationStall** — records the primary-side view, issues `CLIENT PAUSE <PauseMilliseconds> <PauseMode>` on each resolved replica (or, with `DutyCyclePercent` above 0, a repeating short pause — see [Duty-cycle mode](#duty-cycle-mode)), then samples the primary's `INFO replication` until `DurationSeconds` elapses, logging `master_repl_offset` alongside each replica's acknowledged `offset`, `lag` and `state`.
 
 Observation is taken from the **primary**, not the replica, because `PauseMode=ALL` also blocks `INFO` on the paused replica.
 
@@ -155,6 +155,28 @@ slave0(offset=0, lag=0s, state=wait_bgsave)   <- link dropped, full resynchronis
 The replica's acknowledged offset stayed frozen while the primary advanced, the link stayed `online` throughout the pause, and the backlog then grew past what the node could hold — `sync_full` incremented and the replica reached 1.45 GB behind before catching up. Size the pause against the node type and the write rate, not against the clock alone.
 
 Note also that the `RestoreAndVerify` step is best-effort by design. In the same run, `CLIENT UNPAUSE` timed out because the replica was too saturated to answer, and the document logged a warning and continued. Recovery does not depend on that call: the pause expires on its own.
+
+### Duty-cycle mode
+
+`CLIENT PAUSE` is binary: the stream is either held or not. Setting `DutyCyclePercent` to 1-99 approximates a partial degradation instead. At the start of every `CyclePeriodMilliseconds` the document issues `CLIENT PAUSE <period x percent / 100> <PauseMode>`, the pause expires on its own, and the cycle repeats for `DurationSeconds`. The replica repeatedly falls behind and catches up, which is closer to a replication link that is degraded by packet loss or throttling than one long freeze followed by a single catch-up. `PauseMilliseconds` is ignored in this mode.
+
+What the two parameters control, measured on `cache.t4g.micro` at about 12 MiB/s of writes:
+
+| Parameter | Controls | Observed |
+|---|---|---|
+| `CyclePeriodMilliseconds` × `DutyCyclePercent` / 100, the pause slice | Peak backlog per cycle, roughly write rate × pause slice | 50% of 4000 ms: every cycle peaked at 32-37 MiB and fell back to 0-3 MiB; baseline peak 10-11 MiB |
+| `DutyCyclePercent` | Fraction of time the stream is held | Requested 50% / 75%, effective 50.0% / 75.0% |
+
+**Average throughput is not a dial.** In the same measurements the replica kept up on average at every duty cycle up to 90%, because it applies the backlog in the gap far faster than writes arrive. To make a replica fall behind on average you need writes near the replica's apply rate, or a duty cycle near 100%, which is the single-pause mode.
+
+Safety in this mode:
+
+- Before every pause the replica's role is re-read over the data plane. A node that no longer reports `role:slave` — for example after a failover promoted it — is dropped from the injection rather than paused as a primary.
+- If the loop falls behind schedule (a slow replica, or observation taking longer than the gap), missed cycles are skipped, never issued back to back. The summary reports the effective duty cycle and any skipped cycles.
+- Observation is sampled just before a pause slice expires, where the backlog peaks. Sampling at the start of a slice only ever sees the trough of the sawtooth.
+- Set the FIS action's `duration` to cover `DurationSeconds` plus the validate and restore steps. The template ships with `PT3M`, sized for the single-pause defaults.
+
+**CloudWatch cannot see short pause slices.** During a 60-second run at 50% of 4000 ms, the CloudWatch `ReplicationLag` maximum for the paused replica stayed at 0.001-0.009 seconds while the offset gap rose to 37 MiB every cycle. Neither `ReplicationLag` nor the `lag` field of `INFO replication` resolves a stall of a few seconds. Use `master_repl_offset` minus the replica's `offset` on the primary, which the document logs, or your application's own staleness signal.
 
 ## Validation
 
@@ -190,6 +212,8 @@ and returned to `master_link_status=up` with `master_sync_in_progress=0`.
 
 **Write rejection with `min-replicas-to-write=1`** (cluster mode disabled, 4 writer threads × 4 KiB × pipeline 50 over a fixed 80 MiB keyspace, `PauseMode=ALL`, 30-second pause): first `-NOREPLICAS` at 15.3 s, then every write rejected until 183 s. The replica's `SwapUsage` rose from 176 to 323 MiB while its engine CPU stayed at 0–5%; the link dropped at about 73 s and recovery followed a full resynchronisation.
 
+**Duty-cycle mode.** Cluster mode disabled, `DutyCyclePercent=50`, `CyclePeriodMilliseconds=4000`, 40 seconds, about 12 MiB/s of writes over a fixed keyspace: 10 pauses issued, 0 failed, effective duty 50.0%; the replica's offset gap peaked at 37 MiB against a 10 MiB baseline, the link stayed `online`, and 0 writes failed. Cluster mode enabled, `TargetShardId=0002` on a shard with two replicas, `DutyCyclePercent=75`, about 8 MiB/s into that shard: the targeted replica peaked at 31 MiB while the shard's other replica stayed at its 7.5 MiB baseline. A single-pause run (`DutyCyclePercent=0`) on the same cluster behaved as before.
+
 Also verified: the idempotency guard refuses a second `validate`; an unknown
 `TargetShardId` is rejected before anything is injected; a run **without** write
 traffic correctly shows no replication gap, which is why flowing writes are an
@@ -210,7 +234,7 @@ As you adapt this scenario to your needs, we recommend:
 
 1. Reviewing the tag names you use to ensure they fit your specific use case. This template deliberately requires two tags on the injector instance, `FIS-Ready=True` and `FIS-Role=ElastiCacheInjector`, so that the command is not sent to unrelated instances.
 2. Identifying business metrics tied to cached reads — for example cache hit ratio, read latency, and any correctness signal that would expose a stale read.
-3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the replication stall. `ReplicationLag` is the primary signal. Do not build the alarm on the `lag` field of `INFO replication` or on `connected_slaves`: neither moves while the stream is stalled.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the replication stall. `ReplicationLag` is the primary signal for stalls lasting tens of seconds or more; it does not resolve the few-second pause slices of duty-cycle mode, so for that mode alarm on the offset gap instead. Do not build the alarm on the `lag` field of `INFO replication` or on `connected_slaves`: neither moves while the stream is stalled.
 4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
 5. Running the experiment in a non-production environment first, and confirming there that `CLIENT PAUSE` is permitted on your cluster and engine version before scheduling it anywhere else.
 6. Extending the document to read an auth token from AWS Secrets Manager if your clusters use an auth token or RBAC.
