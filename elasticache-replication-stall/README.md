@@ -178,6 +178,31 @@ Safety in this mode:
 
 **CloudWatch cannot see short pause slices.** During a 60-second run at 50% of 4000 ms, the CloudWatch `ReplicationLag` maximum for the paused replica stayed at 0.001-0.009 seconds while the offset gap rose to 37 MiB every cycle. Neither `ReplicationLag` nor the `lag` field of `INFO replication` resolves a stall of a few seconds. Use `master_repl_offset` minus the replica's `offset` on the primary, which the document logs, or your application's own staleness signal.
 
+### How `min-replicas-to-write` changes the outcome
+
+Before each write command the primary counts its replicas that are `online` **and** have acknowledged within `min-replicas-max-lag` seconds. If that count is below `min-replicas-to-write`, the write is rejected with `-NOREPLICAS`. On a cluster-mode-enabled group each primary counts only its own replicas, so the gate applies per shard. Note that it measures whether acknowledgements arrive on time, not how far behind a replica is.
+
+On a topology with one replica per shard:
+
+| Situation | `0` (default) | `1` | `2` |
+|---|---|---|---|
+| Normal operation | Writes accepted | Writes accepted | **All writes rejected** — a shard can never have two replicas |
+| A replica stops acknowledging | Writes accepted | That shard rejects writes | Rejected |
+| After a failover, until the replacement replica has synchronised | Writes accepted | That shard rejects writes (inferred from the rule above, not measured) | Rejected |
+| Node replacement or maintenance | Writes accepted | May reject writes | Rejected |
+
+Points to keep in mind:
+
+- **`2` only makes sense with at least three nodes per shard.** With one replica per shard, it switches writes off.
+- **It is not synchronous replication.** It guarantees that enough replicas acknowledged recently, not that a given write reached them. It bounds the data-loss window to roughly `min-replicas-max-lag` seconds; it does not remove it. Use `WAIT` for a per-write guarantee (permitted on node-based caches, not exercised here).
+- **This experiment under-represents the gate.** `CLIENT PAUSE` leaves acknowledgements flowing, so the gate sees a healthy replica. In validation, `0` accepted every write through an 11-minute stall, while 166 MiB built up on the primary that the replica did not have. At `1`, a plain pause did not trip the gate; it tripped only once the replica ran out of memory and stopped acknowledging. Real packet loss is different: acknowledgements travel the same degraded link, so `lag` genuinely grows and the gate trips more readily. If production runs with `1` or higher, rejected writes during a network event may well come from this gate. To reproduce that, stop acknowledgements as well, for example by cutting the replication path with `aws:network:disrupt-connectivity` in an isolated environment.
+
+| Goal | Setting | Cost |
+|---|---|---|
+| Write availability first (typical for a cache) | `0` | A failover can lose writes the replica had not received, with no upper bound |
+| Bound data loss on failover | `1`, with at least two replicas per shard | The shard stops accepting writes while a replica is unhealthy or being replaced |
+| `2` | Only with at least three nodes per shard and a strong consistency requirement | The shard stops accepting writes if any one replica is unhealthy |
+
 ### Recovery action: adding a replica
 
 A common runbook response to a lagging replica is to add another one with `increase-replica-count`. Whether that restores writes depends on why writes are failing. Test it as a separate step and read the result with these points in mind.
