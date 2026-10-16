@@ -11,7 +11,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ## Hypothesis
 
-When a read replica stops applying the replication stream while its replication link stays up, the application continues to serve reads from that replica with unchanged latency, serves writes normally against the primary, and alerting detects the growing replication gap rather than reporting the cluster as healthy.
+When a read replica stops applying the replication stream while its replication link stays up, the application continues to serve reads from that replica with unchanged latency, serves writes normally against the primary (provided `min-replicas-to-write` is `0`, the default — see prerequisite 17), and alerting detects the growing replication gap rather than reporting the cluster as healthy.
 
 Two failure modes this experiment is designed to surface:
 
@@ -111,6 +111,7 @@ The fault is injected over the cache data plane, so it must be issued from insid
 
 15. A steady-state baseline has been captured for at least 10 minutes on `ReplicationLag`, `ReplicationBytes`, read latency and read error rate. Without a baseline you cannot tell the fault's effect from normal variation.
 16. Write traffic is flowing to the primary during the experiment. With no writes there is nothing for the replica to fall behind on, and the experiment will report no effect even though the injection succeeded.
+17. You know the value of `min-replicas-to-write` in the target's parameter group. At the default `0` the primary never rejects writes because of replica state. At `1` or higher, a sustained stall under heavy write load **rejects writes on the primary for far longer than the pause**: in validation, a 30-second pause rejected every write for **166.8 seconds**. A stall alone does not trip this gate — it measures how recently an acknowledgement arrived, and acknowledgements keep flowing during a pause. It trips only when the backlog piles up in the replica's memory until the node starts swapping and stops acknowledging; the primary then drops the link at `repl-timeout` (60 seconds) and rejections continue until a full resynchronisation completes. Treat a non-zero value as widening the blast radius to the primary's write path.
 
 ## How it works
 
@@ -118,7 +119,7 @@ The experiment sends one SSM Command document to a single tagged injector instan
 
 **ValidatePrerequisites** — writes the helper script to the instance, then:
 
-- calls `elasticache:DescribeReplicationGroups` and selects target nodes by the API's `CurrentRole` field. A node whose role is not exactly `replica` is skipped with a warning and never paused. This fails closed on purpose: pausing a primary would be a far larger fault than the one under test, and node names do not reliably indicate role after a failover.
+- resolves the topology and selects target nodes, by `CurrentRole` on a cluster-mode-disabled group and by `CLUSTER SHARDS` on a cluster-mode-enabled one. A node whose role cannot be proven to be `replica` is skipped with a warning and never paused. This fails closed on purpose: pausing a primary would be a far larger fault than the one under test, and node names do not reliably indicate role after a failover.
 - connects to each candidate and confirms the node itself reports `role:slave`, so the API view and the data-plane view have to agree.
 - issues `CLIENT PAUSE 1 <mode>` as an availability probe. One millisecond has no measurable effect, but it proves the command is permitted on this cluster before the real injection.
 - refuses to start if a state file from an earlier run is still present on the instance.
@@ -184,6 +185,10 @@ throughout and acted as controls:
 
 After the pause expired, shard 0002's replica applied roughly 100 MB of backlog
 and returned to `master_link_status=up` with `master_sync_in_progress=0`.
+
+**Monitoring blind spot, sustained.** On the same sharded group, one shard's replica was held stalled for 11 minutes. Throughout, the primary's `INFO replication` reported `lag` of 0–1 seconds and `state=online`, and the replication group stayed `available`; CloudWatch `ReplicationLag` for that replica rose from 52 to 592 seconds, one minute per minute, while the untargeted shards stayed at 0.001 seconds.
+
+**Write rejection with `min-replicas-to-write=1`** (cluster mode disabled, 4 writer threads × 4 KiB × pipeline 50 over a fixed 80 MiB keyspace, `PauseMode=ALL`, 30-second pause): first `-NOREPLICAS` at 15.3 s, then every write rejected until 183 s. The replica's `SwapUsage` rose from 176 to 323 MiB while its engine CPU stayed at 0–5%; the link dropped at about 73 s and recovery followed a full resynchronisation.
 
 Also verified: the idempotency guard refuses a second `validate`; an unknown
 `TargetShardId` is rejected before anything is injected; a run **without** write
