@@ -64,9 +64,12 @@ parameters:
     allowedPattern: "^([1-9][0-9]{2,3}|[1-5][0-9]{4}|60000)$"
   Region:
     type: String
-    default: "{{global:REGION}}"
-    description: Region of the target replication group.
-    allowedPattern: "^[a-z0-9-]{1,30}$"
+    default: ""
+    description: >-
+      Region of the target replication group. Leave empty to use the injector
+      instance's own Region, read from the instance metadata service; the injector
+      has to be in the cache VPC, so this is normally correct.
+    allowedPattern: "^([a-z]{2}(-[a-z]+)+-[0-9])?$"
   UseTls:
     type: String
     default: "false"
@@ -102,6 +105,7 @@ mainSteps:
         - platformType
         - Linux
     inputs:
+      onFailure: exit
       timeoutSeconds: 180
       runCommand:
         - |
@@ -483,6 +487,27 @@ mainSteps:
               return out
 
 
+          def instance_region():
+              """Region of this instance from IMDSv2. Used when the Region parameter is empty."""
+              import urllib.request
+              base = "http://169.254.169.254/latest"
+              try:
+                  token = urllib.request.urlopen(urllib.request.Request(
+                      base + "/api/token", method="PUT",
+                      headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=2).read().decode()
+                  region = urllib.request.urlopen(urllib.request.Request(
+                      base + "/meta-data/placement/region",
+                      headers={"X-aws-ec2-metadata-token": token}), timeout=2).read().decode().strip()
+              except Exception as exc:
+                  raise SystemExit("ERROR: Region was not given and could not be read from the instance "
+                                   "metadata service (%s: %s). Pass the Region parameter explicitly."
+                                   % (type(exc).__name__, exc))
+              if not region:
+                  raise SystemExit("ERROR: instance metadata returned an empty Region. "
+                                   "Pass the Region parameter explicitly.")
+              return region
+
+
           def duty_pause_ms(args):
               return args.cycle_period_ms * args.duty_cycle_percent // 100
 
@@ -699,7 +724,7 @@ mainSteps:
               parser = argparse.ArgumentParser()
               parser.add_argument("action", choices=["validate", "inject", "restore"])
               parser.add_argument("--replication-group-id", required=True)
-              parser.add_argument("--region", required=True)
+              parser.add_argument("--region", default="")
               parser.add_argument("--pause-mode", default="WRITE", choices=["WRITE", "ALL"])
               parser.add_argument("--pause-milliseconds", type=int, default=30000)
               parser.add_argument("--duration-seconds", type=int, default=60)
@@ -712,6 +737,7 @@ mainSteps:
               args = parser.parse_args()
               args.use_tls = str(args.use_tls).lower() == "true"
               args.target_shard_id = (args.target_shard_id or "").strip()
+              args.region = (args.region or "").strip() or instance_region()
               log("action=%s replication_group=%s region=%s mode=%s pause_ms=%s duration=%s "
                   "scope=%s shard=%s tls=%s duty=%s%% period_ms=%s"
                   % (args.action, args.replication_group_id, args.region, args.pause_mode,
@@ -770,13 +796,19 @@ mainSteps:
       StringEquals:
         - platformType
         - Linux
-    isEnd: true
     inputs:
+      finallyStep: true
       timeoutSeconds: 300
       runCommand:
         - |
           #!/bin/bash
           set -uo pipefail
+          # Runs even when ValidatePrerequisites exits early (finallyStep). If the
+          # helper script was never written there is nothing to restore.
+          if [ ! -f /tmp/fis/ec_replication_stall.py ]; then
+            echo "Helper script not present - ValidatePrerequisites stopped before writing it. Nothing to restore."
+            exit 0
+          fi
           python3 /tmp/fis/ec_replication_stall.py restore \
             --replication-group-id '{{ReplicationGroupId}}' \
             --region '{{Region}}' \

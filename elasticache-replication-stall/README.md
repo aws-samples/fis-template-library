@@ -80,7 +80,7 @@ targeting, precisely so the untargeted shards can serve as that control.
 The fault is injected over the cache data plane, so it must be issued from inside the VPC. SSM Automation's `aws:executeScript` runs in an AWS-managed sandbox with no VPC connectivity and therefore cannot reach a cache node, which is why this template uses `aws:ssm:send-command` against an instance you control.
 
 5. You have at least one **Linux** EC2 instance in the same VPC as the cache cluster, in a subnet with a network path to the cache nodes. The document is Linux-only: every step carries a `platformType: Linux` precondition.
-6. The instance is a **managed instance**: SSM Agent is installed and running, and the instance appears under Fleet Manager in Systems Manager.
+6. The instance is a **managed instance**: SSM Agent **3.0.502 or later** is installed and running (required for the document's `onFailure` / `finallyStep` step controls), and the instance appears under Fleet Manager in Systems Manager. The document's `Region` parameter defaults to the instance's own Region, read from the instance metadata service, so the injector needs IMDS access unless you pass `Region` explicitly.
 7. The instance profile has **both**:
    - the `AmazonSSMManagedInstanceCore` AWS managed policy, and
    - `elasticache:DescribeReplicationGroups`, which the document uses to read the topology, **and** `elasticache:DescribeCacheClusters`, which it uses on cluster-mode-enabled groups to resolve node DNS names. A sample policy is provided in `elasticache-replication-stall-injector-instance-policy.json`.
@@ -117,7 +117,7 @@ The fault is injected over the cache data plane, so it must be issued from insid
 
 The experiment sends one SSM Command document to a single tagged injector instance. The document runs three steps.
 
-**ValidatePrerequisites** — writes the helper script to the instance, then:
+**ValidatePrerequisites** — writes the helper script to the instance, then performs the checks below. The step sets `onFailure: exit`, so if any check fails, `InjectReplicationStall` is skipped and nothing is paused.
 
 - resolves the topology and selects target nodes, by `CurrentRole` on a cluster-mode-disabled group and by `CLUSTER SHARDS` on a cluster-mode-enabled one. A node whose role cannot be proven to be `replica` is skipped with a warning and never paused. This fails closed on purpose: pausing a primary would be a far larger fault than the one under test, and node names do not reliably indicate role after a failover.
 - connects to each candidate and confirms the node itself reports `role:slave`, so the API view and the data-plane view have to agree.
@@ -128,7 +128,7 @@ The experiment sends one SSM Command document to a single tagged injector instan
 
 Observation is taken from the **primary**, not the replica, because `PauseMode=ALL` also blocks `INFO` on the paused replica.
 
-**RestoreAndVerify** — issues `CLIENT UNPAUSE`, reports `master_link_status`, `master_sync_in_progress` and the replica's offset, prints the primary-side view again and removes the state file. `CLIENT PAUSE` expires on its own, so this step is a safety net rather than the primary recovery mechanism; the fault self-heals even if the experiment is interrupted or the instance becomes unreachable.
+**RestoreAndVerify** — issues `CLIENT UNPAUSE`, reports `master_link_status`, `master_sync_in_progress` and the replica's offset, prints the primary-side view again and removes the state file and the helper script. It is a `finallyStep`, so it runs even when validation exits early. `CLIENT PAUSE` expires on its own, so this step is a safety net rather than the primary recovery mechanism; the fault self-heals even if the experiment is interrupted or the instance becomes unreachable.
 
 ### Choosing PauseMode
 

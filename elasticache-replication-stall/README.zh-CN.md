@@ -74,7 +74,7 @@
 故障是通过缓存的数据面注入的，因此必须从 VPC 内部发起。SSM Automation 的 `aws:executeScript` 运行在 AWS 托管沙箱中、没有 VPC 连通性，因此到不了缓存节点——这正是本模板采用 `aws:ssm:send-command` 打你自己的实例的原因。
 
 5. 你在缓存集群所在的**同一个 VPC** 内有至少一台 **Linux** EC2 实例，且其子网与缓存节点之间网络可达。本文档仅支持 Linux：每个步骤都带 `platformType: Linux` 前置条件。
-6. 该实例是**受管实例**：SSM Agent 已安装并在运行，实例在 Systems Manager 的 Fleet Manager 中可见。
+6. 该实例是**受管实例**：已安装并运行 **3.0.502 或更高版本**的 SSM Agent（文档使用的 `onFailure` / `finallyStep` 步骤控制需要该版本），实例在 Systems Manager 的 Fleet Manager 中可见。文档的 `Region` 参数默认取实例自身所在的 Region（从实例元数据服务读取），因此除非显式传入 `Region`，注入机需要能访问 IMDS。
 7. 该实例的实例配置文件（instance profile）**同时具备**：
    - AWS 托管策略 `AmazonSSMManagedInstanceCore`，以及
    - `elasticache:DescribeReplicationGroups`（文档用它读取拓扑）**以及** `elasticache:DescribeCacheClusters`（集群模式开启时用它解析节点 DNS 名）。示例策略见 `elasticache-replication-stall-injector-instance-policy.json`。
@@ -111,7 +111,7 @@
 
 实验向一台打了标签的注入机发送一个 SSM Command 文档，文档分三步执行。
 
-**ValidatePrerequisites（校验前提）**——把辅助脚本写到实例上，然后：
+**ValidatePrerequisites（校验前提）**——把辅助脚本写到实例上，然后执行下列检查。该步骤设置了 `onFailure: exit`，任何一项检查失败，`InjectReplicationStall` 都会被跳过，不会暂停任何节点。
 
 - 解析拓扑并挑选目标节点：集群模式关闭时依据 `CurrentRole`，集群模式开启时依据 `CLUSTER SHARDS`。角色无法证明为 `replica` 的节点会被跳过并告警，**绝不会被暂停**。这是刻意的「失败即关闭」设计：暂停主节点会造成远大于被测范围的故障，而且节点名在发生过故障转移之后并不能可靠地反映角色。
 - 连接每个候选节点，确认节点自己也报告 `role:slave`，即要求 API 视角与数据面视角必须一致。
@@ -122,7 +122,7 @@
 
 观测取自**主节点**而不是副本，因为 `PauseMode=ALL` 会把被暂停副本上的 `INFO` 也一起挂住。
 
-**RestoreAndVerify（恢复与核验）**——执行 `CLIENT UNPAUSE`，报告 `master_link_status`、`master_sync_in_progress` 与副本 offset，再打印一次主节点侧视图，最后删除状态文件。`CLIENT PAUSE` 会自动到期，所以这一步是安全兜底而非主要恢复手段——即便实验被中断或实例失联，故障也会自愈。
+**RestoreAndVerify（恢复与核验）**——执行 `CLIENT UNPAUSE`，报告 `master_link_status`、`master_sync_in_progress` 与副本 offset，再打印一次主节点侧视图，最后删除状态文件和辅助脚本。它是 `finallyStep`，即使校验步骤提前退出也会执行。`CLIENT PAUSE` 会自动到期，所以这一步是安全兜底而非主要恢复手段——即便实验被中断或实例失联，故障也会自愈。
 
 ### PauseMode 怎么选
 
