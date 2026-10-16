@@ -26,9 +26,31 @@
 ### 一、目标缓存集群
 
 1. 目标是**节点型**（non-serverless）的 ElastiCache 复制组，引擎为 **Valkey** 或 **Redis OSS**。Serverless 不支持：`client pause` 属于 ElastiCache 对 serverless 缓存禁用的命令。
-2. 该复制组**至少有一个副本**，且 `Status` 为 `available`。副本跨可用区时，实验与真实的 AZ 间网络事件最接近。
-3. 集群**未启用** auth token 或 RBAC 认证。本文档不带凭证连接；若缓存返回 `NOAUTH` 或 `WRONGPASS`，脚本会以明确的错误信息退出。如果必须针对带认证的集群运行，需要自行扩展文档，从 AWS Secrets Manager 读取令牌。
-4. 如果复制组启用了**传输加密**，需要把文档参数 `UseTls` 设为 `true`。
+2. 目标运行在**集群模式关闭**（cluster mode disabled，即单分片、一主一或多从）。**本版模板不支持集群模式开启**——见下方限制说明。
+3. 该复制组**至少有一个副本**，且 `Status` 为 `available`。副本跨可用区时，实验与真实的 AZ 间网络事件最接近。
+4. 集群**未启用** auth token 或 RBAC 认证。本文档不带凭证连接；若缓存返回 `NOAUTH` 或 `WRONGPASS`，脚本会以明确的错误信息退出。如果必须针对带认证的集群运行，需要自行扩展文档，从 AWS Secrets Manager 读取令牌。
+5. 如果复制组启用了**传输加密**，需要把文档参数 `UseTls` 设为 `true`。
+
+> ### 限制：暂不支持集群模式开启（cluster mode enabled）
+>
+> 本模板通过 `DescribeReplicationGroups` 的两个字段发现目标，而 AWS API 参考明确
+> 说明这两个字段**仅在集群模式关闭的复制组上才填充**：
+>
+> - `NodeGroupMember.CurrentRole` —— "This member is only applicable for Valkey
+>   or Redis OSS (cluster mode disabled) replication groups."
+> - `NodeGroupMember.ReadEndpoint` —— "The read endpoint is only applicable on
+>   Valkey or Redis OSS (cluster mode disabled) clusters."
+>
+> 因此在集群模式开启的复制组上，角色解析步骤找不到任何可以证明为副本的节点，实验
+> 会在**注入任何东西之前停止**，报 `ERROR: no node with CurrentRole 'replica' was
+> found`。这是失败即关闭的设计在正常工作、而不是静默误伤——但实验确实跑不起来。
+>
+> **这是发现路径的限制，不是故障本身的限制。** `CLIENT PAUSE` 在集群模式下同样是
+> 节点级的：pause 状态存放在单进程的 `server` 结构里，引擎中唯一与集群相关的用法是
+> 节点在手动 failover 时暂停自己。后续版本可以这样支持集群模式：改用配置端点上的
+> `CLUSTER SHARDS` 来发现角色与节点端点（`cluster shards` 与 `cluster nodes` 都不在
+> ElastiCache 的受限命令清单里），并增加一个只针对单个分片的参数，让其余分片保持可用
+> 作为实验内的对照组。
 
 ### 二、注入机 EC2 实例
 

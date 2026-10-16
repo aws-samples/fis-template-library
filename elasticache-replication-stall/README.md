@@ -27,9 +27,37 @@ Before running this experiment, ensure that:
 ### 1. Target cache cluster
 
 1. The target is a **node-based** ElastiCache replication group running **Valkey** or **Redis OSS**. Serverless caches are not supported: `client pause` is on the list of commands ElastiCache makes unavailable for serverless caches.
-2. The replication group has **at least one replica**, and its `Status` is `available`. A cross-Availability-Zone replica makes the experiment closest to a real inter-AZ network event.
-3. The cluster does **not** require an auth token or RBAC authentication. This document connects without credentials and will exit with a clear error if the cache replies `NOAUTH` or `WRONGPASS`. Extend the document to read a token from AWS Secrets Manager if you need authenticated clusters.
-4. If the replication group has **encryption in transit** enabled, set the `UseTls` document parameter to `true`.
+2. The target runs in **cluster mode disabled** (a single shard with one primary and one or more replicas). **Cluster mode enabled is not supported by this version of the template** — see the limitation below.
+3. The replication group has **at least one replica**, and its `Status` is `available`. A cross-Availability-Zone replica makes the experiment closest to a real inter-AZ network event.
+4. The cluster does **not** require an auth token or RBAC authentication. This document connects without credentials and will exit with a clear error if the cache replies `NOAUTH` or `WRONGPASS`. Extend the document to read a token from AWS Secrets Manager if you need authenticated clusters.
+5. If the replication group has **encryption in transit** enabled, set the `UseTls` document parameter to `true`.
+
+> ### Limitation: cluster mode enabled is not yet supported
+>
+> This template discovers its target from two `DescribeReplicationGroups` fields,
+> and the AWS API reference states that both are populated only for cluster mode
+> disabled replication groups:
+>
+> - `NodeGroupMember.CurrentRole` — "This member is only applicable for Valkey or
+>   Redis OSS (cluster mode disabled) replication groups."
+> - `NodeGroupMember.ReadEndpoint` — "The read endpoint is only applicable on
+>   Valkey or Redis OSS (cluster mode disabled) clusters."
+>
+> On a cluster-mode-enabled replication group the role-resolution step therefore
+> finds no node it can prove to be a replica, and the experiment **stops before
+> injecting anything** with `ERROR: no node with CurrentRole 'replica' was found`.
+> That is the fail-closed behaviour working as intended, not a silent
+> misfire — but the experiment cannot run.
+>
+> This is a discovery limitation, not a limitation of the fault itself.
+> `CLIENT PAUSE` is node-local in cluster mode too: the pause state lives in the
+> per-process `server` struct, and the only cluster-related use of it in the
+> engine is a node pausing itself during a manual failover. A future revision can
+> support cluster mode enabled by discovering roles and node endpoints from
+> `CLUSTER SHARDS` against the configuration endpoint — neither `cluster shards`
+> nor `cluster nodes` appears on the ElastiCache restricted-command list — and by
+> adding a parameter to target a single shard so that the remaining shards stay
+> available as in-experiment controls.
 
 ### 2. Injector EC2 instance
 
