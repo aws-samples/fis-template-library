@@ -1,4 +1,4 @@
-# AWS 故障注入服务实验：ElastiCache 主从复制停滞
+# AWS 故障注入服务实验：ElastiCache 复制停滞
 
 本目录是一个配合 AWS Fault Injection Service (FIS) 与 fis-template-library-tooling 使用的实验模板。使用前需要先部署到你的 AWS 账号，并且账号里要有可供注入故障的资源。
 
