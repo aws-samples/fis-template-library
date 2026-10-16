@@ -178,6 +178,32 @@ Safety in this mode:
 
 **CloudWatch cannot see short pause slices.** During a 60-second run at 50% of 4000 ms, the CloudWatch `ReplicationLag` maximum for the paused replica stayed at 0.001-0.009 seconds while the offset gap rose to 37 MiB every cycle. Neither `ReplicationLag` nor the `lag` field of `INFO replication` resolves a stall of a few seconds. Use `master_repl_offset` minus the replica's `offset` on the primary, which the document logs, or your application's own staleness signal.
 
+### Recovery action: adding a replica
+
+A common runbook response to a lagging replica is to add another one with `increase-replica-count`. Whether that restores writes depends on why writes are failing. Test it as a separate step and read the result with these points in mind.
+
+**What was measured.** On a cluster-mode-enabled group, one shard's only replica was held stalled with a repeating `CLIENT PAUSE WRITE` while writes went to that shard. Then a second replica was requested in the primary's Availability Zone:
+
+| Since the API call | Event |
+|---|---|
+| 0.5 s | `increase-replica-count` accepted; group `modifying`. **A degraded shard does not block the request.** |
+| 0 – 488 s | No data-plane change while the node is provisioned; the stalled replica's backlog keeps growing |
+| 488 s | New replica appears on the primary in `wait_bgsave`; `sync_full` increments (twice for one replica, cause not determined) |
+| **555.6 s** | New replica `online` |
+| 576 s | Group back to `available`; the stalled replica is still ~160 MiB behind and still `state=online` |
+
+The stall was then lifted, and the original replica caught up 166 MiB in 10 seconds without a resynchronisation. No write failed at any point.
+
+**What this means for writes.**
+
+- **At the default `min-replicas-to-write=0`, there is nothing for a new replica to restore.** The primary never rejected a write during the 11-minute stall.
+- **At `1` or higher, a new replica can restore writes, but only once it is `online`.** The gate counts replicas that are `online` and acknowledged within `min-replicas-max-lag`. A replica added during the incident is counted after its full synchronisation completes. That was **9 min 15 s** here, on `cache.t4g.micro` with ~20 MiB of data, and it grows with the data set. Writes are rejected until then.
+- **The incident may resolve itself first.** With `min-replicas-to-write=1`, a 30-second pause under heavy writes rejected writes for 166.8 s, then recovered by itself: the link dropped at `repl-timeout` and the replica resynchronised. That is about a third of the time a new replica needed to come online. In an experiment, compare the moment writes recover with the moment the new replica reaches `online`. If writes recover first, the new replica was not the cause.
+- **A new replica adds load in the wrong place if the network is the bottleneck.** Its full synchronisation (RDB generation and transfer) uses the primary's outbound bandwidth. If writes are failing because of `NetworkBandwidthOutAllowanceExceeded` rather than `-NOREPLICAS`, adding a replica makes it worse.
+- **Lowering `min-replicas-to-write` to `0` is the faster lever** when the goal is to accept writes again. It trades durability for availability. The parameter's `ChangeType` is `immediate` (no reboot), but reaching `in-sync` took between 86 and 147 s across the validation runs.
+
+Not measured: the end-to-end sequence "writes rejected → replica added → writes recover once it is `online`". To test it directly, set `min-replicas-to-write` higher than the shard's current replica count, so writes are rejected by configuration, then add a replica and measure the gap between `online` and the first successful write. That isolates the recovery path. It does not reproduce a replication stall.
+
 ## Validation
 
 Validated end to end against two live replication groups in `ap-northeast-1`,
