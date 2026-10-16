@@ -2,10 +2,18 @@
     "Version": "2012-10-17",
     "Statement": [
         {
-            "Sid": "ResolveReplicaRolesAtRunTime",
+            "Sid": "ReadReplicationGroupTopology",
             "Effect": "Allow",
             "Action": [
                 "elasticache:DescribeReplicationGroups"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ResolveNodeDnsNamesForClusterMode",
+            "Effect": "Allow",
+            "Action": [
+                "elasticache:DescribeCacheClusters"
             ],
             "Resource": "*"
         }

@@ -2,10 +2,11 @@ schemaVersion: "2.2"
 description: >-
   Stall Amazon ElastiCache (Valkey or Redis OSS) replication by issuing CLIENT PAUSE
   on replica nodes. The replication stream stops being applied while the replication
-  link stays up, reproducing a replica that cannot keep up with its primary. This is
-  an SSM Command document and must run on an EC2 instance inside the cache VPC,
-  because the fault is injected over the cache data plane (port 6379) rather than
-  through a control-plane API.
+  link stays up, reproducing a replica that cannot keep up with its primary. Supports
+  both cluster mode disabled and cluster mode enabled replication groups. This is an
+  SSM Command document and must run on an EC2 instance inside the cache VPC, because
+  the fault is injected over the cache data plane rather than through a control-plane
+  API.
 
 parameters:
   ReplicationGroupId:
@@ -51,6 +52,15 @@ parameters:
       - "true"
       - "false"
     description: Set to true when the replication group has encryption in transit enabled.
+  TargetShardId:
+    type: String
+    default: ""
+    description: >-
+      Cluster mode enabled only. Restrict the experiment to one shard, given as the
+      ElastiCache node group id such as 0001. Leave empty to consider every shard.
+      Targeting a single shard keeps the remaining shards available as in-experiment
+      controls, which is strongly recommended for a first run.
+    allowedPattern: "^([0-9]{4})?$"
   ReplicaScope:
     type: String
     default: ONE_PER_SHARD
@@ -58,8 +68,9 @@ parameters:
       - ONE_PER_SHARD
       - ALL
     description: >-
-      ONE_PER_SHARD pauses a single replica per shard. ALL pauses every replica, which
-      combined with PauseMode=ALL removes all read replicas from service at once.
+      ONE_PER_SHARD pauses a single replica per considered shard. ALL pauses every
+      replica of every considered shard. On a topology with one replica per shard
+      these two values are identical, so use TargetShardId to limit the blast radius.
 
 mainSteps:
   - action: aws:runShellScript
@@ -83,14 +94,26 @@ mainSteps:
           #!/usr/bin/env python3
           """Stall ElastiCache replication via CLIENT PAUSE on replica nodes.
 
-          Standard library only: the instance needs no pip packages and no route to
-          PyPI. It does need a network path to the cache nodes on the cache port and
-          to the ElastiCache API endpoint, which the AWS CLI uses to resolve roles.
+          Supports both cluster mode disabled and cluster mode enabled replication
+          groups. Standard library only: the instance needs no pip packages and no
+          route to PyPI. It does need a network path to the cache nodes on the cache
+          port and to the ElastiCache API endpoint, which the AWS CLI uses to read
+          the topology.
+
+          Why two discovery paths:
+            The ElastiCache API reference states that NodeGroupMember.CurrentRole and
+            NodeGroupMember.ReadEndpoint are populated only for cluster mode disabled
+            replication groups. For cluster mode enabled groups the topology is read
+            from CLUSTER SHARDS against the configuration endpoint instead, which
+            reports each node's role and endpoint over the data plane. Neither
+            "cluster shards" nor "cluster nodes" is on the ElastiCache restricted
+            command list.
 
           Safety properties:
-            * Node roles are resolved from the ElastiCache API field CurrentRole at
-              run time. A node whose role cannot be proven to be "replica" is
-              SKIPPED, never paused - pausing a primary would be a far larger fault.
+            * A node is only ever paused when its role is proven to be a replica,
+              both by the discovery path and by the node's own INFO replication.
+              Anything else is SKIPPED - pausing a primary would be a far larger
+              fault than the one under test.
             * CLIENT PAUSE expires on its own, so the fault self-heals even if the
               experiment is interrupted. CLIENT UNPAUSE is issued as a safety net.
           """
@@ -125,10 +148,32 @@ mainSteps:
               if prefix == b"$":
                   length = int(body)
                   return None if length == -1 else fh.read(length + 2)[:-2].decode()
-              if prefix == b"*":
+              if prefix in (b"*", b"~", b">"):
                   count = int(body)
                   return None if count == -1 else [read_reply(fh) for _ in range(count)]
+              if prefix == b"%":
+                  count = int(body)
+                  out = {}
+                  for _ in range(count):
+                      key = read_reply(fh)
+                      out[key] = read_reply(fh)
+                  return out
+              if prefix == b"#":
+                  return body == b"t"
+              if prefix == b",":
+                  return float(body)
+              if prefix == b"_":
+                  return None
               raise RuntimeError("unexpected RESP prefix %r" % prefix)
+
+
+          def to_map(value):
+              """RESP2 encodes a map as a flat array of alternating keys and values."""
+              if isinstance(value, dict):
+                  return value
+              if not isinstance(value, list):
+                  return {}
+              return {value[i]: value[i + 1] for i in range(0, len(value) - 1, 2)}
 
 
           def send(host, port, use_tls, *args, **kwargs):
@@ -175,7 +220,7 @@ mainSteps:
               return out
 
 
-          def resolve(rg_id, region, scope):
+          def describe(rg_id, region):
               cli = ["aws", "elasticache", "describe-replication-groups",
                      "--replication-group-id", rg_id, "--region", region,
                      "--output", "json", "--no-cli-pager"]
@@ -194,7 +239,6 @@ mainSteps:
                   raise SystemExit(
                       "ERROR: describe-replication-groups timed out. This subnet most likely "
                       "has no route to the ElastiCache API endpoint.")
-
               groups = json.loads(raw).get("ReplicationGroups") or []
               if not groups:
                   raise SystemExit("ERROR: replication group %r was not found." % rg_id)
@@ -202,18 +246,165 @@ mainSteps:
               if group.get("Status") != "available":
                   raise SystemExit("ERROR: replication group status is %r, expected 'available'."
                                    % group.get("Status"))
+              return group
+
+
+          def node_group_for_slot(api_groups, slot):
+              """Map a hash slot back to the ElastiCache node group id, so that
+              TargetShardId can be given in the operator's own vocabulary (0001)
+              rather than as a slot range."""
+              for node_group in api_groups:
+                  for part in (node_group.get("Slots") or "").split(","):
+                      if not part:
+                          continue
+                      low, _, high = part.partition("-")
+                      try:
+                          if int(low) <= slot <= int(high or low):
+                              return node_group.get("NodeGroupId")
+                      except ValueError:
+                          continue
+              return None
+
+
+          def node_dns_index(group, region):
+              """Map node IP -> (dns name, cache cluster id, az) for a cluster mode
+              enabled group.
+
+              CLUSTER SHARDS on ElastiCache returns `endpoint` set to the node's IP and
+              `hostname` empty, which is unusable for TLS: a certificate cannot be
+              validated against an IP. describe-cache-clusters --show-cache-node-info
+              returns each member cluster's node DNS name, so the two are joined on the
+              resolved address. It also replaces the opaque cluster node id with the
+              operator-visible CacheClusterId in the log output.
+              """
+              index = {}
+              for cc_id in group.get("MemberClusters") or []:
+                  cli = ["aws", "elasticache", "describe-cache-clusters",
+                         "--cache-cluster-id", cc_id, "--show-cache-node-info",
+                         "--region", region, "--output", "json", "--no-cli-pager"]
+                  try:
+                      raw = subprocess.check_output(cli, stderr=subprocess.STDOUT, timeout=60)
+                  except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                          FileNotFoundError) as exc:
+                      detail = getattr(exc, "output", b"")
+                      log("WARNING: describe-cache-clusters failed for %s (%s). Node DNS "
+                          "names will be unavailable; this only matters for TLS. The "
+                          "instance profile needs elasticache:DescribeCacheClusters.\n%s"
+                          % (cc_id, type(exc).__name__,
+                             detail.decode(errors="replace") if detail else ""))
+                      continue
+                  for cluster in json.loads(raw).get("CacheClusters") or []:
+                      az = cluster.get("PreferredAvailabilityZone")
+                      for cache_node in cluster.get("CacheNodes") or []:
+                          address = (cache_node.get("Endpoint") or {}).get("Address")
+                          if not address:
+                              continue
+                          try:
+                              for info in socket.getaddrinfo(address, None, socket.AF_INET):
+                                  index[info[4][0]] = {"dns": address, "id": cluster.get("CacheClusterId"),
+                                                       "az": az}
+                          except socket.gaierror as exc:
+                              log("WARNING: could not resolve %s (%s)." % (address, exc))
+              return index
+
+
+          def resolve_cluster_mode_enabled(group, region, use_tls, scope, target_shard):
+              endpoint = group.get("ConfigurationEndpoint") or {}
+              host, port = endpoint.get("Address"), endpoint.get("Port")
+              if not host:
+                  raise SystemExit(
+                      "ERROR: the replication group reports ClusterEnabled but has no "
+                      "ConfigurationEndpoint, so the topology cannot be read.")
+              log("Cluster mode enabled. Reading topology from CLUSTER SHARDS at %s:%s"
+                  % (host, port))
+              shards = send(host, port, use_tls, "CLUSTER", "SHARDS", timeout=10.0)
+              api_groups = group.get("NodeGroups") or []
+              dns_index = node_dns_index(group, region)
 
               replicas, primaries = [], []
+              for shard in shards or []:
+                  smap = to_map(shard)
+                  slots = smap.get("slots") or []
+                  first_slot = slots[0] if slots else None
+                  shard_id = (node_group_for_slot(api_groups, int(first_slot))
+                              if first_slot is not None else None)
+                  # A shard outside TargetShardId contributes no injection target, but
+                  # its primary is still collected so the observation covers it as an
+                  # in-experiment control.
+                  in_scope = (not target_shard) or shard_id == target_shard
+
+                  shard_replicas = []
+                  for raw_node in smap.get("nodes") or []:
+                      node_map = to_map(raw_node)
+                      role = str(node_map.get("role") or "").lower()
+                      node_ip = node_map.get("ip") or node_map.get("endpoint")
+                      enriched = dns_index.get(node_ip) or {}
+                      # Prefer a DNS name: required for TLS certificate validation, and
+                      # it keeps the node identifiable in the log output.
+                      node_host = (node_map.get("hostname") or "").strip() or enriched.get("dns") or node_ip
+                      node_port = node_map.get("tls-port") if use_tls else node_map.get("port")
+                      if node_port is None:
+                          node_port = node_map.get("port") or node_map.get("tls-port")
+                      node = {"shard": shard_id,
+                              "id": enriched.get("id") or node_map.get("id"),
+                              "cluster_node_id": node_map.get("id"),
+                              "az": enriched.get("az"), "role": role,
+                              "host": node_host, "port": node_port,
+                              "health": node_map.get("health"),
+                              "targeted": in_scope}
+                      if role == "master":
+                          primaries.append(node)
+                          continue
+                      if not in_scope:
+                          continue
+                      if role != "replica":
+                          log("WARNING: skipping node %s in shard %s - CLUSTER SHARDS reports "
+                              "role %r. Refusing to pause a node that cannot be proven to be a "
+                              "replica." % (node_map.get("id"), shard_id, node_map.get("role")))
+                          continue
+                      if not node_host or node_port is None:
+                          log("WARNING: skipping node %s in shard %s - no usable endpoint in "
+                              "CLUSTER SHARDS output." % (node_map.get("id"), shard_id))
+                          continue
+                      if str(node_map.get("health") or "").lower() not in ("online", ""):
+                          log("WARNING: skipping node %s in shard %s - health is %r."
+                              % (node_map.get("id"), shard_id, node_map.get("health")))
+                          continue
+                      if use_tls and _looks_like_ip(node_host):
+                          raise SystemExit(
+                              "ERROR: UseTls is true but only an IP address (%s) could be "
+                              "determined for node %s. A TLS certificate cannot be validated "
+                              "against an IP. Grant elasticache:DescribeCacheClusters to the "
+                              "instance profile so node DNS names can be resolved, then retry."
+                              % (node_host, node_map.get("id")))
+                      shard_replicas.append(node)
+                  replicas.extend(shard_replicas[:1] if scope == "ONE_PER_SHARD" else shard_replicas)
+
+              if target_shard and not replicas:
+                  raise SystemExit(
+                      "ERROR: no replica was resolved for shard %r. Check the node group id "
+                      "against describe-replication-groups output." % target_shard)
+              return replicas, primaries
+
+
+          def _looks_like_ip(value):
+              parts = str(value).split(".")
+              return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+          def resolve_cluster_mode_disabled(group, scope):
+              replicas, primaries = [], []
               for node_group in group.get("NodeGroups") or []:
-                  shard = []
+                  shard_replicas = []
                   for member in node_group.get("NodeGroupMembers") or []:
-                      endpoint = member.get("ReadEndpoint") or {}
+                      read_endpoint = member.get("ReadEndpoint") or {}
                       node = {"shard": node_group.get("NodeGroupId"),
                               "id": member.get("CacheClusterId"),
                               "az": member.get("PreferredAvailabilityZone"),
                               "role": member.get("CurrentRole"),
-                              "host": endpoint.get("Address"),
-                              "port": endpoint.get("Port")}
+                              "host": read_endpoint.get("Address"),
+                              "port": read_endpoint.get("Port"),
+                              "health": None}
                       role = (member.get("CurrentRole") or "").lower()
                       if role == "primary":
                           primaries.append(node)
@@ -226,14 +417,29 @@ mainSteps:
                       if not node["host"]:
                           log("WARNING: skipping %s - no ReadEndpoint was returned." % node["id"])
                           continue
-                      shard.append(node)
-                  replicas.extend(shard[:1] if scope == "ONE_PER_SHARD" else shard)
+                      shard_replicas.append(node)
+                  replicas.extend(shard_replicas[:1] if scope == "ONE_PER_SHARD" else shard_replicas)
+              return replicas, primaries
 
+
+          def resolve(args):
+              group = describe(args.replication_group_id, args.region)
+              cluster_enabled = bool(group.get("ClusterEnabled"))
+              if args.target_shard_id and not cluster_enabled:
+                  log("WARNING: TargetShardId was supplied but this replication group has "
+                      "cluster mode disabled. The parameter is ignored.")
+              if cluster_enabled:
+                  replicas, primaries = resolve_cluster_mode_enabled(
+                      group, args.region, args.use_tls, args.replica_scope,
+                      args.target_shard_id)
+              else:
+                  replicas, primaries = resolve_cluster_mode_disabled(group, args.replica_scope)
               if not replicas:
                   raise SystemExit(
-                      "ERROR: no node with CurrentRole 'replica' was found for %r. This "
-                      "experiment requires at least one replica." % rg_id)
-              return replicas, primaries
+                      "ERROR: no node that can be proven to be a replica was found for %r. "
+                      "This experiment requires at least one replica."
+                      % args.replication_group_id)
+              return replicas, primaries, cluster_enabled
 
 
           def primary_view(primaries, use_tls):
@@ -243,14 +449,15 @@ mainSteps:
               for node in primaries:
                   if not node.get("host"):
                       continue
+                  label = "%s/%s" % (node.get("shard"), node.get("id"))
                   try:
                       info = info_replication(node["host"], node["port"], use_tls)
-                      out[node["id"]] = {
+                      out[label] = {
                           "master_repl_offset": info.get("master_repl_offset"),
                           "connected_slaves": info.get("connected_slaves"),
                           "replicas": info.get("replicas")}
                   except Exception as exc:
-                      out[node["id"]] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+                      out[label] = {"error": "%s: %s" % (type(exc).__name__, exc)}
               return out
 
 
@@ -261,19 +468,19 @@ mainSteps:
                       "flight on this instance. Remove the file only after confirming that no "
                       "pause is active." % STATE)
 
-              replicas, primaries = resolve(args.replication_group_id, args.region, args.replica_scope)
-              log("Resolved %d replica target(s) and %d primary node(s)."
-                  % (len(replicas), len(primaries)))
+              replicas, primaries, cluster_enabled = resolve(args)
+              log("Topology: cluster_mode_enabled=%s, %d replica target(s), %d primary node(s)."
+                  % (cluster_enabled, len(replicas), len(primaries)))
               for node in replicas:
-                  log("  replica target: %s (shard=%s, az=%s) at %s:%s"
-                      % (node["id"], node["shard"], node["az"], node["host"], node["port"]))
+                  log("  replica target: shard=%s id=%s at %s:%s"
+                      % (node["shard"], node["id"], node["host"], node["port"]))
 
               for node in replicas:
                   info = info_replication(node["host"], node["port"], args.use_tls)
                   if info.get("role") != "slave":
                       raise SystemExit(
-                          "ERROR: %s reports role=%r over the data plane while the API called it "
-                          "a replica. Refusing to continue." % (node["id"], info.get("role")))
+                          "ERROR: %s reports role=%r over the data plane while discovery called "
+                          "it a replica. Refusing to continue." % (node["id"], info.get("role")))
                   log("  %s role=slave master_link_status=%s"
                       % (node["id"], info.get("master_link_status")))
                   reply = send(node["host"], node["port"], args.use_tls,
@@ -284,6 +491,7 @@ mainSteps:
               os.makedirs(os.path.dirname(STATE), exist_ok=True)
               with open(STATE, "w") as fh:
                   json.dump({"replicas": replicas, "primaries": primaries,
+                             "cluster_enabled": cluster_enabled,
                              "created": time.time()}, fh, indent=2)
               log("Prerequisites validated. State written to %s" % STATE)
 
@@ -299,23 +507,24 @@ mainSteps:
               for node in replicas:
                   reply = send(node["host"], node["port"], args.use_tls,
                                "CLIENT", "PAUSE", args.pause_milliseconds, args.pause_mode)
-                  log("INJECTED: %s CLIENT PAUSE %s %s returned %s"
-                      % (node["id"], args.pause_milliseconds, args.pause_mode, reply))
+                  log("INJECTED: shard=%s %s CLIENT PAUSE %s %s returned %s"
+                      % (node["shard"], node["id"], args.pause_milliseconds,
+                         args.pause_mode, reply))
 
               interval = min(10, max(1, args.duration_seconds // 6))
               deadline = time.time() + args.duration_seconds
               while time.time() < deadline:
                   time.sleep(interval)
-                  for cid, data in primary_view(primaries, args.use_tls).items():
+                  for label, data in sorted(primary_view(primaries, args.use_tls).items()):
                       if "error" in data:
-                          log("  primary %s unreachable: %s" % (cid, data["error"]))
+                          log("  primary %s unreachable: %s" % (label, data["error"]))
                           continue
                       detail = ", ".join(
                           "%s(offset=%s,lag=%ss,state=%s)"
                           % (k, v.get("offset"), v.get("lag"), v.get("state"))
                           for k, v in sorted((data.get("replicas") or {}).items()))
                       log("  primary %s master_repl_offset=%s  %s"
-                          % (cid, data.get("master_repl_offset"), detail))
+                          % (label, data.get("master_repl_offset"), detail))
 
               log("Observation window finished. The pause expires on its own after %s ms."
                   % args.pause_milliseconds)
@@ -365,14 +574,16 @@ mainSteps:
               parser.add_argument("--duration-seconds", type=int, default=60)
               parser.add_argument("--replica-scope", default="ONE_PER_SHARD",
                                   choices=["ONE_PER_SHARD", "ALL"])
+              parser.add_argument("--target-shard-id", default="")
               parser.add_argument("--use-tls", default="false")
               args = parser.parse_args()
               args.use_tls = str(args.use_tls).lower() == "true"
+              args.target_shard_id = (args.target_shard_id or "").strip()
               log("action=%s replication_group=%s region=%s mode=%s pause_ms=%s duration=%s "
-                  "scope=%s tls=%s"
+                  "scope=%s shard=%s tls=%s"
                   % (args.action, args.replication_group_id, args.region, args.pause_mode,
                      args.pause_milliseconds, args.duration_seconds, args.replica_scope,
-                     args.use_tls))
+                     args.target_shard_id or "<all>", args.use_tls))
               {"validate": action_validate,
                "inject": action_inject,
                "restore": action_restore}[args.action](args)
@@ -390,6 +601,7 @@ mainSteps:
             --pause-milliseconds '{{PauseMilliseconds}}' \
             --duration-seconds '{{DurationSeconds}}' \
             --replica-scope '{{ReplicaScope}}' \
+            --target-shard-id '{{TargetShardId}}' \
             --use-tls '{{UseTls}}'
 
   - action: aws:runShellScript
@@ -411,6 +623,7 @@ mainSteps:
             --pause-milliseconds '{{PauseMilliseconds}}' \
             --duration-seconds '{{DurationSeconds}}' \
             --replica-scope '{{ReplicaScope}}' \
+            --target-shard-id '{{TargetShardId}}' \
             --use-tls '{{UseTls}}'
 
   - action: aws:runShellScript
@@ -433,6 +646,7 @@ mainSteps:
             --pause-milliseconds '{{PauseMilliseconds}}' \
             --duration-seconds '{{DurationSeconds}}' \
             --replica-scope '{{ReplicaScope}}' \
+            --target-shard-id '{{TargetShardId}}' \
             --use-tls '{{UseTls}}'
           rc=$?
           rm -f /tmp/fis/ec_replication_stall.py

@@ -26,31 +26,48 @@
 ### 一、目标缓存集群
 
 1. 目标是**节点型**（non-serverless）的 ElastiCache 复制组，引擎为 **Valkey** 或 **Redis OSS**。Serverless 不支持：`client pause` 属于 ElastiCache 对 serverless 缓存禁用的命令。
-2. 目标运行在**集群模式关闭**（cluster mode disabled，即单分片、一主一或多从）。**本版模板不支持集群模式开启**——见下方限制说明。
+2. **集群模式关闭与集群模式开启都支持。** 集群模式开启时，首次运行请把 `TargetShardId` 设成单个分片——见下方「分片集群上的爆炸半径」。
 3. 该复制组**至少有一个副本**，且 `Status` 为 `available`。副本跨可用区时，实验与真实的 AZ 间网络事件最接近。
 4. 集群**未启用** auth token 或 RBAC 认证。本文档不带凭证连接；若缓存返回 `NOAUTH` 或 `WRONGPASS`，脚本会以明确的错误信息退出。如果必须针对带认证的集群运行，需要自行扩展文档，从 AWS Secrets Manager 读取令牌。
-5. 如果复制组启用了**传输加密**，需要把文档参数 `UseTls` 设为 `true`。
+5. 如果复制组启用了**传输加密**，需要把文档参数 `UseTls` 设为 `true`。在集群模式开启时这还额外要求实例配置文件具备 `elasticache:DescribeCacheClusters`——因为 `CLUSTER SHARDS` 返回的节点端点是 IP 地址，而 TLS 证书无法针对 IP 校验。文档会从 API 解析节点 DNS 名，若在 `UseTls=true` 时只能拿到 IP，会**失败即关闭并给出明确错误**。
 
-> ### 限制：暂不支持集群模式开启（cluster mode enabled）
+> ### 两种集群模式的发现路径
 >
-> 本模板通过 `DescribeReplicationGroups` 的两个字段发现目标，而 AWS API 参考明确
-> 说明这两个字段**仅在集群模式关闭的复制组上才填充**：
+> AWS API 参考明确说明，`DescribeReplicationGroups` 的两个字段**仅在集群模式关闭的
+> 复制组上才填充**：
 >
 > - `NodeGroupMember.CurrentRole` —— "This member is only applicable for Valkey
 >   or Redis OSS (cluster mode disabled) replication groups."
 > - `NodeGroupMember.ReadEndpoint` —— "The read endpoint is only applicable on
 >   Valkey or Redis OSS (cluster mode disabled) clusters."
 >
-> 因此在集群模式开启的复制组上，角色解析步骤找不到任何可以证明为副本的节点，实验
-> 会在**注入任何东西之前停止**，报 `ERROR: no node with CurrentRole 'replica' was
-> found`。这是失败即关闭的设计在正常工作、而不是静默误伤——但实验确实跑不起来。
+> 这一点已在一个真实的 3 分片集群模式开启复制组上核实：每个成员返回的
+> `CurrentRole` 与 `ReadEndpoint` 都是 `null`，而 `NodeGroupId` 与 `Slots` 有值。
 >
-> **这是发现路径的限制，不是故障本身的限制。** `CLIENT PAUSE` 在集群模式下同样是
-> 节点级的：pause 状态存放在单进程的 `server` 结构里，引擎中唯一与集群相关的用法是
-> 节点在手动 failover 时暂停自己。后续版本可以这样支持集群模式：改用配置端点上的
-> `CLUSTER SHARDS` 来发现角色与节点端点（`cluster shards` 与 `cluster nodes` 都不在
-> ElastiCache 的受限命令清单里），并增加一个只针对单个分片的参数，让其余分片保持可用
-> 作为实验内的对照组。
+> 因此文档使用两条发现路径：
+>
+> | 模式 | 角色与端点来源 | 分片标识来源 |
+> |---|---|---|
+> | 集群模式关闭 | `NodeGroupMember.CurrentRole` / `ReadEndpoint` | `NodeGroupId` |
+> | 集群模式开启 | 配置端点上的 `CLUSTER SHARDS` | 由哈希槽经 `NodeGroups[].Slots` 反查 `NodeGroupId` |
+>
+> `cluster shards` 与 `cluster nodes` 都不在 ElastiCache 的受限命令清单里。两种模式下
+> 被选中的节点都还必须在自己的 `INFO replication` 里报告 `role:slave` 才会被注入，
+> 即要求控制面视角与数据面视角一致。
+>
+> **故障本身与模式无关。** `CLIENT PAUSE` 在集群模式下同样是节点级的：pause 状态存放在
+> 单进程的 `server` 结构里，引擎中唯一与集群相关的用法是节点在手动 failover 时暂停
+> 自己。暂停某一个分片的副本不会影响其他分片。
+
+### 分片集群上的爆炸半径
+
+`ReplicaScope` 是**按分片**计数的，所以在「每分片一个副本」这种常见拓扑上，
+`ONE_PER_SHARD` 与 `ALL` 解析出的集合完全相同——即集群里的全部副本。在
+3 shards × 2 nodes 上这意味着整个副本层同时停滞，实验也就没有任何未受影响的分片可供
+对比。
+
+**用 `TargetShardId` 只注入一个分片，其余分片留作实验内对照组。** 无论是否定向，
+观测都会覆盖**全部**分片的主节点——正是为了让未被定向的分片充当这个对照。
 
 ### 二、注入机 EC2 实例
 
@@ -60,7 +77,7 @@
 6. 该实例是**受管实例**：SSM Agent 已安装并在运行，实例在 Systems Manager 的 Fleet Manager 中可见。
 7. 该实例的实例配置文件（instance profile）**同时具备**：
    - AWS 托管策略 `AmazonSSMManagedInstanceCore`，以及
-   - `elasticache:DescribeReplicationGroups`——文档用它在运行时解析哪个节点当前是副本。示例策略见 `elasticache-replication-stall-injector-instance-policy.json`。
+   - `elasticache:DescribeReplicationGroups`（文档用它读取拓扑）**以及** `elasticache:DescribeCacheClusters`（集群模式开启时用它解析节点 DNS 名）。示例策略见 `elasticache-replication-stall-injector-instance-policy.json`。
 8. 该实例所在子网能够访问 **ElastiCache API 端点**——通过 NAT 网关，或者通过 `com.amazonaws.<region>.elasticache` 的接口型 VPC 端点。缺少这条路径时，角色解析步骤会失败，实验会在注入任何东西之前停止。
 9. 实例上有 `python3` 和 `aws` CLI。Amazon Linux 2023 与 Amazon Linux 2 都自带这两者。**不需要任何 pip 包，也不需要访问 PyPI 的外网**：内嵌脚本仅用 Python 标准库实现缓存的通信协议。
 10. 实例同时打了 `FIS-Ready=True` **和** `FIS-Role=ElastiCacheInjector` 两个标签。第二个标签用于避免把命令误发给那些只带着本仓库通用 `FIS-Ready` 标签的无关实例。
@@ -132,6 +149,38 @@ slave0(offset=0, lag=0s, state=wait_bgsave)   <- 链路断开，进入全量重�
 
 另外，`RestoreAndVerify` 步骤在设计上就是「尽力而为」。同一次运行中 `CLIENT UNPAUSE` 因副本过载而超时，文档记录了告警并继续执行。恢复并不依赖这次调用——暂停会自行到期。
 
+## 验证记录（Validation）
+
+已在 `ap-northeast-1` 的两个真实复制组上端到端验证，均为 `cache.t4g.micro` 上的
+**Valkey 8.2**。
+
+**集群模式关闭**（主节点在 `ap-northeast-1a`、副本在 `ap-northeast-1c`）。在有写流量的
+情况下，副本已确认的 offset 冻结而主节点持续推进，链路始终 `online`：
+
+```
+master_repl_offset=109213724521  slave0(offset=109021347493, lag=3s,  state=online)
+master_repl_offset=109218366559  slave0(offset=109021347493, lag=28s, state=online)
+```
+
+**集群模式开启**（3 shards × 2 nodes）。`TargetShardId=0002`、`PauseMode=WRITE`、
+25 秒暂停、集群感知的写负载铺满所有槽位。只有被定向的分片停滞，另两个分片全程跟随
+各自主节点，充当对照组：
+
+| 时刻 | 分片 0001 副本 | **分片 0002 副本** | 分片 0003 副本 |
+|---|---|---|---|
+| +6s | 82952549 | **66163374** | 83108186 |
+| +12s | 104020083 | **66163374** | 104258492 |
+| +18s | 124803283 | **66163374** | 125022580 |
+| +24s | 145465515 | **66163374** | 145678460 |
+| +30s | 166522453 | 166227863（已追平） | 166731140 |
+
+暂停到期后，分片 0002 的副本应用了约 100 MB 积压，恢复到
+`master_link_status=up`、`master_sync_in_progress=0`。
+
+另外还验证了：幂等闸门会拒绝第二次 `validate`；不存在的 `TargetShardId` 会在注入任何
+东西之前被拒绝；**没有写流量**的运行正确地显示无复制差距——这正是「必须有写流量」被
+列为硬性前提的原因。
+
 ## 停止条件（Stop Conditions）
 
 本实验没有定义特定的停止条件。它会持续运行，直到被手动停止，或者暂停到期且目标实例上的 RestoreAndVerify 步骤执行完毕。
@@ -164,5 +213,5 @@ slave0(offset=0, lag=0s, state=wait_bgsave)   <- 链路断开，进入全量重�
 | `elasticache-replication-stall-template.json` | FIS 实验模板 |
 | `elasticache-replication-stall-ssm-template.yaml` | 执行注入的 SSM Command 文档 |
 | `elasticache-replication-stall-iam-policy.json` | FIS 实验角色的策略 |
-| `elasticache-replication-stall-injector-instance-policy.json` | 注入机实例配置文件的策略 |
+| `elasticache-replication-stall-injector-instance-policy.json` | 注入机实例配置文件的策略（`DescribeReplicationGroups` + `DescribeCacheClusters`） |
 | `fis-iam-trust-relationship.json` | FIS 实验角色的信任关系 |

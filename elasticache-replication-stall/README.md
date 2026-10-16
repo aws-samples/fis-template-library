@@ -27,37 +27,53 @@ Before running this experiment, ensure that:
 ### 1. Target cache cluster
 
 1. The target is a **node-based** ElastiCache replication group running **Valkey** or **Redis OSS**. Serverless caches are not supported: `client pause` is on the list of commands ElastiCache makes unavailable for serverless caches.
-2. The target runs in **cluster mode disabled** (a single shard with one primary and one or more replicas). **Cluster mode enabled is not supported by this version of the template** — see the limitation below.
+2. **Both cluster mode disabled and cluster mode enabled are supported.** On a cluster-mode-enabled group, set `TargetShardId` to one shard for a first run — see "Blast radius on a sharded cluster" below.
 3. The replication group has **at least one replica**, and its `Status` is `available`. A cross-Availability-Zone replica makes the experiment closest to a real inter-AZ network event.
 4. The cluster does **not** require an auth token or RBAC authentication. This document connects without credentials and will exit with a clear error if the cache replies `NOAUTH` or `WRONGPASS`. Extend the document to read a token from AWS Secrets Manager if you need authenticated clusters.
-5. If the replication group has **encryption in transit** enabled, set the `UseTls` document parameter to `true`.
+5. If the replication group has **encryption in transit** enabled, set the `UseTls` document parameter to `true`. On a cluster-mode-enabled group this additionally requires `elasticache:DescribeCacheClusters` on the instance profile, because `CLUSTER SHARDS` reports node endpoints as IP addresses and a TLS certificate cannot be validated against an IP. The document resolves node DNS names from the API and **fails closed with an explicit error** if it can only obtain an IP while `UseTls` is true.
 
-> ### Limitation: cluster mode enabled is not yet supported
+> ### How the two cluster modes are discovered
 >
-> This template discovers its target from two `DescribeReplicationGroups` fields,
-> and the AWS API reference states that both are populated only for cluster mode
-> disabled replication groups:
+> The AWS API reference states that two `DescribeReplicationGroups` fields are
+> populated only for cluster mode disabled replication groups:
 >
 > - `NodeGroupMember.CurrentRole` — "This member is only applicable for Valkey or
 >   Redis OSS (cluster mode disabled) replication groups."
 > - `NodeGroupMember.ReadEndpoint` — "The read endpoint is only applicable on
 >   Valkey or Redis OSS (cluster mode disabled) clusters."
 >
-> On a cluster-mode-enabled replication group the role-resolution step therefore
-> finds no node it can prove to be a replica, and the experiment **stops before
-> injecting anything** with `ERROR: no node with CurrentRole 'replica' was found`.
-> That is the fail-closed behaviour working as intended, not a silent
-> misfire — but the experiment cannot run.
+> This was confirmed against a live 3-shard cluster-mode-enabled group, where
+> every member returned `CurrentRole: null` and `ReadEndpoint: null`, while
+> `NodeGroupId` and `Slots` were populated.
 >
-> This is a discovery limitation, not a limitation of the fault itself.
-> `CLIENT PAUSE` is node-local in cluster mode too: the pause state lives in the
-> per-process `server` struct, and the only cluster-related use of it in the
-> engine is a node pausing itself during a manual failover. A future revision can
-> support cluster mode enabled by discovering roles and node endpoints from
-> `CLUSTER SHARDS` against the configuration endpoint — neither `cluster shards`
-> nor `cluster nodes` appears on the ElastiCache restricted-command list — and by
-> adding a parameter to target a single shard so that the remaining shards stay
-> available as in-experiment controls.
+> The document therefore uses two discovery paths:
+>
+> | Mode | Roles and endpoints from | Shard identity from |
+> |---|---|---|
+> | Cluster mode disabled | `NodeGroupMember.CurrentRole` / `ReadEndpoint` | `NodeGroupId` |
+> | Cluster mode enabled | `CLUSTER SHARDS` against the configuration endpoint | hash slot mapped back to `NodeGroupId` via `NodeGroups[].Slots` |
+>
+> Neither `cluster shards` nor `cluster nodes` appears on the ElastiCache
+> restricted-command list. In both modes the selected node must additionally
+> report `role:slave` over its own `INFO replication` before it is targeted, so
+> the control-plane view and the data-plane view have to agree.
+>
+> The fault itself is mode-independent. `CLIENT PAUSE` is node-local in cluster
+> mode too: the pause state lives in the per-process `server` struct, and the
+> only cluster-related use of it in the engine is a node pausing itself during a
+> manual failover. Pausing one shard's replica does not affect the other shards.
+
+### Blast radius on a sharded cluster
+
+`ReplicaScope` counts replicas **per shard**, so on the common topology of one
+replica per shard, `ONE_PER_SHARD` and `ALL` resolve to exactly the same set —
+every replica in the cluster. On a 3 shard × 2 node group that means the entire
+replica tier stalls at once, and the experiment has no unaffected shard left to
+compare against.
+
+Use `TargetShardId` to inject into one shard and keep the rest as in-experiment
+controls. Observation always covers **every** shard's primary regardless of
+targeting, precisely so the untargeted shards can serve as that control.
 
 ### 2. Injector EC2 instance
 
@@ -67,7 +83,7 @@ The fault is injected over the cache data plane, so it must be issued from insid
 6. The instance is a **managed instance**: SSM Agent is installed and running, and the instance appears under Fleet Manager in Systems Manager.
 7. The instance profile has **both**:
    - the `AmazonSSMManagedInstanceCore` AWS managed policy, and
-   - `elasticache:DescribeReplicationGroups`, which the document uses to resolve which node is currently a replica. A sample policy is provided in `elasticache-replication-stall-injector-instance-policy.json`.
+   - `elasticache:DescribeReplicationGroups`, which the document uses to read the topology, **and** `elasticache:DescribeCacheClusters`, which it uses on cluster-mode-enabled groups to resolve node DNS names. A sample policy is provided in `elasticache-replication-stall-injector-instance-policy.json`.
 8. The instance's subnet can reach the **ElastiCache API endpoint** — through a NAT gateway, or through an interface VPC endpoint for `com.amazonaws.<region>.elasticache`. Without this the role-resolution step fails and the experiment stops before injecting anything.
 9. `python3` and the `aws` CLI are present on the instance. Both ship with Amazon Linux 2023 and Amazon Linux 2. **No pip packages and no internet access to PyPI are required**: the embedded script speaks the cache wire protocol using only the Python standard library.
 10. The instance is tagged `FIS-Ready=True` **and** `FIS-Role=ElastiCacheInjector`. The second tag keeps the experiment from sending the command to unrelated instances that merely carry the repository's common `FIS-Ready` tag.
@@ -139,6 +155,41 @@ The replica's acknowledged offset stayed frozen while the primary advanced, the 
 
 Note also that the `RestoreAndVerify` step is best-effort by design. In the same run, `CLIENT UNPAUSE` timed out because the replica was too saturated to answer, and the document logged a warning and continued. Recovery does not depend on that call: the pause expires on its own.
 
+## Validation
+
+Validated end to end against two live replication groups in `ap-northeast-1`,
+both running **Valkey 8.2** on `cache.t4g.micro`.
+
+**Cluster mode disabled** (1 primary in `ap-northeast-1a`, 1 replica in
+`ap-northeast-1c`). With write traffic present, the replica's acknowledged
+offset froze while the primary advanced and the link stayed `online`:
+
+```
+master_repl_offset=109213724521  slave0(offset=109021347493, lag=3s,  state=online)
+master_repl_offset=109218366559  slave0(offset=109021347493, lag=28s, state=online)
+```
+
+**Cluster mode enabled** (3 shards x 2 nodes). `TargetShardId=0002`,
+`PauseMode=WRITE`, 25-second pause, cluster-aware write load spread across all
+slots. Only the targeted shard stalled; the other two tracked their primaries
+throughout and acted as controls:
+
+| elapsed | shard 0001 replica | **shard 0002 replica** | shard 0003 replica |
+|---|---|---|---|
+| +6s | 82952549 | **66163374** | 83108186 |
+| +12s | 104020083 | **66163374** | 104258492 |
+| +18s | 124803283 | **66163374** | 125022580 |
+| +24s | 145465515 | **66163374** | 145678460 |
+| +30s | 166522453 | 166227863 (caught up) | 166731140 |
+
+After the pause expired, shard 0002's replica applied roughly 100 MB of backlog
+and returned to `master_link_status=up` with `master_sync_in_progress=0`.
+
+Also verified: the idempotency guard refuses a second `validate`; an unknown
+`TargetShardId` is rejected before anything is injected; a run **without** write
+traffic correctly shows no replication gap, which is why flowing writes are an
+explicit prerequisite.
+
 ## Stop Conditions
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the pause expires and the RestoreAndVerify step has completed on the targeted instance.
@@ -173,5 +224,5 @@ You can import the json experiment template into your AWS account via cli or aws
 | `elasticache-replication-stall-template.json` | FIS experiment template |
 | `elasticache-replication-stall-ssm-template.yaml` | SSM Command document that performs the injection |
 | `elasticache-replication-stall-iam-policy.json` | Policy for the FIS experiment role |
-| `elasticache-replication-stall-injector-instance-policy.json` | Policy for the injector instance profile |
+| `elasticache-replication-stall-injector-instance-policy.json` | Policy for the injector instance profile (`DescribeReplicationGroups` + `DescribeCacheClusters`) |
 | `fis-iam-trust-relationship.json` | Trust relationship for the FIS experiment role |
