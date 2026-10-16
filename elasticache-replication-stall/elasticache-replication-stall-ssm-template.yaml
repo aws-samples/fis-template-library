@@ -1,0 +1,439 @@
+schemaVersion: "2.2"
+description: >-
+  Stall Amazon ElastiCache (Valkey or Redis OSS) replication by issuing CLIENT PAUSE
+  on replica nodes. The replication stream stops being applied while the replication
+  link stays up, reproducing a replica that cannot keep up with its primary. This is
+  an SSM Command document and must run on an EC2 instance inside the cache VPC,
+  because the fault is injected over the cache data plane (port 6379) rather than
+  through a control-plane API.
+
+parameters:
+  ReplicationGroupId:
+    type: String
+    description: >-
+      (Required) Id of the target ElastiCache replication group. Node-based clusters
+      only - CLIENT PAUSE is unavailable on serverless caches.
+    allowedPattern: "^[a-zA-Z][a-zA-Z0-9-]{0,49}$"
+  PauseMode:
+    type: String
+    default: WRITE
+    allowedValues:
+      - WRITE
+      - ALL
+    description: >-
+      WRITE stalls the replication stream while the replica still serves reads.
+      ALL additionally blocks reads on that replica. Use WRITE when your application
+      reads from replicas, otherwise the experiment cannot tell a replication stall
+      apart from a read node being taken out of service.
+  PauseMilliseconds:
+    type: String
+    default: "30000"
+    description: >-
+      Pause duration in milliseconds. The pause expires on its own, so the fault is
+      self-healing even if the experiment is interrupted.
+    allowedPattern: "^([1-9][0-9]{2,6})$"
+  DurationSeconds:
+    type: String
+    default: "60"
+    description: >-
+      How long this document keeps observing after injection. Set it at or above
+      PauseMilliseconds / 1000 so that recovery is captured in the output.
+    allowedPattern: "^([1-9][0-9]{0,3})$"
+  Region:
+    type: String
+    default: "{{global:REGION}}"
+    description: Region of the target replication group.
+    allowedPattern: "^[a-z0-9-]{1,30}$"
+  UseTls:
+    type: String
+    default: "false"
+    allowedValues:
+      - "true"
+      - "false"
+    description: Set to true when the replication group has encryption in transit enabled.
+  ReplicaScope:
+    type: String
+    default: ONE_PER_SHARD
+    allowedValues:
+      - ONE_PER_SHARD
+      - ALL
+    description: >-
+      ONE_PER_SHARD pauses a single replica per shard. ALL pauses every replica, which
+      combined with PauseMode=ALL removes all read replicas from service at once.
+
+mainSteps:
+  - action: aws:runShellScript
+    name: ValidatePrerequisites
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: 180
+      runCommand:
+        - |
+          #!/bin/bash
+          set -uo pipefail
+
+          command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required but not installed."; exit 1; }
+          command -v aws >/dev/null 2>&1 || { echo "ERROR: the AWS CLI is required but not installed."; exit 1; }
+
+          mkdir -p /tmp/fis
+          cat > /tmp/fis/ec_replication_stall.py <<'FISPYEOF'
+          #!/usr/bin/env python3
+          """Stall ElastiCache replication via CLIENT PAUSE on replica nodes.
+
+          Standard library only: the instance needs no pip packages and no route to
+          PyPI. It does need a network path to the cache nodes on the cache port and
+          to the ElastiCache API endpoint, which the AWS CLI uses to resolve roles.
+
+          Safety properties:
+            * Node roles are resolved from the ElastiCache API field CurrentRole at
+              run time. A node whose role cannot be proven to be "replica" is
+              SKIPPED, never paused - pausing a primary would be a far larger fault.
+            * CLIENT PAUSE expires on its own, so the fault self-heals even if the
+              experiment is interrupted. CLIENT UNPAUSE is issued as a safety net.
+          """
+
+          import argparse
+          import json
+          import os
+          import socket
+          import ssl
+          import subprocess
+          import sys
+          import time
+
+          STATE = "/tmp/fis/ec_replication_stall_state.json"
+
+
+          def log(msg):
+              print(time.strftime("[%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "] " + str(msg), flush=True)
+
+
+          def read_reply(fh):
+              line = fh.readline()
+              if not line:
+                  raise IOError("connection closed by server")
+              prefix, body = line[:1], line[1:-2]
+              if prefix == b"+":
+                  return body.decode()
+              if prefix == b"-":
+                  raise RuntimeError(body.decode())
+              if prefix == b":":
+                  return int(body)
+              if prefix == b"$":
+                  length = int(body)
+                  return None if length == -1 else fh.read(length + 2)[:-2].decode()
+              if prefix == b"*":
+                  count = int(body)
+                  return None if count == -1 else [read_reply(fh) for _ in range(count)]
+              raise RuntimeError("unexpected RESP prefix %r" % prefix)
+
+
+          def send(host, port, use_tls, *args, **kwargs):
+              timeout = kwargs.get("timeout", 5.0)
+              payload = ("*%d" % len(args)).encode() + b"\r\n"
+              for arg in args:
+                  raw = str(arg).encode()
+                  payload += b"$" + str(len(raw)).encode() + b"\r\n" + raw + b"\r\n"
+              sock = socket.create_connection((host, int(port)), timeout=timeout)
+              try:
+                  if use_tls:
+                      sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+                  sock.sendall(payload)
+                  return read_reply(sock.makefile("rb"))
+              except RuntimeError as exc:
+                  text = str(exc)
+                  if "NOAUTH" in text or "WRONGPASS" in text:
+                      raise SystemExit(
+                          "ERROR: the cache requires authentication (auth token or RBAC). "
+                          "This document does not support authenticated clusters. Run the "
+                          "experiment against a cluster without an auth token, or extend "
+                          "this document to read the token from AWS Secrets Manager.")
+                  raise
+              finally:
+                  try:
+                      sock.close()
+                  except Exception:
+                      pass
+
+
+          def info_replication(host, port, use_tls, timeout=5.0):
+              out = {"replicas": {}}
+              raw = send(host, port, use_tls, "INFO", "replication", timeout=timeout)
+              for line in (raw or "").splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#") or ":" not in line:
+                      continue
+                  key, value = line.split(":", 1)
+                  if key.startswith("slave") and key[5:].isdigit():
+                      out["replicas"][key] = dict(
+                          kv.split("=", 1) for kv in value.split(",") if "=" in kv)
+                  else:
+                      out[key] = value
+              return out
+
+
+          def resolve(rg_id, region, scope):
+              cli = ["aws", "elasticache", "describe-replication-groups",
+                     "--replication-group-id", rg_id, "--region", region,
+                     "--output", "json", "--no-cli-pager"]
+              try:
+                  raw = subprocess.check_output(cli, stderr=subprocess.STDOUT, timeout=90)
+              except FileNotFoundError:
+                  raise SystemExit("ERROR: the AWS CLI is not installed on this instance.")
+              except subprocess.CalledProcessError as exc:
+                  raise SystemExit(
+                      "ERROR: describe-replication-groups failed. The instance profile needs "
+                      "elasticache:DescribeReplicationGroups, and this subnet needs a route to "
+                      "the ElastiCache API endpoint (a NAT gateway, or an interface VPC "
+                      "endpoint for com.amazonaws." + region + ".elasticache).\n"
+                      + exc.output.decode(errors="replace"))
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(
+                      "ERROR: describe-replication-groups timed out. This subnet most likely "
+                      "has no route to the ElastiCache API endpoint.")
+
+              groups = json.loads(raw).get("ReplicationGroups") or []
+              if not groups:
+                  raise SystemExit("ERROR: replication group %r was not found." % rg_id)
+              group = groups[0]
+              if group.get("Status") != "available":
+                  raise SystemExit("ERROR: replication group status is %r, expected 'available'."
+                                   % group.get("Status"))
+
+              replicas, primaries = [], []
+              for node_group in group.get("NodeGroups") or []:
+                  shard = []
+                  for member in node_group.get("NodeGroupMembers") or []:
+                      endpoint = member.get("ReadEndpoint") or {}
+                      node = {"shard": node_group.get("NodeGroupId"),
+                              "id": member.get("CacheClusterId"),
+                              "az": member.get("PreferredAvailabilityZone"),
+                              "role": member.get("CurrentRole"),
+                              "host": endpoint.get("Address"),
+                              "port": endpoint.get("Port")}
+                      role = (member.get("CurrentRole") or "").lower()
+                      if role == "primary":
+                          primaries.append(node)
+                          continue
+                      if role != "replica":
+                          log("WARNING: skipping %s - CurrentRole is %r. Refusing to pause a "
+                              "node that cannot be proven to be a replica."
+                              % (node["id"], member.get("CurrentRole")))
+                          continue
+                      if not node["host"]:
+                          log("WARNING: skipping %s - no ReadEndpoint was returned." % node["id"])
+                          continue
+                      shard.append(node)
+                  replicas.extend(shard[:1] if scope == "ONE_PER_SHARD" else shard)
+
+              if not replicas:
+                  raise SystemExit(
+                      "ERROR: no node with CurrentRole 'replica' was found for %r. This "
+                      "experiment requires at least one replica." % rg_id)
+              return replicas, primaries
+
+
+          def primary_view(primaries, use_tls):
+              """Primary-side INFO replication. This is the authoritative view while a
+              replica is paused, because PauseMode=ALL also blocks INFO on the replica."""
+              out = {}
+              for node in primaries:
+                  if not node.get("host"):
+                      continue
+                  try:
+                      info = info_replication(node["host"], node["port"], use_tls)
+                      out[node["id"]] = {
+                          "master_repl_offset": info.get("master_repl_offset"),
+                          "connected_slaves": info.get("connected_slaves"),
+                          "replicas": info.get("replicas")}
+                  except Exception as exc:
+                      out[node["id"]] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+              return out
+
+
+          def action_validate(args):
+              if os.path.exists(STATE):
+                  raise SystemExit(
+                      "ERROR: %s already exists, so another run of this experiment is still in "
+                      "flight on this instance. Remove the file only after confirming that no "
+                      "pause is active." % STATE)
+
+              replicas, primaries = resolve(args.replication_group_id, args.region, args.replica_scope)
+              log("Resolved %d replica target(s) and %d primary node(s)."
+                  % (len(replicas), len(primaries)))
+              for node in replicas:
+                  log("  replica target: %s (shard=%s, az=%s) at %s:%s"
+                      % (node["id"], node["shard"], node["az"], node["host"], node["port"]))
+
+              for node in replicas:
+                  info = info_replication(node["host"], node["port"], args.use_tls)
+                  if info.get("role") != "slave":
+                      raise SystemExit(
+                          "ERROR: %s reports role=%r over the data plane while the API called it "
+                          "a replica. Refusing to continue." % (node["id"], info.get("role")))
+                  log("  %s role=slave master_link_status=%s"
+                      % (node["id"], info.get("master_link_status")))
+                  reply = send(node["host"], node["port"], args.use_tls,
+                               "CLIENT", "PAUSE", 1, args.pause_mode)
+                  log("  %s CLIENT PAUSE 1 %s returned %s"
+                      % (node["id"], args.pause_mode, reply))
+
+              os.makedirs(os.path.dirname(STATE), exist_ok=True)
+              with open(STATE, "w") as fh:
+                  json.dump({"replicas": replicas, "primaries": primaries,
+                             "created": time.time()}, fh, indent=2)
+              log("Prerequisites validated. State written to %s" % STATE)
+
+
+          def action_inject(args):
+              with open(STATE) as fh:
+                  state = json.load(fh)
+              replicas, primaries = state["replicas"], state["primaries"]
+
+              log("Primary-side view BEFORE injection:")
+              log(json.dumps(primary_view(primaries, args.use_tls), indent=2))
+
+              for node in replicas:
+                  reply = send(node["host"], node["port"], args.use_tls,
+                               "CLIENT", "PAUSE", args.pause_milliseconds, args.pause_mode)
+                  log("INJECTED: %s CLIENT PAUSE %s %s returned %s"
+                      % (node["id"], args.pause_milliseconds, args.pause_mode, reply))
+
+              interval = min(10, max(1, args.duration_seconds // 6))
+              deadline = time.time() + args.duration_seconds
+              while time.time() < deadline:
+                  time.sleep(interval)
+                  for cid, data in primary_view(primaries, args.use_tls).items():
+                      if "error" in data:
+                          log("  primary %s unreachable: %s" % (cid, data["error"]))
+                          continue
+                      detail = ", ".join(
+                          "%s(offset=%s,lag=%ss,state=%s)"
+                          % (k, v.get("offset"), v.get("lag"), v.get("state"))
+                          for k, v in sorted((data.get("replicas") or {}).items()))
+                      log("  primary %s master_repl_offset=%s  %s"
+                          % (cid, data.get("master_repl_offset"), detail))
+
+              log("Observation window finished. The pause expires on its own after %s ms."
+                  % args.pause_milliseconds)
+
+
+          def action_restore(args):
+              if not os.path.exists(STATE):
+                  log("No state file at %s - nothing to restore." % STATE)
+                  return
+              with open(STATE) as fh:
+                  state = json.load(fh)
+              replicas, primaries = state["replicas"], state["primaries"]
+
+              for node in replicas:
+                  try:
+                      reply = send(node["host"], node["port"], args.use_tls, "CLIENT", "UNPAUSE")
+                      log("CLIENT UNPAUSE on %s returned %s" % (node["id"], reply))
+                  except Exception as exc:
+                      log("WARNING: CLIENT UNPAUSE on %s failed (%s: %s). The pause still "
+                          "expires on its own." % (node["id"], type(exc).__name__, exc))
+
+              for node in replicas:
+                  try:
+                      info = info_replication(node["host"], node["port"], args.use_tls, timeout=10.0)
+                      log("POST-CHECK %s master_link_status=%s master_sync_in_progress=%s "
+                          "slave_repl_offset=%s"
+                          % (node["id"], info.get("master_link_status"),
+                             info.get("master_sync_in_progress"), info.get("slave_repl_offset")))
+                  except Exception as exc:
+                      log("WARNING: post-check on %s failed (%s: %s). The replica may still be "
+                          "applying the backlog it accumulated while paused."
+                          % (node["id"], type(exc).__name__, exc))
+
+              log("Primary-side view AFTER restore:")
+              log(json.dumps(primary_view(primaries, args.use_tls), indent=2))
+              os.remove(STATE)
+              log("State file removed.")
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("action", choices=["validate", "inject", "restore"])
+              parser.add_argument("--replication-group-id", required=True)
+              parser.add_argument("--region", required=True)
+              parser.add_argument("--pause-mode", default="WRITE", choices=["WRITE", "ALL"])
+              parser.add_argument("--pause-milliseconds", type=int, default=30000)
+              parser.add_argument("--duration-seconds", type=int, default=60)
+              parser.add_argument("--replica-scope", default="ONE_PER_SHARD",
+                                  choices=["ONE_PER_SHARD", "ALL"])
+              parser.add_argument("--use-tls", default="false")
+              args = parser.parse_args()
+              args.use_tls = str(args.use_tls).lower() == "true"
+              log("action=%s replication_group=%s region=%s mode=%s pause_ms=%s duration=%s "
+                  "scope=%s tls=%s"
+                  % (args.action, args.replication_group_id, args.region, args.pause_mode,
+                     args.pause_milliseconds, args.duration_seconds, args.replica_scope,
+                     args.use_tls))
+              {"validate": action_validate,
+               "inject": action_inject,
+               "restore": action_restore}[args.action](args)
+
+
+          if __name__ == "__main__":
+              main()
+          FISPYEOF
+          chmod 700 /tmp/fis/ec_replication_stall.py
+
+          python3 /tmp/fis/ec_replication_stall.py validate \
+            --replication-group-id '{{ReplicationGroupId}}' \
+            --region '{{Region}}' \
+            --pause-mode '{{PauseMode}}' \
+            --pause-milliseconds '{{PauseMilliseconds}}' \
+            --duration-seconds '{{DurationSeconds}}' \
+            --replica-scope '{{ReplicaScope}}' \
+            --use-tls '{{UseTls}}'
+
+  - action: aws:runShellScript
+    name: InjectReplicationStall
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: 3900
+      runCommand:
+        - |
+          #!/bin/bash
+          set -uo pipefail
+          python3 /tmp/fis/ec_replication_stall.py inject \
+            --replication-group-id '{{ReplicationGroupId}}' \
+            --region '{{Region}}' \
+            --pause-mode '{{PauseMode}}' \
+            --pause-milliseconds '{{PauseMilliseconds}}' \
+            --duration-seconds '{{DurationSeconds}}' \
+            --replica-scope '{{ReplicaScope}}' \
+            --use-tls '{{UseTls}}'
+
+  - action: aws:runShellScript
+    name: RestoreAndVerify
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    isEnd: true
+    inputs:
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+          set -uo pipefail
+          python3 /tmp/fis/ec_replication_stall.py restore \
+            --replication-group-id '{{ReplicationGroupId}}' \
+            --region '{{Region}}' \
+            --pause-mode '{{PauseMode}}' \
+            --pause-milliseconds '{{PauseMilliseconds}}' \
+            --duration-seconds '{{DurationSeconds}}' \
+            --replica-scope '{{ReplicaScope}}' \
+            --use-tls '{{UseTls}}'
+          rc=$?
+          rm -f /tmp/fis/ec_replication_stall.py
+          exit $rc

@@ -1,0 +1,149 @@
+# AWS Fault Injection Service Experiment: ElastiCache Replication Stall
+
+This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
+
+> 中文说明请见 [README.zh-CN.md](README.zh-CN.md).
+
+THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Hypothesis
+
+When a read replica stops applying the replication stream while its replication link stays up, the application continues to serve reads from that replica with unchanged latency, serves writes normally against the primary, and alerting detects the growing replication gap rather than reporting the cluster as healthy.
+
+Two failure modes this experiment is designed to surface:
+
+1. **Stale reads that look healthy.** The replica keeps answering reads at normal latency, but the data it returns is frozen at the moment the stall began. An application that treats "the replica responded quickly" as "the replica is current" will serve stale data without any error.
+2. **A monitoring blind spot.** While the stream is stalled, the primary still reports `lag=0` for that replica in `INFO replication`, because that field measures how recently an acknowledgement arrived, not how far behind the replica is. Monitoring built on that field alone, or on `connected_slaves`, cannot see this fault. The gap is visible in `master_repl_offset` minus the replica's `offset` on the primary, and in the CloudWatch `ReplicationLag` metric.
+
+If the fault is sustained long enough that the backlog outgrows what the replica can hold, the replication link drops and the replica performs a full resynchronisation. That escalation is driven by the volume of accumulated backlog, which is approximately the write rate multiplied by the pause duration.
+
+## Prerequisites
+
+Before running this experiment, ensure that:
+
+### 1. Target cache cluster
+
+1. The target is a **node-based** ElastiCache replication group running **Valkey** or **Redis OSS**. Serverless caches are not supported: `client pause` is on the list of commands ElastiCache makes unavailable for serverless caches.
+2. The replication group has **at least one replica**, and its `Status` is `available`. A cross-Availability-Zone replica makes the experiment closest to a real inter-AZ network event.
+3. The cluster does **not** require an auth token or RBAC authentication. This document connects without credentials and will exit with a clear error if the cache replies `NOAUTH` or `WRONGPASS`. Extend the document to read a token from AWS Secrets Manager if you need authenticated clusters.
+4. If the replication group has **encryption in transit** enabled, set the `UseTls` document parameter to `true`.
+
+### 2. Injector EC2 instance
+
+The fault is injected over the cache data plane, so it must be issued from inside the VPC. SSM Automation's `aws:executeScript` runs in an AWS-managed sandbox with no VPC connectivity and therefore cannot reach a cache node, which is why this template uses `aws:ssm:send-command` against an instance you control.
+
+5. You have at least one **Linux** EC2 instance in the same VPC as the cache cluster, in a subnet with a network path to the cache nodes. The document is Linux-only: every step carries a `platformType: Linux` precondition.
+6. The instance is a **managed instance**: SSM Agent is installed and running, and the instance appears under Fleet Manager in Systems Manager.
+7. The instance profile has **both**:
+   - the `AmazonSSMManagedInstanceCore` AWS managed policy, and
+   - `elasticache:DescribeReplicationGroups`, which the document uses to resolve which node is currently a replica. A sample policy is provided in `elasticache-replication-stall-injector-instance-policy.json`.
+8. The instance's subnet can reach the **ElastiCache API endpoint** — through a NAT gateway, or through an interface VPC endpoint for `com.amazonaws.<region>.elasticache`. Without this the role-resolution step fails and the experiment stops before injecting anything.
+9. `python3` and the `aws` CLI are present on the instance. Both ship with Amazon Linux 2023 and Amazon Linux 2. **No pip packages and no internet access to PyPI are required**: the embedded script speaks the cache wire protocol using only the Python standard library.
+10. The instance is tagged `FIS-Ready=True` **and** `FIS-Role=ElastiCacheInjector`. The second tag keeps the experiment from sending the command to unrelated instances that merely carry the repository's common `FIS-Ready` tag.
+
+### 3. Network path from the injector to the cache
+
+11. The cache cluster's security group allows **inbound TCP on the cache port (6379 by default) from the injector instance's security group**. Without this rule the validation step fails on a connection timeout.
+
+### 4. IAM and the SSM document
+
+12. You have registered the SSM document in your account with the name `ElastiCacheReplicationStall`, from `elasticache-replication-stall-ssm-template.yaml`:
+
+    ```bash
+    aws ssm create-document \
+      --name ElastiCacheReplicationStall \
+      --document-type Command \
+      --document-format YAML \
+      --content file://elasticache-replication-stall-ssm-template.yaml
+    ```
+
+13. The IAM role referenced in the `roleArn` field of the experiment template exists, trusts `fis.amazonaws.com` (see `fis-iam-trust-relationship.json`) and carries the permissions in `elasticache-replication-stall-iam-policy.json`.
+14. You have replaced every placeholder in `elasticache-replication-stall-template.json`: `<YOUR REGION>`, `<YOUR AWS ACCOUNT>`, `<YOUR ROLE NAME>` and `<YOUR REPLICATION GROUP ID>`.
+
+### 5. Observability, before you inject
+
+15. A steady-state baseline has been captured for at least 10 minutes on `ReplicationLag`, `ReplicationBytes`, read latency and read error rate. Without a baseline you cannot tell the fault's effect from normal variation.
+16. Write traffic is flowing to the primary during the experiment. With no writes there is nothing for the replica to fall behind on, and the experiment will report no effect even though the injection succeeded.
+
+## How it works
+
+The experiment sends one SSM Command document to a single tagged injector instance. The document runs three steps.
+
+**ValidatePrerequisites** — writes the helper script to the instance, then:
+
+- calls `elasticache:DescribeReplicationGroups` and selects target nodes by the API's `CurrentRole` field. A node whose role is not exactly `replica` is skipped with a warning and never paused. This fails closed on purpose: pausing a primary would be a far larger fault than the one under test, and node names do not reliably indicate role after a failover.
+- connects to each candidate and confirms the node itself reports `role:slave`, so the API view and the data-plane view have to agree.
+- issues `CLIENT PAUSE 1 <mode>` as an availability probe. One millisecond has no measurable effect, but it proves the command is permitted on this cluster before the real injection.
+- refuses to start if a state file from an earlier run is still present on the instance.
+
+**InjectReplicationStall** — records the primary-side view, issues `CLIENT PAUSE <PauseMilliseconds> <PauseMode>` on each resolved replica, then samples the primary's `INFO replication` until `DurationSeconds` elapses, logging `master_repl_offset` alongside each replica's acknowledged `offset`, `lag` and `state`.
+
+Observation is taken from the **primary**, not the replica, because `PauseMode=ALL` also blocks `INFO` on the paused replica.
+
+**RestoreAndVerify** — issues `CLIENT UNPAUSE`, reports `master_link_status`, `master_sync_in_progress` and the replica's offset, prints the primary-side view again and removes the state file. `CLIENT PAUSE` expires on its own, so this step is a safety net rather than the primary recovery mechanism; the fault self-heals even if the experiment is interrupted or the instance becomes unreachable.
+
+### Choosing PauseMode
+
+| Your application | Use | Why |
+|---|---|---|
+| Reads from replicas | `WRITE` | Stalls the replication stream while the replica keeps serving reads, which is the condition you want to test. |
+| Reads only from the primary | `ALL` | Simpler, and no application read path touches the paused node. |
+
+Do not use `ALL` when the application reads from replicas: reads on that node are blocked for the whole pause, which mixes "replication fell behind" together with "a read node was removed from service" and makes the result impossible to attribute.
+
+### Controlling severity
+
+Severity is governed by the accumulated backlog, roughly the write rate multiplied by the pause duration. Start with a short `PauseMilliseconds` and increase it to walk from a stall that the application does not notice, through a replica that is reported as lagging, to a replication link that drops and resynchronises in full. Increase one variable at a time so each step stays attributable.
+
+Escalation can arrive sooner than expected on small node types. In a validation run on `cache.t4g.micro` with three writer threads at 1 KiB per value, a `PauseMode=WRITE` pause of only **20 seconds** produced this sequence on the primary:
+
+```
+master_repl_offset=109213724521  slave0(offset=109021347493, lag=3s,  state=online)
+master_repl_offset=109218366559  slave0(offset=109021347493, lag=28s, state=online)   <- acknowledged offset frozen
+...
+slave0(offset=0, lag=0s, state=wait_bgsave)   <- link dropped, full resynchronisation
+```
+
+The replica's acknowledged offset stayed frozen while the primary advanced, the link stayed `online` throughout the pause, and the backlog then grew past what the node could hold — `sync_full` incremented and the replica reached 1.45 GB behind before catching up. Size the pause against the node type and the write rate, not against the clock alone.
+
+Note also that the `RestoreAndVerify` step is best-effort by design. In the same run, `CLIENT UNPAUSE` timed out because the replica was too saturated to answer, and the document logged a warning and continued. Recovery does not depend on that call: the pause expires on its own.
+
+## Stop Conditions
+
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the pause expires and the RestoreAndVerify step has completed on the targeted instance.
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
+business metric requiring an immediate end of the fault injection. This 
+template makes no assumptions about your application and the relevant metrics 
+and does not include stop conditions by default.
+
+## Next Steps
+
+As you adapt this scenario to your needs, we recommend:
+
+1. Reviewing the tag names you use to ensure they fit your specific use case. This template deliberately requires two tags on the injector instance, `FIS-Ready=True` and `FIS-Role=ElastiCacheInjector`, so that the command is not sent to unrelated instances.
+2. Identifying business metrics tied to cached reads — for example cache hit ratio, read latency, and any correctness signal that would expose a stale read.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the replication stall. `ReplicationLag` is the primary signal. Do not build the alarm on the `lag` field of `INFO replication` or on `connected_slaves`: neither moves while the stream is stalled.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Running the experiment in a non-production environment first, and confirming there that `CLIENT PAUSE` is permitted on your cluster and engine version before scheduling it anywhere else.
+6. Extending the document to read an auth token from AWS Secrets Manager if your clusters use an auth token or RBAC.
+7. Pairing this experiment with `elasticache-az-power-interruption` for coverage of the abrupt failure mode. This template covers gradual degradation with the link intact; that one covers the node disappearing.
+
+## Import Experiment
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
+
+## Files in This Directory
+
+| File | Purpose |
+|---|---|
+| `README.md` | This document |
+| `README.zh-CN.md` | Chinese translation |
+| `AWSFIS.json` | Template version marker |
+| `elasticache-replication-stall-template.json` | FIS experiment template |
+| `elasticache-replication-stall-ssm-template.yaml` | SSM Command document that performs the injection |
+| `elasticache-replication-stall-iam-policy.json` | Policy for the FIS experiment role |
+| `elasticache-replication-stall-injector-instance-policy.json` | Policy for the injector instance profile |
+| `fis-iam-trust-relationship.json` | Trust relationship for the FIS experiment role |
