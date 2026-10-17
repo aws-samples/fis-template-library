@@ -22,8 +22,8 @@ Before running this experiment, ensure that:
 
 1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided.
 2. You have created the SSM Automation Document from the sample provided (sqs-queue-impairment-tag-based-automation.yaml)
-3. You have created the FIS Experiment Template from the sample provided (sqs-queue-impairment-tag-based-template.json)
-3. The SQS queue(s) you want to target have the "FIS-Ready":"True" tag and value
+3. You have created the FIS Experiment Template from the sample provided (sqs-queue-impairment-tag-based-experiment-template.json)
+4. The SQS queue(s) you want to target have the "FIS-Ready":"True" tag and value
 5. You have appropriate monitoring and observability in place to track the impact of the experiment.
 
 ## How it works
@@ -99,8 +99,8 @@ As you adapt this scenario to your needs, we recommend:
 2. Identifying business metrics tied to your SQS queue processing, such as application transaction rates.
 3. **Before running anything beyond a short test, add a stop condition** tied to a customer-impact alarm so the experiment aborts automatically if critical thresholds are breached (see [Stop Conditions](#stop-conditions) for how to choose the metric and an example alarm).
 4. Implementing appropriate circuit breakers in your application to handle SQS service impairments gracefully.
-6. Testing your application's recovery mechanisms to ensure they work as expected after the SQS service is restored.
-7. Documenting the findings from your experiment and updating your incident response procedures accordingly.
+5. Testing your application's recovery mechanisms to ensure they work as expected after the SQS service is restored.
+6. Documenting the findings from your experiment and updating your incident response procedures accordingly.
 
 ## Import Experiment
 
