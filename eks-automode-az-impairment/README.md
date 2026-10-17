@@ -27,7 +27,7 @@ EKS Auto Mode manages the underlying EC2 instances on your behalf — you don't 
 2. Simply deleting pods doesn't simulate the network impairment aspect of an AZ failure
 3. EKS Auto Mode will immediately try to provision new nodes, potentially back in the impaired AZ
 
-This experiment uses a "trifecta" approach (analogous to the ECS Fargate pattern) to realistically simulate an AZ failure:
+This experiment uses a "trifecta" approach to realistically simulate an AZ failure:
 
 1. **Network disruption** — Block all traffic at the subnet level using NACLs
 2. **Node pool exclusion** — Cordon nodes and patch the NodePool to prevent scheduling in the target AZ
@@ -53,22 +53,27 @@ Note that the NACL network disruption (`disrupt-az-network`) is unaffected by th
 
 Before running this experiment, ensure that:
 
-1. **IAM Roles**: Create the FIS execution role and SSM automation role with the policies from the included IAM policy files.
+1. **IAM Roles**: Create three roles:
+   - **FIS execution role** — uses `eks-automode-az-impairment-iam-policy.json`. Starts the SSM automation and drives the NACL network-disruption action. It never calls the Kubernetes API.
+   - **SSM automation role** — uses `eks-automode-az-impairment-ssm-automation-iam-policy.json`. Orchestrates the automation: launches/terminates the ephemeral client instance, manages its security group, and sends the `runCommand`s.
+   - **EC2 instance profile role** — attach the AWS managed policy `AmazonSSMManagedInstanceCore` (so the SSM Agent registers) **plus** the inline policy `eks-automode-az-impairment-instance-profile-iam-policy.json` (grants `eks:DescribeCluster`, `eks:AccessKubernetesApi`, `ec2:DescribeSubnets`, and `sts:GetCallerIdentity`). This is the role the Kubernetes work actually runs under — see the note below.
 
-2. **EKS Cluster Access**: The SSM automation role must have Kubernetes API access. Create an EKS Access Entry:
+   > **Which identity calls the Kubernetes API?** The cordon/patch/delete/restore logic runs **on the ephemeral EC2 instance**, so it uses the **instance profile role's** credentials, and the EKS bearer token is minted for that role. The SSM automation role only orchestrates; it does not call the Kubernetes API. Therefore the EKS Access Entry and RBAC below must map the **instance profile role**, not the SSM automation role.
+
+2. **EKS Cluster Access**: Grant the **instance profile role** Kubernetes API access by creating an EKS Access Entry mapped to the username the RBAC binds (`fis-az-impairment-client`):
    ```bash
    aws eks create-access-entry \
-     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME> \
-     --username fis-ssm-automation \
+     --principal-arn arn:aws:iam::<ACCOUNT>:role/<YOUR INSTANCE PROFILE ROLE NAME> \
+     --username fis-az-impairment-client \
      --cluster-name <YOUR EKS CLUSTER>
    ```
-   Only the SSM automation role needs Kubernetes access. The FIS execution role never calls the Kubernetes API — it only starts the SSM automation and drives the NACL action — so it does not need an access entry.
+   The FIS execution role and the SSM automation role do **not** need an access entry — neither calls the Kubernetes API.
 
 3. **Kubernetes RBAC**: Apply the RBAC configuration to your cluster:
    ```bash
    kubectl apply -f eks-automode-az-impairment-rbac.yaml
    ```
-   This grants the SSM automation permission to cordon/uncordon nodes, delete pods, and patch the NodePool.
+   This grants the client (the `fis-az-impairment-client` user mapped to the instance profile role) permission to cordon/uncordon nodes, delete pods, and patch the NodePool. The username in the RBAC `ClusterRoleBinding` must match the `--username` in the access entry above.
 
 4. **SSM Automation Document**: Deploy the SSM automation document:
    ```bash
@@ -95,7 +100,41 @@ Before running this experiment, ensure that:
      --resources <YOUR SUBNET ID IN TARGET AZ> \
      --tags Key=FIS-Ready,Value=True
    ```
-   The IAM policy's `ec2:ReplaceNetworkAclAssociation` permission is conditioned on this tag, so the network-disruption action can only associate the deny-NACL with a subnet you have explicitly marked `FIS-Ready=True`.
+   The template scopes the network-disruption target to subnets tagged `FIS-Ready=True` in `<YOUR TARGET AZ>`, so the deny-NACL is only ever associated with a subnet you have explicitly marked.
+
+9. **In-VPC client connectivity to the EKS API**: The SSM Automation launches a short-lived EC2 instance **inside your VPC** (via `aws:runInstances` into `SubnetId`) and runs all Kubernetes operations on that instance via `aws:runCommand`. Because the traffic originates from inside the VPC, the experiment works against a **private** EKS endpoint without opening public access. For this to work:
+   - **`SubnetId`** must be a subnet that (a) can reach the cluster's Kubernetes API endpoint — i.e. the cluster has **private endpoint access enabled** and this subnet is allowed to reach it — and (b) can reach the AWS Systems Manager endpoints so the SSM Agent can register and receive the command. Provide SSM reachability either via a **NAT gateway** or via the `com.amazonaws.<region>.ssm`, `.ssmmessages`, and `.ec2messages` **interface VPC endpoints**.
+   - **Do not use a subnet in the target AZ.** The network-disruption action denies traffic in the impaired AZ's subnets; launching the client there would sever it from the API too. Use a subnet in a surviving AZ.
+   - **`InstanceProfileName`** must be an existing EC2 instance profile whose role has `AmazonSSMManagedInstanceCore` (so the instance registers with SSM) **plus** the inline permissions listed in prerequisite 1 (`eks:DescribeCluster`, `eks:AccessKubernetesApi`, `ec2:DescribeSubnets`, `sts:GetCallerIdentity`) and the EKS Access Entry/RBAC from prerequisites 2–3, since the Kubernetes calls run under this role.
+   - The **instance profile role's** EKS Access Entry (step 2) and RBAC (step 3) authorize the Kubernetes calls the instance makes. A connection **timeout** at the `CordonPatchDelete`/`RestoreNodePool` step means the subnet cannot reach the API endpoint (fix reachability); a `403` means the network path works but the instance profile role's access entry/RBAC is missing or misnamed. **Validate this path before a full run** — see [Validating SSM-to-EKS connectivity](#validating-ssm-to-eks-connectivity) below.
+
+## Validating SSM-to-EKS connectivity
+
+The automation's Kubernetes calls run from an **ephemeral EC2 instance launched inside your VPC** (`CordonPatchDelete` and `RestoreNodePool` use `aws:runCommand` on that instance), so the traffic to the cluster's Kubernetes API endpoint originates from `SubnetId` and is subject to your security groups and the EKS **private** endpoint — not to public endpoint access. Distinguish the two failure modes:
+
+- A **connection timeout** at `CordonPatchDelete` or `RestoreNodePool` means packets from the client subnet never reached the API server — a *network reachability* problem (the cluster lacks private endpoint access, or the subnet/security group/route cannot reach it).
+- A `403` means the network path works but the **instance profile role** lacks Kubernetes access — fix its EKS Access Entry / the subject in `eks-automode-az-impairment-rbac.yaml` in that case.
+
+Two other reachability notes:
+
+- If `WaitForSSMAgent` times out, the launched instance could not reach the SSM service endpoints — add a NAT path or the `ssm`/`ssmmessages`/`ec2messages` interface VPC endpoints to `SubnetId`.
+- The running NACL network disruption is **not** the cause of an API timeout, provided you followed the guidance above and placed `SubnetId` in a surviving AZ. The deny-NACL only affects the target AZ's subnets.
+
+**Check the cluster's endpoint access mode:**
+```bash
+aws eks describe-cluster --name <YOUR EKS CLUSTER> \
+  --query 'cluster.resourcesVpcConfig.{public:endpointPublicAccess,private:endpointPrivateAccess,cidrs:publicAccessCidrs}'
+```
+For the in-VPC pattern you want `endpointPrivateAccess: true`. You do **not** need `endpointPublicAccess` enabled at all.
+
+**Independent pre-check (no disruption).** Before running the full experiment, confirm the path end to end with a host already inside the client subnet (or a one-off instance launched there):
+```bash
+# From a host in SubnetId — a fast "ok" confirms reachability; a hang confirms the block.
+curl -sk --max-time 5 https://<CLUSTER ENDPOINT HOST>/livez && echo " reachable"
+```
+A `200`/`ok` confirms the network path is open; a timeout confirms the subnet cannot reach the private endpoint (fix routing/SG/endpoint access before running).
+
+**Why this design.** Launching an ephemeral in-VPC instance and driving it with `aws:runCommand` means the Kubernetes API traffic originates from inside the VPC and is subject to your security groups and the EKS private endpoint, so the cluster's Kubernetes API can stay private. The instance is created at the start of the run, used only for the Kubernetes calls, and terminated (with its temporary security group deleted) on completion, failure, or cancel.
 
 ## Cluster configuration determines the outcome
 
@@ -208,77 +247,71 @@ T+0     ┌───────────────────────
                           │
         SSM Automation:   │
                           ▼
-T+~4s   ┌─ CordonNodesInAZ ──────────────────────────────────────────────────┐
-        │  Mark all nodes in target AZ as unschedulable                       │
+T+~0s   ┌─ ValidateInputs / CreateSecurityGroup ─────────────────────────────┐
+        │  Validate AZ/cluster/NodePool, create a temporary client SG         │
         └─────────────────────────────────────────────────────────────────────┘
                           │
-T+~34s  ┌─ PatchNodePoolExcludeAZ ───────────────────────────────────────────┐
-        │  Remove target AZ from NodePool zone requirements                   │
-        │  EKS Auto Mode cannot provision new nodes in impaired AZ            │
+T+~5s   ┌─ LaunchClientInstance / WaitForSSMAgent / BootstrapClient ─────────┐
+        │  Launch an ephemeral EC2 instance INSIDE the VPC (SubnetId),        │
+        │  wait for its SSM Agent, install python3 + urllib3/boto3            │
         └─────────────────────────────────────────────────────────────────────┘
                           │
-T+~38s  ┌─ DeletePodsInAZ ───────────────────────────────────────────────────┐
-        │  Delete all non-system pods on nodes in target AZ                   │
-        │  gracePeriodSeconds=0 (instant kill, simulates sudden AZ death)     │
+T+~2m   ┌─ CordonPatchDelete  (aws:runCommand on the in-VPC instance) ───────┐
+        │  Cordon all nodes in target AZ (unschedulable)                      │
+        │  Patch NodePool to remove target AZ from zone requirements          │
+        │  Delete all non-system pods on nodes in target AZ (gracePeriod=0)   │
         │  Kubernetes reschedules to healthy AZs only ✓                       │
         └─────────────────────────────────────────────────────────────────────┘
                           │
-T+38s → T+15m             ▼  WaitForDuration (impairment period)
+T+2m → T+17m              ▼  WaitForDuration (impairment period)
                           │
-T+15m                     ▼
-        ┌─ RestoreNodePool ──────────────────────────────────────────────────┐
+T+17m                     ▼
+        ┌─ RestoreNodePool  (aws:runCommand on the in-VPC instance) ─────────┐
         │  Re-add target AZ to NodePool zone requirements                     │
         │  Uncordon all nodes in target AZ                                    │
         └─────────────────────────────────────────────────────────────────────┘
                           │
-T+15m                     ▼  FIS restores NACLs (network connectivity returns)
+T+17m   ┌─ TerminateInstance / DeleteSecurityGroup ─────────────────────────┐
+        │  Terminate the ephemeral instance, delete the temporary SG          │
+        └─────────────────────────────────────────────────────────────────────┘
+                          │
+T+17m                     ▼  FIS restores NACLs (network connectivity returns)
                           ▼  EKS Auto Mode rebalances workloads across all AZs
 ```
 
-**Why pods are deleted only after the NodePool is patched:** The ordering inside the SSM automation is what makes the impairment stick. Cordoning marks existing nodes in the target AZ unschedulable and the NodePool patch stops EKS Auto Mode from provisioning replacements there. Only then are pods deleted, so Kubernetes has no placement option left in the impaired AZ. If pods were deleted first, they could be rescheduled straight back into the AZ before the exclusion took effect.
+**Why pods are deleted only after the NodePool is patched:** The ordering inside the SSM automation is what makes the impairment stick. Cordoning marks existing nodes in the target AZ unschedulable and the NodePool patch stops EKS Auto Mode from provisioning replacements there. Only then are pods deleted, so Kubernetes has no placement option left in the impaired AZ. If pods were deleted first, they could be rescheduled straight back into the AZ before the exclusion took effect. The cordon, patch, and delete operations run as one `aws:runCommand` program on the in-VPC instance (`CordonPatchDelete`), so the ordering is guaranteed within a single process.
 
 ### Actions Detail
 
 | Action | Action ID | Description | Starts |
 |--------|-----------|-------------|--------|
 | `disrupt-az-network` | `aws:network:disrupt-connectivity` | Blocks all ingress/egress traffic on subnets in the target AZ via NACLs | T+0 |
-| `cordon-and-exclude-az` | `aws:ssm:start-automation-execution` | Triggers the SSM automation that performs all K8s operations (cordon, patch, delete pods, wait, restore) | T+0 |
+| `cordon-and-exclude-az` | `aws:ssm:start-automation-execution` | Triggers the SSM automation that launches an in-VPC client instance and performs all K8s operations (cordon, patch, delete pods, wait, restore) from inside the VPC | T+0 |
 
 ### SSM Automation Document
 
-The experiment uses a single SSM Automation document (`eks-automode-az-impairment-automation`) that manages the complete EKS-specific fault lifecycle:
+The experiment uses a single SSM Automation document (`eks-automode-az-impairment-automation`) that manages the complete EKS-specific fault lifecycle. All Kubernetes API calls run from an **ephemeral EC2 instance inside your VPC**, so they work against a private EKS endpoint:
 
-1. **Validates** input parameters (AZ format, cluster existence)
-2. **Cordons nodes** in the target AZ (~4s) — prevents pod scheduling on existing nodes
-3. **Patches the NodePool** to exclude the target AZ (~30s) — prevents EKS Auto Mode from provisioning new nodes there
-4. **Deletes all non-system pods** on nodes in the target AZ (instant, `gracePeriodSeconds=0`) — simulates sudden pod death
-5. **Waits** for the impairment duration (configurable, default 15 minutes)
-6. **Restores the NodePool** to original configuration (re-includes the target AZ)
-7. **Uncordons nodes** in the target AZ
+1. **Validates** input parameters (AZ format, cluster/NodePool choice) — `ValidateInputs`
+2. **Creates a temporary security group** and **launches an ephemeral EC2 instance** in `SubnetId` inside the VPC — `CreateSecurityGroup`, `LaunchClientInstance`
+3. **Waits for the SSM Agent** to come online and **bootstraps** python3 + `urllib3`/`boto3` — `WaitForSSMAgent`, `BootstrapClient`
+4. **Cordons nodes, patches the NodePool, and deletes pods** in the target AZ, all from the in-VPC instance in a single `aws:runCommand` — `CordonPatchDelete`
+5. **Waits** for the impairment duration (configurable, default 15 minutes) — `WaitForDuration`
+6. **Restores the NodePool** and **uncordons nodes** from the in-VPC instance — `RestoreNodePool`
+7. **Terminates the instance** and **deletes the temporary security group** — `TerminateInstance`, `DeleteSecurityGroup`
 
-Steps 2-4 have `onFailure` and `onCancel` routing to the restore step, ensuring the NodePool is always restored and nodes are always uncordoned even if the experiment is cancelled or encounters an error.
-
-### Key Difference from ECS Pattern
-
-| Aspect | ECS Fargate | EKS Auto Mode |
-|--------|-------------|---------------|
-| Scheduling control | Remove subnet from service network config | Cordon nodes + patch NodePool requirements |
-| Network disruption | `aws:ecs:task-network-packet-loss` | `aws:network:disrupt-connectivity` (subnet-level NACL) |
-| Workload termination | `aws:ecs:stop-task` (FIS action, AZ-filterable) | K8s API pod delete via SSM automation (see below) |
-| Restore mechanism | Re-add subnet to service config | Remove zone exclusion from NodePool + uncordon nodes |
+`CordonPatchDelete` and `WaitForDuration` have `onFailure`/`onCancel` routing to `RestoreNodePool`, which in turn routes to `TerminateInstance` → `DeleteSecurityGroup`. This ensures the NodePool is always restored, nodes are always uncordoned, and the ephemeral instance and security group are always cleaned up — even if the experiment is cancelled or errors. The restore gates on a patch-result file written by `CordonPatchDelete`, so it only touches the NodePool if the patch actually ran; a terminal restore failure makes the step exit non-zero so a stop condition or alarm can trip.
 
 ### Why This Experiment Uses No `aws:eks:pod` Actions
 
-The ECS experiment uses `aws:ecs:stop-task` as a separate FIS action because ECS tasks have native AZ metadata that FIS can filter on (resource tags + `AvailabilityZone` path filter).
-
-EKS pod targets have no equivalent. FIS resolves `aws:eks:pod` targets by **namespace + label selector**, and the [FIS documentation](https://docs.aws.amazon.com/fis/latest/userguide/eks-pod-actions.html) states you *"can't identify targets of type `aws:eks:pod` in your experiment template using resource ARNs or resource tags."* Critically, **pods do not inherit their node's `topology.kubernetes.io/zone` label** — that label exists on Nodes only. A selector like `app=myapp,topology.kubernetes.io/zone=us-east-1a` therefore matches zero pods.
+FIS resolves `aws:eks:pod` targets by **namespace + label selector**, and the [FIS documentation](https://docs.aws.amazon.com/fis/latest/userguide/eks-pod-actions.html) states you *"can't identify targets of type `aws:eks:pod` in your experiment template using resource ARNs or resource tags."* Critically, **pods do not inherit their node's `topology.kubernetes.io/zone` label** — that label exists on Nodes only. A selector like `app=myapp,topology.kubernetes.io/zone=us-east-1a` therefore matches zero pods.
 
 That leaves no correct way to scope a pod action to one AZ:
 
 - An AZ-qualified label selector resolves to nothing, and with `emptyTargetResolutionMode: skip` the action silently does nothing while the experiment still reports success
 - Dropping the AZ term and targeting `app=myapp` hits pods in the **healthy** AZs too — degrading the very capacity the experiment is meant to prove survives
 
-So pod termination is handled by the SSM automation instead, directly via the Kubernetes API: it lists pods on nodes in the target AZ and deletes them with `gracePeriodSeconds=0` (sudden death, same as ECS stop-task). This gives precise AZ-scoped termination with no dependency on FIS pod targeting.
+So pod termination is handled by the SSM automation, directly via the Kubernetes API: it lists pods on nodes in the target AZ and deletes them with `gracePeriodSeconds=0` (sudden death). This gives precise AZ-scoped termination with no dependency on FIS pod targeting.
 
 **This is also why there is no `aws:eks:pod-network-packet-loss` action.** Beyond the same targeting problem, subnet-level NACLs (`aws:network:disrupt-connectivity`) already block all traffic in the AZ — strictly broader than per-pod packet loss, since it affects every resource in the subnet rather than only labelled pods. The pod action would add setup cost (a Kubernetes service account, the `privileged` Pod Security Standard, root in the ephemeral container, and `readOnlyRootFilesystem: false` on every target pod) for no additional coverage.
 
@@ -290,12 +323,12 @@ If you do add `aws:eks:pod` actions to a fork of this experiment, note that all 
 |-------------|---------------|----------------|-------------|
 | `subnets-in-target-az` | `aws:ec2:subnet` | ALL | VPC subnets tagged `FIS-Ready=True` in the target AZ (scoped via the `availabilityZoneIdentifier` parameter) to disrupt network connectivity |
 
-The template defines only this one FIS target. It is resolved by the `FIS-Ready=True` resource tag and scoped to a single AZ with the `availabilityZoneIdentifier` parameter (rather than a hard-coded subnet ARN), consistent with the tagging strategy used across this library. Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why This Experiment Uses No `aws:eks:pod` Actions](#why-this-experiment-uses-no-awsekspod-actions) above.
+The template defines only this one FIS target. It is resolved by the `FIS-Ready=True` resource tag and scoped to a single AZ with the `availabilityZoneIdentifier` parameter (rather than a hard-coded subnet ARN). Pod termination is handled by the SSM automation via the Kubernetes API rather than by a FIS `aws:eks:pod` target — see [Why This Experiment Uses No `aws:eks:pod` Actions](#why-this-experiment-uses-no-awsekspod-actions) above.
 
 ### Target Requirements
 - The subnet must carry the `FIS-Ready=True` tag and be in the AZ named by both the target's `availabilityZoneIdentifier` parameter and the automation's `TargetAZ` parameter, so the network disruption and the Kubernetes-level impairment affect the same AZ
 - Nodes must carry the standard `topology.kubernetes.io/zone` label (EKS applies this automatically) — the automation uses it to find nodes and pods in the target AZ
-- The SSM automation role must have Kubernetes API access via an EKS Access Entry plus the RBAC in `eks-automode-az-impairment-rbac.yaml`
+- The EC2 instance profile role must have Kubernetes API access via an EKS Access Entry (username `fis-az-impairment-client`) plus the RBAC in `eks-automode-az-impairment-rbac.yaml`
 
 ## Parameters to Configure
 
@@ -307,9 +340,13 @@ Before running the experiment, update these placeholder values:
 | `<YOUR REGION>` | AWS region where resources are deployed (e.g., `ap-southeast-2`) |
 | `<YOUR FIS ROLE NAME>` | FIS execution IAM role name |
 | `<YOUR SSM AUTOMATION ROLE NAME>` | SSM automation IAM role name |
+| `<YOUR INSTANCE PROFILE ROLE NAME>` | Name of the role behind the EC2 instance profile the ephemeral client uses (referenced by the SSM automation role's `iam:PassRole`) |
 | `<YOUR EKS CLUSTER>` | Name of your EKS cluster |
 | `<YOUR TARGET AZ>` | Availability Zone to impair (e.g., `ap-southeast-2a`) |
 | `<YOUR SUBNET ID IN TARGET AZ>` | Subnet ID(s) in the target AZ to tag with `FIS-Ready=True` (used in the `create-tags` step, not hard-coded in the template) |
+| `<YOUR CLIENT SUBNET ID (NOT in the target AZ)>` | Subnet (in a surviving AZ) where the ephemeral K8s client instance is launched; must reach the private EKS endpoint and the SSM endpoints — passed as the `SubnetId` document parameter |
+| `<YOUR VPC ID>` | VPC ID in which the temporary client security group is created — passed as the `VpcId` document parameter |
+| `<YOUR INSTANCE PROFILE NAME>` | Existing EC2 instance profile (with `AmazonSSMManagedInstanceCore`) for the client instance — passed as the `InstanceProfileName` document parameter |
 | `<YOUR NODEPOOL NAME>` | Name of a **custom** EKS Auto Mode NodePool (not `general-purpose` or `system`) |
 
 ## How Pods in the Target AZ Are Selected
@@ -320,11 +357,11 @@ No pod label selector configuration is required. The SSM automation resolves the
 2. For each of those nodes, lists pods via `fieldSelector=spec.nodeName=<node>`
 3. Deletes each pod with `gracePeriodSeconds=0`, skipping the `kube-system`, `kube-node-lease`, and `kube-public` namespaces
 
-This means **all non-system pods on nodes in the target AZ are deleted**, across every namespace. If you need to limit the blast radius to specific workloads, add a namespace or label filter to the `DeletePodsInAZ` step in `eks-automode-az-impairment-automation.yaml`.
+This means **all non-system pods on nodes in the target AZ are deleted**, across every namespace. If you need to limit the blast radius to specific workloads, add a namespace or label filter to the pod-deletion logic in the `CordonPatchDelete` step of `eks-automode-az-impairment-automation.yaml`.
 
 ## Fine-Tuning the Wait Duration
 
-The automation deletes pods immediately after cordoning nodes and patching the NodePool, so no separate wait action is needed. If your cluster's control plane is slow enough that pods get rescheduled into the impaired AZ before the NodePool patch propagates, insert an `aws:sleep` step between `PatchNodePoolExcludeAZ` and `DeletePodsInAZ`. Timing depends on:
+The automation deletes pods immediately after cordoning nodes and patching the NodePool, so no separate wait action is needed. If your cluster's control plane is slow enough that pods get rescheduled into the impaired AZ before the NodePool patch propagates, add a short sleep between the patch and the pod deletion inside the `CordonPatchDelete` step's program. Timing depends on:
 
 - **Cluster size**: More nodes = longer cordon time
 - **Control plane load**: Busy clusters may take longer for NodePool patches to propagate
@@ -338,8 +375,6 @@ To calibrate:
 ## Stop Conditions
 
 The experiment does not include stop conditions by default. It will continue until all actions complete (approximately 30-45 minutes total).
-
-## Observability and stop conditions
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 business metric requiring an immediate end of the fault injection. This 
@@ -383,9 +418,9 @@ After the experiment completes:
 
 ### Restore status and failure signal
 
-The `RestoreNodePool` step reports a `Status` in its `RestoreResult` output describing how the cleanup went. On a clean run this is `NODEPOOL_RESTORED` (or `NODEPOOL_ALREADY_CORRECT` / `NODEPOOL_UNCHANGED_NO_PATCH_RECORDED` when there was nothing to undo).
+The `RestoreNodePool` step runs the restore program on the in-VPC instance and prints a `RestoreResult` JSON line (visible in the step's command output / CloudWatch Logs) describing how the cleanup went. On a clean run this is `NODEPOOL_RESTORED` (or `NODEPOOL_ALREADY_CORRECT` / `NODEPOOL_UNCHANGED_NO_PATCH_RECORDED` when there was nothing to undo).
 
-If the restore cannot complete cleanly, the step **fails the SSM automation** (raises after first attempting to uncordon nodes) so the failure is visible to an operator and can trip a CloudWatch alarm or FIS stop condition, rather than being silently reported as success. A terminal restore leaves the target AZ still excluded from the NodePool and/or nodes still cordoned, so it requires **manual remediation**. Statuses that fail the step are:
+If the restore cannot complete cleanly, the program exits non-zero (after first attempting to uncordon nodes), which **fails the SSM automation step** so the failure is visible to an operator and can trip a CloudWatch alarm or FIS stop condition, rather than being silently reported as success. A terminal restore leaves the target AZ still excluded from the NodePool and/or nodes still cordoned, so it requires **manual remediation**. Statuses that fail the step are:
 
 - `NODEPOOL_RESTORE_FAILED_<code>` — the restore PATCH to the Kubernetes API returned a non-200 status.
 - `NODEPOOL_RESTORE_ERROR: <message>` — an unexpected exception occurred during NodePool restore.
@@ -425,8 +460,8 @@ As you adapt this scenario to your needs, we recommend:
 2. Identifying business metrics tied to your EKS workload health.
 3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the AZ impairment.
 4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. Reviewing the RBAC ClusterRole and confirming the `fis-ssm-automation` username matches the one in your EKS Access Entry.
-6. Narrowing the blast radius if needed — by default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter to the `DeletePodsInAZ` step to scope it.
+5. Reviewing the RBAC ClusterRole and confirming the `fis-az-impairment-client` username matches the one in the instance profile role's EKS Access Entry.
+6. Narrowing the blast radius if needed — by default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter to the pod-deletion logic in the `CordonPatchDelete` step to scope it.
 7. **Testing in a non-production environment first** to validate automation behavior and timing.
 8. Documenting expected vs actual behavior to build an AZ failure runbook.
 9. Gradually increasing scope (longer duration, more namespaces, multiple NodePools).
@@ -442,9 +477,10 @@ You can import the json experiment template into your AWS account via cli or aws
 | `README.md` | This documentation file |
 | `AWSFIS.json` | Template version marker for fis-template-library-tooling |
 | `eks-automode-az-impairment-template.json` | FIS experiment template definition |
-| `eks-automode-az-impairment-automation.yaml` | SSM Automation document (cordon, patch NodePool, wait, restore) |
+| `eks-automode-az-impairment-automation.yaml` | SSM Automation document — launches an ephemeral in-VPC EC2 client, then cordons, patches the NodePool, deletes pods, waits, restores, and cleans up |
 | `eks-automode-az-impairment-iam-policy.json` | IAM policy for the FIS execution role |
-| `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role |
-| `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the SSM automation role |
+| `eks-automode-az-impairment-ssm-automation-iam-policy.json` | IAM policy for the SSM automation role (orchestration: launch/terminate instance, security group, runCommand) |
+| `eks-automode-az-impairment-instance-profile-iam-policy.json` | Inline IAM policy for the EC2 instance profile role (EKS describe + Kubernetes API access + subnet describe); attach alongside `AmazonSSMManagedInstanceCore` |
+| `eks-automode-az-impairment-rbac.yaml` | Kubernetes RBAC for the EC2 instance profile role (bound via the `fis-az-impairment-client` username) |
 | `fis-iam-trust-relationship.json` | Trust policy for FIS service |
 | `ssm-iam-trust-relationship.json` | Trust policy for SSM service |
