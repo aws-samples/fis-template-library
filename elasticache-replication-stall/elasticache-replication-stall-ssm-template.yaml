@@ -1,0 +1,825 @@
+schemaVersion: "2.2"
+description: >-
+  Stall Amazon ElastiCache (Valkey or Redis OSS) replication by issuing CLIENT PAUSE
+  on replica nodes. The replication stream stops being applied while the replication
+  link stays up, reproducing a replica that cannot keep up with its primary. Supports
+  both cluster mode disabled and cluster mode enabled replication groups. This is an
+  SSM Command document and must run on an EC2 instance inside the cache VPC, because
+  the fault is injected over the cache data plane rather than through a control-plane
+  API.
+
+parameters:
+  ReplicationGroupId:
+    type: String
+    description: >-
+      (Required) Id of the target ElastiCache replication group. Node-based clusters
+      only - CLIENT PAUSE is unavailable on serverless caches.
+    allowedPattern: "^[a-zA-Z][a-zA-Z0-9-]{0,49}$"
+  PauseMode:
+    type: String
+    default: WRITE
+    allowedValues:
+      - WRITE
+      - ALL
+    description: >-
+      WRITE stalls the replication stream while the replica still serves reads.
+      ALL additionally blocks reads on that replica. Use WRITE when your application
+      reads from replicas, otherwise the experiment cannot tell a replication stall
+      apart from a read node being taken out of service.
+  PauseMilliseconds:
+    type: String
+    default: "30000"
+    description: >-
+      Pause duration in milliseconds. The pause expires on its own, so the fault is
+      self-healing even if the experiment is interrupted.
+    allowedPattern: "^([1-9][0-9]{2,6})$"
+  DurationSeconds:
+    type: String
+    default: "60"
+    description: >-
+      Single-pause mode (DutyCyclePercent=0): how long this document keeps observing
+      after injection; set it at or above PauseMilliseconds / 1000 so that recovery is
+      captured. Duty-cycle mode: how long the repeating pauses are issued. 1-3600,
+      bounded by the InjectReplicationStall step timeout.
+    allowedPattern: "^([1-9][0-9]{0,2}|[1-2][0-9]{3}|3[0-5][0-9]{2}|3600)$"
+  DutyCyclePercent:
+    type: String
+    default: "0"
+    description: >-
+      0 (default) issues one CLIENT PAUSE of PauseMilliseconds. 1-99 switches to
+      duty-cycle mode, which issues a pause of CyclePeriodMilliseconds x
+      DutyCyclePercent / 100 at the start of every period for DurationSeconds, so the
+      replica repeatedly falls behind and catches up. PauseMilliseconds is ignored in
+      this mode. The replica's role is re-checked before every pause and a node that
+      no longer reports role:slave is dropped from the injection.
+    allowedPattern: "^([0-9]|[1-9][0-9])$"
+  CyclePeriodMilliseconds:
+    type: String
+    default: "1000"
+    description: >-
+      Duty-cycle mode only. Length of one pause-plus-gap cycle, 100-60000. The peak
+      backlog per cycle is roughly the write rate multiplied by the pause slice
+      (CyclePeriodMilliseconds x DutyCyclePercent / 100), so the period sets the
+      amplitude of the lag sawtooth.
+    allowedPattern: "^([1-9][0-9]{2,3}|[1-5][0-9]{4}|60000)$"
+  Region:
+    type: String
+    default: ""
+    description: >-
+      Region of the target replication group. Leave empty to use the injector
+      instance's own Region, read from the instance metadata service; the injector
+      has to be in the cache VPC, so this is normally correct.
+    allowedPattern: "^([a-z]{2}(-[a-z]+)+-[0-9])?$"
+  UseTls:
+    type: String
+    default: "false"
+    allowedValues:
+      - "true"
+      - "false"
+    description: Set to true when the replication group has encryption in transit enabled.
+  TargetShardId:
+    type: String
+    default: ""
+    description: >-
+      Cluster mode enabled only. Restrict the experiment to one shard, given as the
+      ElastiCache node group id such as 0001. Leave empty to consider every shard.
+      Targeting a single shard keeps the remaining shards available as in-experiment
+      controls, which is strongly recommended for a first run.
+    allowedPattern: "^([0-9]{4})?$"
+  ReplicaScope:
+    type: String
+    default: ONE_PER_SHARD
+    allowedValues:
+      - ONE_PER_SHARD
+      - ALL
+    description: >-
+      ONE_PER_SHARD pauses a single replica per considered shard. ALL pauses every
+      replica of every considered shard. On a topology with one replica per shard
+      these two values are identical, so use TargetShardId to limit the blast radius.
+
+mainSteps:
+  - action: aws:runShellScript
+    name: ValidatePrerequisites
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      onFailure: exit
+      timeoutSeconds: 180
+      runCommand:
+        - |
+          #!/bin/bash
+          set -uo pipefail
+
+          command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required but not installed."; exit 1; }
+          command -v aws >/dev/null 2>&1 || { echo "ERROR: the AWS CLI is required but not installed."; exit 1; }
+
+          mkdir -p /tmp/fis
+          cat > /tmp/fis/ec_replication_stall.py <<'FISPYEOF'
+          #!/usr/bin/env python3
+          """Stall ElastiCache replication via CLIENT PAUSE on replica nodes.
+
+          Supports both cluster mode disabled and cluster mode enabled replication
+          groups. Standard library only: the instance needs no pip packages and no
+          route to PyPI. It does need a network path to the cache nodes on the cache
+          port and to the ElastiCache API endpoint, which the AWS CLI uses to read
+          the topology.
+
+          Why two discovery paths:
+            The ElastiCache API reference states that NodeGroupMember.CurrentRole and
+            NodeGroupMember.ReadEndpoint are populated only for cluster mode disabled
+            replication groups. For cluster mode enabled groups the topology is read
+            from CLUSTER SHARDS against the configuration endpoint instead, which
+            reports each node's role and endpoint over the data plane. Neither
+            "cluster shards" nor "cluster nodes" is on the ElastiCache restricted
+            command list.
+
+          Safety properties:
+            * A node is only ever paused when its role is proven to be a replica,
+              both by the discovery path and by the node's own INFO replication.
+              Anything else is SKIPPED - pausing a primary would be a far larger
+              fault than the one under test.
+            * CLIENT PAUSE expires on its own, so the fault self-heals even if the
+              experiment is interrupted. CLIENT UNPAUSE is issued as a safety net.
+          """
+
+          import argparse
+          import json
+          import os
+          import socket
+          import ssl
+          import subprocess
+          import sys
+          import time
+
+          STATE = "/tmp/fis/ec_replication_stall_state.json"
+
+
+          def log(msg):
+              print(time.strftime("[%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "] " + str(msg), flush=True)
+
+
+          def read_reply(fh):
+              line = fh.readline()
+              if not line:
+                  raise IOError("connection closed by server")
+              prefix, body = line[:1], line[1:-2]
+              if prefix == b"+":
+                  return body.decode()
+              if prefix == b"-":
+                  raise RuntimeError(body.decode())
+              if prefix == b":":
+                  return int(body)
+              if prefix == b"$":
+                  length = int(body)
+                  return None if length == -1 else fh.read(length + 2)[:-2].decode()
+              if prefix in (b"*", b"~", b">"):
+                  count = int(body)
+                  return None if count == -1 else [read_reply(fh) for _ in range(count)]
+              if prefix == b"%":
+                  count = int(body)
+                  out = {}
+                  for _ in range(count):
+                      key = read_reply(fh)
+                      out[key] = read_reply(fh)
+                  return out
+              if prefix == b"#":
+                  return body == b"t"
+              if prefix == b",":
+                  return float(body)
+              if prefix == b"_":
+                  return None
+              raise RuntimeError("unexpected RESP prefix %r" % prefix)
+
+
+          def to_map(value):
+              """RESP2 encodes a map as a flat array of alternating keys and values."""
+              if isinstance(value, dict):
+                  return value
+              if not isinstance(value, list):
+                  return {}
+              return {value[i]: value[i + 1] for i in range(0, len(value) - 1, 2)}
+
+
+          def send(host, port, use_tls, *args, **kwargs):
+              timeout = kwargs.get("timeout", 5.0)
+              payload = ("*%d" % len(args)).encode() + b"\r\n"
+              for arg in args:
+                  raw = str(arg).encode()
+                  payload += b"$" + str(len(raw)).encode() + b"\r\n" + raw + b"\r\n"
+              sock = socket.create_connection((host, int(port)), timeout=timeout)
+              try:
+                  if use_tls:
+                      sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+                  sock.sendall(payload)
+                  return read_reply(sock.makefile("rb"))
+              except RuntimeError as exc:
+                  text = str(exc)
+                  if "NOAUTH" in text or "WRONGPASS" in text:
+                      raise SystemExit(
+                          "ERROR: the cache requires authentication (auth token or RBAC). "
+                          "This document does not support authenticated clusters. Run the "
+                          "experiment against a cluster without an auth token, or extend "
+                          "this document to read the token from AWS Secrets Manager.")
+                  raise
+              finally:
+                  try:
+                      sock.close()
+                  except Exception:
+                      pass
+
+
+          def info_replication(host, port, use_tls, timeout=5.0):
+              out = {"replicas": {}}
+              raw = send(host, port, use_tls, "INFO", "replication", timeout=timeout)
+              for line in (raw or "").splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#") or ":" not in line:
+                      continue
+                  key, value = line.split(":", 1)
+                  if key.startswith("slave") and key[5:].isdigit():
+                      out["replicas"][key] = dict(
+                          kv.split("=", 1) for kv in value.split(",") if "=" in kv)
+                  else:
+                      out[key] = value
+              return out
+
+
+          def describe(rg_id, region):
+              cli = ["aws", "elasticache", "describe-replication-groups",
+                     "--replication-group-id", rg_id, "--region", region,
+                     "--output", "json", "--no-cli-pager"]
+              try:
+                  raw = subprocess.check_output(cli, stderr=subprocess.STDOUT, timeout=90)
+              except FileNotFoundError:
+                  raise SystemExit("ERROR: the AWS CLI is not installed on this instance.")
+              except subprocess.CalledProcessError as exc:
+                  raise SystemExit(
+                      "ERROR: describe-replication-groups failed. The instance profile needs "
+                      "elasticache:DescribeReplicationGroups, and this subnet needs a route to "
+                      "the ElastiCache API endpoint (a NAT gateway, or an interface VPC "
+                      "endpoint for com.amazonaws." + region + ".elasticache).\n"
+                      + exc.output.decode(errors="replace"))
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(
+                      "ERROR: describe-replication-groups timed out. This subnet most likely "
+                      "has no route to the ElastiCache API endpoint.")
+              groups = json.loads(raw).get("ReplicationGroups") or []
+              if not groups:
+                  raise SystemExit("ERROR: replication group %r was not found." % rg_id)
+              group = groups[0]
+              if group.get("Status") != "available":
+                  raise SystemExit("ERROR: replication group status is %r, expected 'available'."
+                                   % group.get("Status"))
+              return group
+
+
+          def node_group_for_slot(api_groups, slot):
+              """Map a hash slot back to the ElastiCache node group id, so that
+              TargetShardId can be given in the operator's own vocabulary (0001)
+              rather than as a slot range."""
+              for node_group in api_groups:
+                  for part in (node_group.get("Slots") or "").split(","):
+                      if not part:
+                          continue
+                      low, _, high = part.partition("-")
+                      try:
+                          if int(low) <= slot <= int(high or low):
+                              return node_group.get("NodeGroupId")
+                      except ValueError:
+                          continue
+              return None
+
+
+          def node_dns_index(group, region):
+              """Map node IP -> (dns name, cache cluster id, az) for a cluster mode
+              enabled group.
+
+              CLUSTER SHARDS on ElastiCache returns `endpoint` set to the node's IP and
+              `hostname` empty, which is unusable for TLS: a certificate cannot be
+              validated against an IP. describe-cache-clusters --show-cache-node-info
+              returns each member cluster's node DNS name, so the two are joined on the
+              resolved address. It also replaces the opaque cluster node id with the
+              operator-visible CacheClusterId in the log output.
+              """
+              index = {}
+              for cc_id in group.get("MemberClusters") or []:
+                  cli = ["aws", "elasticache", "describe-cache-clusters",
+                         "--cache-cluster-id", cc_id, "--show-cache-node-info",
+                         "--region", region, "--output", "json", "--no-cli-pager"]
+                  try:
+                      raw = subprocess.check_output(cli, stderr=subprocess.STDOUT, timeout=60)
+                  except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                          FileNotFoundError) as exc:
+                      detail = getattr(exc, "output", b"")
+                      log("WARNING: describe-cache-clusters failed for %s (%s). Node DNS "
+                          "names will be unavailable; this only matters for TLS. The "
+                          "instance profile needs elasticache:DescribeCacheClusters.\n%s"
+                          % (cc_id, type(exc).__name__,
+                             detail.decode(errors="replace") if detail else ""))
+                      continue
+                  for cluster in json.loads(raw).get("CacheClusters") or []:
+                      az = cluster.get("PreferredAvailabilityZone")
+                      for cache_node in cluster.get("CacheNodes") or []:
+                          address = (cache_node.get("Endpoint") or {}).get("Address")
+                          if not address:
+                              continue
+                          try:
+                              for info in socket.getaddrinfo(address, None, socket.AF_INET):
+                                  index[info[4][0]] = {"dns": address, "id": cluster.get("CacheClusterId"),
+                                                       "az": az}
+                          except socket.gaierror as exc:
+                              log("WARNING: could not resolve %s (%s)." % (address, exc))
+              return index
+
+
+          def resolve_cluster_mode_enabled(group, region, use_tls, scope, target_shard):
+              endpoint = group.get("ConfigurationEndpoint") or {}
+              host, port = endpoint.get("Address"), endpoint.get("Port")
+              if not host:
+                  raise SystemExit(
+                      "ERROR: the replication group reports ClusterEnabled but has no "
+                      "ConfigurationEndpoint, so the topology cannot be read.")
+              log("Cluster mode enabled. Reading topology from CLUSTER SHARDS at %s:%s"
+                  % (host, port))
+              shards = send(host, port, use_tls, "CLUSTER", "SHARDS", timeout=10.0)
+              api_groups = group.get("NodeGroups") or []
+              dns_index = node_dns_index(group, region)
+
+              replicas, primaries = [], []
+              for shard in shards or []:
+                  smap = to_map(shard)
+                  slots = smap.get("slots") or []
+                  first_slot = slots[0] if slots else None
+                  shard_id = (node_group_for_slot(api_groups, int(first_slot))
+                              if first_slot is not None else None)
+                  # A shard outside TargetShardId contributes no injection target, but
+                  # its primary is still collected so the observation covers it as an
+                  # in-experiment control.
+                  in_scope = (not target_shard) or shard_id == target_shard
+
+                  shard_replicas = []
+                  for raw_node in smap.get("nodes") or []:
+                      node_map = to_map(raw_node)
+                      role = str(node_map.get("role") or "").lower()
+                      node_ip = node_map.get("ip") or node_map.get("endpoint")
+                      enriched = dns_index.get(node_ip) or {}
+                      # Prefer a DNS name: required for TLS certificate validation, and
+                      # it keeps the node identifiable in the log output.
+                      node_host = (node_map.get("hostname") or "").strip() or enriched.get("dns") or node_ip
+                      node_port = node_map.get("tls-port") if use_tls else node_map.get("port")
+                      if node_port is None:
+                          node_port = node_map.get("port") or node_map.get("tls-port")
+                      node = {"shard": shard_id,
+                              "id": enriched.get("id") or node_map.get("id"),
+                              "cluster_node_id": node_map.get("id"),
+                              "az": enriched.get("az"), "role": role,
+                              "host": node_host, "port": node_port,
+                              "health": node_map.get("health"),
+                              "targeted": in_scope}
+                      if role == "master":
+                          primaries.append(node)
+                          continue
+                      if not in_scope:
+                          continue
+                      if role != "replica":
+                          log("WARNING: skipping node %s in shard %s - CLUSTER SHARDS reports "
+                              "role %r. Refusing to pause a node that cannot be proven to be a "
+                              "replica." % (node_map.get("id"), shard_id, node_map.get("role")))
+                          continue
+                      if not node_host or node_port is None:
+                          log("WARNING: skipping node %s in shard %s - no usable endpoint in "
+                              "CLUSTER SHARDS output." % (node_map.get("id"), shard_id))
+                          continue
+                      if str(node_map.get("health") or "").lower() not in ("online", ""):
+                          log("WARNING: skipping node %s in shard %s - health is %r."
+                              % (node_map.get("id"), shard_id, node_map.get("health")))
+                          continue
+                      if use_tls and _looks_like_ip(node_host):
+                          raise SystemExit(
+                              "ERROR: UseTls is true but only an IP address (%s) could be "
+                              "determined for node %s. A TLS certificate cannot be validated "
+                              "against an IP. Grant elasticache:DescribeCacheClusters to the "
+                              "instance profile so node DNS names can be resolved, then retry."
+                              % (node_host, node_map.get("id")))
+                      shard_replicas.append(node)
+                  replicas.extend(shard_replicas[:1] if scope == "ONE_PER_SHARD" else shard_replicas)
+
+              if target_shard and not replicas:
+                  raise SystemExit(
+                      "ERROR: no replica was resolved for shard %r. Check the node group id "
+                      "against describe-replication-groups output." % target_shard)
+              return replicas, primaries
+
+
+          def _looks_like_ip(value):
+              parts = str(value).split(".")
+              return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+          def resolve_cluster_mode_disabled(group, scope):
+              replicas, primaries = [], []
+              for node_group in group.get("NodeGroups") or []:
+                  shard_replicas = []
+                  for member in node_group.get("NodeGroupMembers") or []:
+                      read_endpoint = member.get("ReadEndpoint") or {}
+                      node = {"shard": node_group.get("NodeGroupId"),
+                              "id": member.get("CacheClusterId"),
+                              "az": member.get("PreferredAvailabilityZone"),
+                              "role": member.get("CurrentRole"),
+                              "host": read_endpoint.get("Address"),
+                              "port": read_endpoint.get("Port"),
+                              "health": None}
+                      role = (member.get("CurrentRole") or "").lower()
+                      if role == "primary":
+                          primaries.append(node)
+                          continue
+                      if role != "replica":
+                          log("WARNING: skipping %s - CurrentRole is %r. Refusing to pause a "
+                              "node that cannot be proven to be a replica."
+                              % (node["id"], member.get("CurrentRole")))
+                          continue
+                      if not node["host"]:
+                          log("WARNING: skipping %s - no ReadEndpoint was returned." % node["id"])
+                          continue
+                      shard_replicas.append(node)
+                  replicas.extend(shard_replicas[:1] if scope == "ONE_PER_SHARD" else shard_replicas)
+              return replicas, primaries
+
+
+          def resolve(args):
+              group = describe(args.replication_group_id, args.region)
+              cluster_enabled = bool(group.get("ClusterEnabled"))
+              if args.target_shard_id and not cluster_enabled:
+                  log("WARNING: TargetShardId was supplied but this replication group has "
+                      "cluster mode disabled. The parameter is ignored.")
+              if cluster_enabled:
+                  replicas, primaries = resolve_cluster_mode_enabled(
+                      group, args.region, args.use_tls, args.replica_scope,
+                      args.target_shard_id)
+              else:
+                  replicas, primaries = resolve_cluster_mode_disabled(group, args.replica_scope)
+              if not replicas:
+                  raise SystemExit(
+                      "ERROR: no node that can be proven to be a replica was found for %r. "
+                      "This experiment requires at least one replica."
+                      % args.replication_group_id)
+              return replicas, primaries, cluster_enabled
+
+
+          def primary_view(primaries, use_tls):
+              """Primary-side INFO replication. This is the authoritative view while a
+              replica is paused, because PauseMode=ALL also blocks INFO on the replica."""
+              out = {}
+              for node in primaries:
+                  if not node.get("host"):
+                      continue
+                  label = "%s/%s" % (node.get("shard"), node.get("id"))
+                  try:
+                      info = info_replication(node["host"], node["port"], use_tls)
+                      out[label] = {
+                          "master_repl_offset": info.get("master_repl_offset"),
+                          "connected_slaves": info.get("connected_slaves"),
+                          "replicas": info.get("replicas")}
+                  except Exception as exc:
+                      out[label] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+              return out
+
+
+          def instance_region():
+              """Region of this instance from IMDSv2. Used when the Region parameter is empty."""
+              import urllib.request
+              base = "http://169.254.169.254/latest"
+              try:
+                  token = urllib.request.urlopen(urllib.request.Request(
+                      base + "/api/token", method="PUT",
+                      headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=2).read().decode()
+                  region = urllib.request.urlopen(urllib.request.Request(
+                      base + "/meta-data/placement/region",
+                      headers={"X-aws-ec2-metadata-token": token}), timeout=2).read().decode().strip()
+              except Exception as exc:
+                  raise SystemExit("ERROR: Region was not given and could not be read from the instance "
+                                   "metadata service (%s: %s). Pass the Region parameter explicitly."
+                                   % (type(exc).__name__, exc))
+              if not region:
+                  raise SystemExit("ERROR: instance metadata returned an empty Region. "
+                                   "Pass the Region parameter explicitly.")
+              return region
+
+
+          def duty_pause_ms(args):
+              return args.cycle_period_ms * args.duty_cycle_percent // 100
+
+
+          def action_validate(args):
+              if os.path.exists(STATE):
+                  raise SystemExit(
+                      "ERROR: %s already exists, so another run of this experiment is still in "
+                      "flight on this instance. Remove the file only after confirming that no "
+                      "pause is active." % STATE)
+
+              if not 0 <= args.duty_cycle_percent <= 99:
+                  raise SystemExit("ERROR: DutyCyclePercent must be 0-99, got %s"
+                                   % args.duty_cycle_percent)
+              if args.duty_cycle_percent:
+                  if not 100 <= args.cycle_period_ms <= 60000:
+                      raise SystemExit("ERROR: CyclePeriodMilliseconds must be 100-60000, got %s"
+                                       % args.cycle_period_ms)
+                  if duty_pause_ms(args) < 1:
+                      raise SystemExit("ERROR: CyclePeriodMilliseconds x DutyCyclePercent / 100 "
+                                       "rounds down to 0 ms; nothing would be paused.")
+                  log("Duty-cycle mode: CLIENT PAUSE %d %s every %d ms (%d%%) for %d s. "
+                      "PauseMilliseconds is ignored in this mode."
+                      % (duty_pause_ms(args), args.pause_mode, args.cycle_period_ms,
+                         args.duty_cycle_percent, args.duration_seconds))
+              else:
+                  log("Single-pause mode: CLIENT PAUSE %d %s, observed for %d s."
+                      % (args.pause_milliseconds, args.pause_mode, args.duration_seconds))
+
+              replicas, primaries, cluster_enabled = resolve(args)
+              log("Topology: cluster_mode_enabled=%s, %d replica target(s), %d primary node(s)."
+                  % (cluster_enabled, len(replicas), len(primaries)))
+              for node in replicas:
+                  log("  replica target: shard=%s id=%s at %s:%s"
+                      % (node["shard"], node["id"], node["host"], node["port"]))
+
+              for node in replicas:
+                  info = info_replication(node["host"], node["port"], args.use_tls)
+                  if info.get("role") != "slave":
+                      raise SystemExit(
+                          "ERROR: %s reports role=%r over the data plane while discovery called "
+                          "it a replica. Refusing to continue." % (node["id"], info.get("role")))
+                  log("  %s role=slave master_link_status=%s"
+                      % (node["id"], info.get("master_link_status")))
+                  reply = send(node["host"], node["port"], args.use_tls,
+                               "CLIENT", "PAUSE", 1, args.pause_mode)
+                  log("  %s CLIENT PAUSE 1 %s returned %s"
+                      % (node["id"], args.pause_mode, reply))
+
+              os.makedirs(os.path.dirname(STATE), exist_ok=True)
+              with open(STATE, "w") as fh:
+                  json.dump({"replicas": replicas, "primaries": primaries,
+                             "cluster_enabled": cluster_enabled,
+                             "created": time.time()}, fh, indent=2)
+              log("Prerequisites validated. State written to %s" % STATE)
+
+
+          def log_primary_view(primaries, use_tls):
+              for label, data in sorted(primary_view(primaries, use_tls).items()):
+                  if "error" in data:
+                      log("  primary %s unreachable: %s" % (label, data["error"]))
+                      continue
+                  detail = ", ".join(
+                      "%s(offset=%s,lag=%ss,state=%s)"
+                      % (k, v.get("offset"), v.get("lag"), v.get("state"))
+                      for k, v in sorted((data.get("replicas") or {}).items()))
+                  log("  primary %s master_repl_offset=%s  %s"
+                      % (label, data.get("master_repl_offset"), detail))
+
+
+          def inject_duty_cycle(args, replicas, primaries):
+              """Issue a short pause at the start of every period until DurationSeconds.
+
+              CLIENT PAUSE expires on its own, so the gap in each cycle is simply the time
+              in which no new pause is issued. Before every pause the replica's role is
+              re-read over the data plane: if a failover has promoted it, it is dropped
+              from the injection rather than paused as a primary.
+              """
+              period = args.cycle_period_ms / 1000.0
+              pause_ms = duty_pause_ms(args)
+              obs_interval = min(10, max(1, args.duration_seconds // 6))
+              active = list(replicas)
+              issued = dict((n["id"], 0) for n in replicas)
+              failed = dict((n["id"], 0) for n in replicas)
+              skipped = 0
+              start = time.time()
+              deadline = start + args.duration_seconds
+              next_obs = start + obs_interval
+              cycle = 0
+              log("INJECTING duty cycle: CLIENT PAUSE %d %s every %d ms on %d replica(s)."
+                  % (pause_ms, args.pause_mode, args.cycle_period_ms, len(active)))
+              while active and time.time() < deadline:
+                  cycle_start = start + cycle * period
+                  for node in list(active):
+                      try:
+                          role = info_replication(node["host"], node["port"], args.use_tls,
+                                                  timeout=2.0).get("role")
+                          if role != "slave":
+                              log("STOPPED on %s: it now reports role=%r. It is no longer "
+                                  "paused." % (node["id"], role))
+                              active.remove(node)
+                              continue
+                          send(node["host"], node["port"], args.use_tls,
+                               "CLIENT", "PAUSE", pause_ms, args.pause_mode, timeout=2.0)
+                          issued[node["id"]] += 1
+                      except Exception as exc:
+                          failed[node["id"]] += 1
+                          if failed[node["id"]] in (1, 10, 100) or failed[node["id"]] % 1000 == 0:
+                              log("WARNING: cycle %d on %s failed (%s: %s); %d failure(s) so far."
+                                  % (cycle, node["id"], type(exc).__name__, exc,
+                                     failed[node["id"]]))
+                  if time.time() >= next_obs:
+                      # Sample just before this cycle's pause expires, where the backlog
+                      # peaks. Sampling right after issuing the pause would only ever see
+                      # the trough of the sawtooth and under-report the fault.
+                      peak_at = cycle_start + pause_ms * 0.95 / 1000.0
+                      time.sleep(max(0.0, min(peak_at, deadline) - time.time()))
+                      log("  sample near the end of a %d ms pause slice (backlog peak):"
+                          % pause_ms)
+                      log_primary_view(primaries, args.use_tls)
+                      while next_obs <= time.time():
+                          next_obs += obs_interval
+                  cycle += 1
+                  due = start + cycle * period
+                  now = time.time()
+                  if now > due:
+                      # Fell behind (slow replica or observation): skip, never burst.
+                      late = int((now - due) // period) + 1
+                      skipped += late
+                      cycle += late
+                      due = start + cycle * period
+                  time.sleep(max(0.0, min(due, deadline) - time.time()))
+
+              elapsed = max(time.time() - start, 0.001)
+              for node in replicas:
+                  effective = 100.0 * issued[node["id"]] * pause_ms / (elapsed * 1000.0)
+                  log("Duty cycle summary %s: %d pause(s) issued, %d failed, effective duty "
+                      "%.1f%% (requested %d%%)."
+                      % (node["id"], issued[node["id"]], failed[node["id"]], effective,
+                         args.duty_cycle_percent))
+              if skipped:
+                  log("Note: %d cycle(s) were skipped because the loop fell behind schedule."
+                      % skipped)
+              if not any(issued.values()):
+                  raise SystemExit("ERROR: no pause was issued in duty-cycle mode.")
+
+
+          def action_inject(args):
+              with open(STATE) as fh:
+                  state = json.load(fh)
+              replicas, primaries = state["replicas"], state["primaries"]
+
+              log("Primary-side view BEFORE injection:")
+              log(json.dumps(primary_view(primaries, args.use_tls), indent=2))
+
+              if args.duty_cycle_percent:
+                  inject_duty_cycle(args, replicas, primaries)
+                  log("Duty cycle finished. The last pause expires on its own within %d ms."
+                      % duty_pause_ms(args))
+                  return
+
+              for node in replicas:
+                  reply = send(node["host"], node["port"], args.use_tls,
+                               "CLIENT", "PAUSE", args.pause_milliseconds, args.pause_mode)
+                  log("INJECTED: shard=%s %s CLIENT PAUSE %s %s returned %s"
+                      % (node["shard"], node["id"], args.pause_milliseconds,
+                         args.pause_mode, reply))
+
+              interval = min(10, max(1, args.duration_seconds // 6))
+              deadline = time.time() + args.duration_seconds
+              while time.time() < deadline:
+                  time.sleep(interval)
+                  log_primary_view(primaries, args.use_tls)
+
+              log("Observation window finished. The pause expires on its own after %s ms."
+                  % args.pause_milliseconds)
+
+
+          def action_restore(args):
+              if not os.path.exists(STATE):
+                  log("No state file at %s - nothing to restore." % STATE)
+                  return
+              with open(STATE) as fh:
+                  state = json.load(fh)
+              replicas, primaries = state["replicas"], state["primaries"]
+
+              for node in replicas:
+                  try:
+                      reply = send(node["host"], node["port"], args.use_tls, "CLIENT", "UNPAUSE")
+                      log("CLIENT UNPAUSE on %s returned %s" % (node["id"], reply))
+                  except Exception as exc:
+                      log("WARNING: CLIENT UNPAUSE on %s failed (%s: %s). The pause still "
+                          "expires on its own." % (node["id"], type(exc).__name__, exc))
+
+              for node in replicas:
+                  try:
+                      info = info_replication(node["host"], node["port"], args.use_tls, timeout=10.0)
+                      log("POST-CHECK %s master_link_status=%s master_sync_in_progress=%s "
+                          "slave_repl_offset=%s"
+                          % (node["id"], info.get("master_link_status"),
+                             info.get("master_sync_in_progress"), info.get("slave_repl_offset")))
+                  except Exception as exc:
+                      log("WARNING: post-check on %s failed (%s: %s). The replica may still be "
+                          "applying the backlog it accumulated while paused."
+                          % (node["id"], type(exc).__name__, exc))
+
+              log("Primary-side view AFTER restore:")
+              log(json.dumps(primary_view(primaries, args.use_tls), indent=2))
+              os.remove(STATE)
+              log("State file removed.")
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("action", choices=["validate", "inject", "restore"])
+              parser.add_argument("--replication-group-id", required=True)
+              parser.add_argument("--region", default="")
+              parser.add_argument("--pause-mode", default="WRITE", choices=["WRITE", "ALL"])
+              parser.add_argument("--pause-milliseconds", type=int, default=30000)
+              parser.add_argument("--duration-seconds", type=int, default=60)
+              parser.add_argument("--replica-scope", default="ONE_PER_SHARD",
+                                  choices=["ONE_PER_SHARD", "ALL"])
+              parser.add_argument("--target-shard-id", default="")
+              parser.add_argument("--use-tls", default="false")
+              parser.add_argument("--duty-cycle-percent", type=int, default=0)
+              parser.add_argument("--cycle-period-ms", type=int, default=1000)
+              args = parser.parse_args()
+              args.use_tls = str(args.use_tls).lower() == "true"
+              args.target_shard_id = (args.target_shard_id or "").strip()
+              args.region = (args.region or "").strip() or instance_region()
+              log("action=%s replication_group=%s region=%s mode=%s pause_ms=%s duration=%s "
+                  "scope=%s shard=%s tls=%s duty=%s%% period_ms=%s"
+                  % (args.action, args.replication_group_id, args.region, args.pause_mode,
+                     args.pause_milliseconds, args.duration_seconds, args.replica_scope,
+                     args.target_shard_id or "<all>", args.use_tls,
+                     args.duty_cycle_percent, args.cycle_period_ms))
+              {"validate": action_validate,
+               "inject": action_inject,
+               "restore": action_restore}[args.action](args)
+
+
+          if __name__ == "__main__":
+              main()
+          FISPYEOF
+          chmod 700 /tmp/fis/ec_replication_stall.py
+
+          python3 /tmp/fis/ec_replication_stall.py validate \
+            --replication-group-id '{{ReplicationGroupId}}' \
+            --region '{{Region}}' \
+            --pause-mode '{{PauseMode}}' \
+            --pause-milliseconds '{{PauseMilliseconds}}' \
+            --duration-seconds '{{DurationSeconds}}' \
+            --replica-scope '{{ReplicaScope}}' \
+            --target-shard-id '{{TargetShardId}}' \
+            --use-tls '{{UseTls}}' \
+            --duty-cycle-percent '{{DutyCyclePercent}}' \
+            --cycle-period-ms '{{CyclePeriodMilliseconds}}'
+
+  - action: aws:runShellScript
+    name: InjectReplicationStall
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: 3900
+      runCommand:
+        - |
+          #!/bin/bash
+          set -uo pipefail
+          python3 /tmp/fis/ec_replication_stall.py inject \
+            --replication-group-id '{{ReplicationGroupId}}' \
+            --region '{{Region}}' \
+            --pause-mode '{{PauseMode}}' \
+            --pause-milliseconds '{{PauseMilliseconds}}' \
+            --duration-seconds '{{DurationSeconds}}' \
+            --replica-scope '{{ReplicaScope}}' \
+            --target-shard-id '{{TargetShardId}}' \
+            --use-tls '{{UseTls}}' \
+            --duty-cycle-percent '{{DutyCyclePercent}}' \
+            --cycle-period-ms '{{CyclePeriodMilliseconds}}'
+
+  - action: aws:runShellScript
+    name: RestoreAndVerify
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      finallyStep: true
+      timeoutSeconds: 300
+      runCommand:
+        - |
+          #!/bin/bash
+          set -uo pipefail
+          # Runs even when ValidatePrerequisites exits early (finallyStep). If the
+          # helper script was never written there is nothing to restore.
+          if [ ! -f /tmp/fis/ec_replication_stall.py ]; then
+            echo "Helper script not present - ValidatePrerequisites stopped before writing it. Nothing to restore."
+            exit 0
+          fi
+          python3 /tmp/fis/ec_replication_stall.py restore \
+            --replication-group-id '{{ReplicationGroupId}}' \
+            --region '{{Region}}' \
+            --pause-mode '{{PauseMode}}' \
+            --pause-milliseconds '{{PauseMilliseconds}}' \
+            --duration-seconds '{{DurationSeconds}}' \
+            --replica-scope '{{ReplicaScope}}' \
+            --target-shard-id '{{TargetShardId}}' \
+            --use-tls '{{UseTls}}' \
+            --duty-cycle-percent '{{DutyCyclePercent}}' \
+            --cycle-period-ms '{{CyclePeriodMilliseconds}}'
+          rc=$?
+          rm -f /tmp/fis/ec_replication_stall.py
+          exit $rc
