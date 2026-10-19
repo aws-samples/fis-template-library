@@ -44,8 +44,12 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/FIS-DynamoDB-Traffic-Blackhole-Role",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
   "experimentOptions": {
+    "accountTargeting": "single-account",
     "emptyTargetResolutionMode": "skip"
+  },
+  "tags": {
+    "Name": "DynamoDBTrafficBlackholeRegionImpairment"
   }
 }
