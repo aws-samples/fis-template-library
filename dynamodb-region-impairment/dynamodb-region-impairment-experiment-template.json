@@ -26,7 +26,7 @@
       "parameters": {
         "maxDuration": "PT15M",
         "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DynamoDB-Region-Impairment",
-        "documentParameters": "{\"tableName\": \"<YOUR TABLE NAME>\", \"targetRegion\": \"<YOUR REGION>\", \"duration\": \"PT10M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/SSM-DynamoDB-Automation-Role\"}"
+        "documentParameters": "{\"tableName\": \"<YOUR TABLE NAME>\", \"targetRegion\": \"<YOUR REGION>\", \"duration\": \"PT10M\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\"}"
       },
       "targets": {}
     }
@@ -36,8 +36,12 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/FIS-DynamoDB-Role",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+  "tags": {
+    "Name": "DynamoDBRegionImpairment"
+  },
   "experimentOptions": {
+    "accountTargeting": "single-account",
     "emptyTargetResolutionMode": "skip"
   }
 }
