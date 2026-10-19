@@ -37,7 +37,13 @@ The experiment follows this sequence:
 1. **Target Resolution**: FIS resolves all replication groups tagged `FIS-Ready=True` in the specified AZ.
 2. **Power Interruption**: FIS interrupts power to nodes in the target AZ. If the primary is in that AZ, automatic failover promotes the replica with the least replication lag.
 3. **Reduced Capacity**: Replica replacements in the impaired AZ are blocked for the experiment duration (`PT10M` by default).
-4. **Recovery**: After the experiment ends, the impaired AZ is restored and nodes rejoin the replication group.
+4. **Recovery**: After the experiment ends, the impaired AZ is restored and nodes rejoin the replication group. The primary does not move back: the recovered node rejoins as a replica.
+
+> **Note**: Timings measured in two test runs on a two-node Redis OSS 7.1 replication group (`cache.t4g.micro`) in `us-east-1`:
+>
+> * Power loss is not immediate. The node in the target AZ stopped answering 42 and 74 seconds after the FIS action started. Writes on the primary endpoint resumed 23 and 31 seconds after that. Measure the hypothesis's 30-second failover from when the node stops answering, not from when the action starts.
+> * `describe-replication-groups` showed every member `available` within 2 minutes of the experiment ending, but the node in the target AZ answered clients again only about 9 to 10 minutes after the experiment ended or was stopped. Check reachability from a client before you treat the cluster as back at full capacity.
+> * While the recovering node still did not answer clients, the CloudWatch `IsMaster` metric for that node showed `1` for one minute. Account for this if you alarm on `IsMaster`.
 
 > **Note**: Resource targeting for this action supports `resourceTags` and `filters`. Targeting by `resourceArns` is not supported and is rejected at template creation time.
 
@@ -53,9 +59,7 @@ watch -n 5 'aws elasticache describe-replication-groups \
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined. The AZ power interruption lasts for the configured `duration` parameter (`PT10M` by default) and recovers automatically.
-
-## Observability and stop conditions
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the configured `duration` parameter (`PT10M` by default) ends. Stopping it early ends the power interruption, but in testing the node in the target AZ still took about 9 minutes to answer clients again.
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
