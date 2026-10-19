@@ -62,6 +62,14 @@ curl -I https://<your-app>/health
 
 During the experiment, the cluster status changes from `available` to `rebooting cache cluster nodes` as soon as the reboot is requested. The node status changes to `rebooting` only when the node actually restarts. Then the event `Cache node 0001 restarted` appears, and the cluster and node return to `available`.
 
+> **Note**: Measured in seven test runs on a two-node Redis OSS 7.1 replication group (`cache.t4g.micro`) in `us-east-1`, with a client opening a new connection to the primary endpoint every second:
+>
+> * The node kept serving for 2 to 4 minutes after `RebootCacheCluster` was called (112 to 247 seconds), then restarted.
+> * Writes on the primary endpoint failed for 6 to 7 seconds while it restarted. The same node stayed primary.
+> * After every restart the data was gone: a counter that had been incremented between 1,164 and 31,137 times started again at 1.
+> * The cluster showed `available` again 3 to 5 minutes after the call (186 to 310 seconds), about a minute after the node answered again.
+> * Stopping the experiment within 10 seconds of the call did not prevent the restart or the data loss.
+
 ## Stop Conditions
 
 The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped, until the rebooted nodes are available again, or after 30 minutes (`maxDuration`). Stopping it early does not cancel a reboot that ElastiCache has accepted.
