@@ -6,7 +6,7 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Hypothesis
 
-When Redis connections are disrupted, applications should gracefully handle the failure through circuit breaker mechanisms within 30 seconds, and continue operating in degraded mode without cascading failures. Once Redis connectivity is restored, normal operations should resume within 60 seconds, and clients should reconnect without a retry storm: the cluster's [`NewConnections`](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/CacheMetrics.Redis.html) metric should return to its pre-fault level within 5 minutes.
+When Redis connections are disrupted, applications should gracefully handle the failure through circuit breaker mechanisms within 30 seconds, and continue operating in degraded mode without cascading failures. Once Redis connectivity is restored, normal operations should resume within 60 seconds, and clients should reconnect without a retry storm, which you can observe as a spike in the cluster's [`NewConnections`](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/CacheMetrics.Redis.html) metric.
 
 ### What does this enable me to verify?
 
