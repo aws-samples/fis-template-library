@@ -20,7 +20,7 @@ When the Redis primary node fails over to a replica, applications should detect 
 
 Before running this experiment, ensure that:
 
-1. You have created two IAM roles: one for FIS (trust policy `fis-iam-trust-relationship.json`, permissions `elasticache-redis-primary-node-failover-fis-role-iam-policy.json`) and one for SSM Automation (trust policy `ssm-iam-trust-relationship.json`, permissions `elasticache-redis-primary-node-failover-ssm-role-iam-policy.json`). In both policies, replace `<YOUR REGION>`, `<YOUR AWS ACCOUNT>` and `<YOUR SSM AUTOMATION ROLE NAME>`.
+1. You have created two IAM roles: one for FIS (trust policy `fis-iam-trust-relationship.json`, permissions `elasticache-redis-primary-node-failover-fis-role-iam-policy.json`) and one for SSM Automation (trust policy `ssm-iam-trust-relationship.json`, permissions `elasticache-redis-primary-node-failover-ssm-role-iam-policy.json`). Replace `<YOUR REGION>` and `<YOUR AWS ACCOUNT>` in both policies, and `<YOUR SSM AUTOMATION ROLE NAME>` in the FIS role policy.
 2. You have created the SSM Automation document `ElastiCache-Redis-Primary-Node-Failover` from `elasticache-redis-primary-node-failover-automation.json`. The FIS template and the FIS role policy refer to the document by this name.
 3. You have created the FIS experiment template from `elasticache-redis-primary-node-failover-experiment-template.json`, replacing `<YOUR REGION>`, `<YOUR AWS ACCOUNT>`, `<YOUR ROLE NAME>` (the FIS role) and `<YOUR SSM AUTOMATION ROLE NAME>` (the SSM Automation role).
 4. The ElastiCache (Redis OSS) replication groups you want to target have the `FIS-Ready=True` tag. The experiment fails over the primary of the first node group (shard) of every replication group in the Region that carries this tag.
@@ -39,6 +39,12 @@ This experiment forces a Redis primary node failover by using the ElastiCache Te
 
 ElastiCache updates the primary endpoint to point to the new primary, and the former primary becomes a replica. The original primary does not come back; the roles stay swapped.
 
+> **Note**: Measured in four test runs on a two-node Redis OSS 7.1 replication group (`cache.t4g.micro`) in `us-east-1`, with a client opening a new connection to the primary endpoint every second:
+>
+> * Writes on the primary endpoint failed for 26 to 38 seconds after `TestFailover` was called (30, 35, 38 and 26 seconds).
+> * The former primary did not answer clients until just before ElastiCache reported `Finished recovery for cache nodes`, 9 to 11 minutes after `TestFailover` was called. Until then the group had no working replica.
+> * No acknowledged writes were lost.
+
 To verify the experiment is working properly, you can monitor the primary node before and after:
 
 ```bash
@@ -52,7 +58,7 @@ watch -n 5 'aws elasticache describe-replication-groups --replication-group-id <
 aws elasticache describe-events --source-type replication-group --source-identifier <YOUR-CLUSTER-ID> --duration 60
 ```
 
-The group status may stay `available` the whole time, so follow the failover with the events command. You should see, in order, `Test Failover API called for node group <id>` and `Failover from master node <old primary> to replica node <new primary> completed`. The former primary's own events (`--source-type cache-cluster --source-identifier <old primary>`) then show `Recovering cache nodes` and, several minutes later, `Finished recovery for cache nodes`.
+In testing, the group status stayed `available` the whole time, so follow the failover with the events command. You should see, in order, `Test Failover API called for node group <id>` and `Failover from master node <old primary> to replica node <new primary> completed`. The former primary's own events (`--source-type cache-cluster --source-identifier <old primary>`) then show `Recovering cache nodes` and, several minutes later, `Finished recovery for cache nodes`.
 
 ## Stop Conditions
 
