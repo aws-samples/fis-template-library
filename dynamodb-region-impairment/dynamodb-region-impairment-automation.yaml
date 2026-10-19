@@ -1,4 +1,4 @@
-description: "Block DynamoDB table access by modifying table resource policy"
+description: "Block DynamoDB table access in one Region by adding a deny statement to the table's resource-based policy, then remove it"
 schemaVersion: "0.3"
 assumeRole: "{{ AutomationAssumeRole }}"
 parameters:
@@ -24,106 +24,90 @@ mainSteps:
     action: aws:sleep
     inputs:
       Duration: PT10S
-  
+
   - name: applyDenyPolicy
     action: aws:executeScript
+    timeoutSeconds: 120
     onFailure: step:cleanupPolicy
     onCancel: step:cleanupPolicy
     inputs:
       Runtime: python3.11
       Handler: apply_deny_policy
       Script: |
-        import boto3
         import json
         import time
+        import boto3
+        from botocore.exceptions import ClientError
+
+        SID = "FISDenyAccess"
+        FIS_PREFIX = "DoNotModifyFisDynamoDbPauseReplication"
+        ACTIONS = [
+            "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan",
+            "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem",
+            "dynamodb:ConditionCheckItem", "dynamodb:PartiQLSelect", "dynamodb:PartiQLInsert",
+            "dynamodb:PartiQLUpdate", "dynamodb:PartiQLDelete"
+        ]
+
+        def read_policy(ddb, arn):
+            try:
+                r = ddb.get_resource_policy(ResourceArn=arn)
+                return json.loads(r["Policy"]), r["RevisionId"]
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "PolicyNotFoundException":
+                    return None, "NO_POLICY"
+                raise
+
+        def statements(policy):
+            st = (policy or {}).get("Statement", [])
+            return st if isinstance(st, list) else [st]
+
+        def sids(policy):
+            return [s.get("Sid", "") for s in statements(policy)]
 
         def apply_deny_policy(events, context):
-            table_name = events['tableName']
-            target_region = events['targetRegion']
-            
-            # Create DynamoDB client for target region
-            dynamodb = boto3.client('dynamodb', region_name=target_region)
-            
-            # Get current table description
-            response = dynamodb.describe_table(TableName=table_name)
-            table_arn = response['Table']['TableArn']
-            
-            # Check for existing resource policy
-            existing_policy = None
-            try:
-                policy_response = dynamodb.get_resource_policy(ResourceArn=table_arn)
-                existing_policy = json.loads(policy_response['Policy'])
-                print(f"Found existing policy on table {table_name}")
-            except (dynamodb.exceptions.ResourceNotFoundException, dynamodb.exceptions.PolicyNotFoundException):
-                print(f"No existing policy on table {table_name}")
-            
-            # Create deny statement
-            deny_statement = {
-                "Sid": "FISDenyAccess",
+            table = events["tableName"]
+            region = events["targetRegion"]
+            ddb = boto3.client("dynamodb", region_name=region)
+            desc = ddb.describe_table(TableName=table)["Table"]
+            arn = desc["TableArn"]
+            indexes = [i["IndexName"] for i in desc.get("GlobalSecondaryIndexes", []) + desc.get("LocalSecondaryIndexes", [])]
+            account = arn.split(":")[4]
+            replication_role = ("arn:aws:iam::" + account + ":role/aws-service-role/"
+                                "replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication")
+            # Every principal is denied except the DynamoDB replication service-linked role, so replication stays
+            # under the FIS pause action's control. Each index is listed, because the table ARN does not cover it.
+            deny = {
+                "Sid": SID,
                 "Effect": "Deny",
                 "Principal": "*",
-                "Action": [
-                    "dynamodb:PutItem",
-                    "dynamodb:GetItem",
-                    "dynamodb:UpdateItem",
-                    "dynamodb:DeleteItem",
-                    "dynamodb:Query",
-                    "dynamodb:Scan",
-                    "dynamodb:BatchGetItem",
-                    "dynamodb:BatchWriteItem"
-                ],
-                "Resource": table_arn,
-                "Condition": {
-                    "StringNotEquals": {
-                        "aws:PrincipalArn": [
-                            "arn:aws:iam::*:role/*SSM*",
-                            "arn:aws:iam::*:role/*FIS*",
-                            "arn:aws:iam::*:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication"
-                        ]
-                    }
-                }
+                "Action": ACTIONS,
+                "Resource": [arn] + [arn + "/index/" + n for n in indexes],
+                "Condition": {"ArnNotEquals": {"aws:PrincipalArn": replication_role}}
             }
-            
-            # Merge with existing policy or create new one
-            if existing_policy:
-                new_policy = existing_policy.copy()
-                new_policy['Statement'].append(deny_statement)
-            else:
-                new_policy = {
-                    "Version": "2012-10-17",
-                    "Statement": [deny_statement]
-                }
-            
-            
-            try:
-                # Apply the merged resource policy with retry logic
-                max_retries = 5
-                for attempt in range(max_retries):
-                    try:
-                        dynamodb.put_resource_policy(
-                            ResourceArn=table_arn,
-                            Policy=json.dumps(new_policy)
-                        )
-                        break
-                    except dynamodb.exceptions.ResourceInUseException:
-                        if attempt < max_retries - 1:
-                            print(f"Table busy, retrying in {2**attempt} seconds...")
-                            time.sleep(2**attempt)
-                        else:
-                            raise
-                
-                print(f"Applied deny policy to table {table_name} in {target_region}")
-                
-                return {
-                    "statusCode": 200, 
-                    "tableArn": table_arn,
-                    "targetRegion": target_region,
-                    "existingPolicy": existing_policy,
-                    "body": f"Successfully applied deny policy to {table_name}"
-                }
-            except Exception as e:
-                print(f"Error applying policy: {str(e)}")
-                raise e
+            # GetResourcePolicy is eventually consistent. Wait until the FIS pause statement is visible, then write
+            # with ExpectedRevisionId so the deny can only be added to the revision that was read.
+            deadline = time.time() + 60
+            policy, rev = read_policy(ddb, arn)
+            while not any(s.startswith(FIS_PREFIX) for s in sids(policy)) and time.time() < deadline:
+                time.sleep(5)
+                policy, rev = read_policy(ddb, arn)
+            if not any(s.startswith(FIS_PREFIX) for s in sids(policy)):
+                print("WARNING: no FIS pause statement on " + arn + " after 60 s; adding the deny anyway")
+            for attempt in range(8):
+                if SID in sids(policy):
+                    print(SID + " is already on " + arn)
+                    return {"tableArn": arn}
+                new = dict(policy) if policy else {"Version": "2012-10-17"}
+                new["Statement"] = statements(policy) + [deny]
+                try:
+                    ddb.put_resource_policy(ResourceArn=arn, Policy=json.dumps(new), ExpectedRevisionId=rev)
+                    print("Added " + SID + " to " + arn + " (expected revision " + rev + ")")
+                    return {"tableArn": arn}
+                except ClientError as e:
+                    print("Put failed (" + e.response["Error"]["Code"] + "); reading the policy again")
+                    time.sleep(min(2 ** attempt, 15))
+                    policy, rev = read_policy(ddb, arn)
+            raise Exception("Could not add " + SID + " to " + arn)
       InputPayload:
         tableName: "{{ tableName }}"
         targetRegion: "{{ targetRegion }}"
@@ -131,80 +115,74 @@ mainSteps:
       - Name: tableArn
         Selector: $.Payload.tableArn
         Type: String
-      - Name: targetRegion
-        Selector: $.Payload.targetRegion
-        Type: String
-      - Name: existingPolicy
-        Selector: $.Payload.existingPolicy
-        Type: StringMap
 
   - name: waitForDuration
     action: aws:sleep
+    onFailure: step:cleanupPolicy
+    onCancel: step:cleanupPolicy
     inputs:
       Duration: "{{ duration }}"
 
   - name: cleanupPolicy
     action: aws:executeScript
+    timeoutSeconds: 100
     inputs:
       Runtime: python3.11
       Handler: cleanup_policy
       Script: |
-        import boto3
         import json
+        import time
+        import boto3
+        from botocore.exceptions import ClientError
+
+        SID = "FISDenyAccess"
+
+        def read_policy(ddb, arn):
+            try:
+                r = ddb.get_resource_policy(ResourceArn=arn)
+                return json.loads(r["Policy"]), r["RevisionId"]
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "PolicyNotFoundException":
+                    return None, "NO_POLICY"
+                raise
+
+        def statements(policy):
+            st = (policy or {}).get("Statement", [])
+            return st if isinstance(st, list) else [st]
 
         def cleanup_policy(events, context):
-            table_arn = events.get('tableArn')
-            target_region = events.get('targetRegion')
-            table_name = events.get('tableName')
-            existing_policy = events.get('existingPolicy')
-            
-            # If we don't have tableArn from previous step, try to get it
-            if not table_arn and table_name and target_region:
-                dynamodb = boto3.client('dynamodb', region_name=target_region)
-                response = dynamodb.describe_table(TableName=table_name)
-                table_arn = response['Table']['TableArn']
-            
-            if table_arn and target_region:
-                dynamodb = boto3.client('dynamodb', region_name=target_region)
-                try:
-                    # Get current policy to see what's there now
-                    current_policy_response = dynamodb.get_resource_policy(ResourceArn=table_arn)
-                    current_policy = json.loads(current_policy_response['Policy'])
-                    
-                    # Remove only our FISDenyAccess statement by SID
-                    filtered_statements = [
-                        stmt for stmt in current_policy.get('Statement', [])
-                        if stmt.get('Sid') != 'FISDenyAccess'
-                    ]
-                    
-                    if filtered_statements:
-                        # Keep other statements, remove only ours
-                        cleaned_policy = {
-                            "Version": current_policy.get("Version", "2012-10-17"),
-                            "Statement": filtered_statements
-                        }
-                        dynamodb.put_resource_policy(
-                            ResourceArn=table_arn,
-                            Policy=json.dumps(cleaned_policy)
-                        )
-                        print(f"Removed FISDenyAccess statement, preserved other policies on table {table_arn}")
-                    else:
-                        # No other statements, delete entire policy
-                        dynamodb.delete_resource_policy(ResourceArn=table_arn)
-                        print(f"Removed entire policy from table {table_arn}")
-                    
-                    return {"statusCode": 200, "body": "Successfully cleaned up policy"}
-                except Exception as e:
-                    print(f"Error cleaning up policy: {str(e)}")
-                    # Don't fail if policy doesn't exist
-                    if "ResourceNotFoundException" in str(e) or "PolicyNotFoundException" in str(e):
-                        return {"statusCode": 200, "body": "Policy already removed"}
-                    raise e
-            else:
-                print("No table ARN provided for cleanup")
-                return {"statusCode": 200, "body": "No cleanup needed"}
+            table = events["tableName"]
+            region = events["targetRegion"]
+            ddb = boto3.client("dynamodb", region_name=region)
+            arn = ddb.describe_table(TableName=table)["Table"]["TableArn"]
+            # Remove only FISDenyAccess and keep every other statement. Each write is conditional on the revision
+            # just read. DynamoDB blocks policy updates for 15 s after each successful update, and FIS removes its
+            # own statements at the same moment when the experiment is stopped, so the step ends only after 6 reads
+            # in a row, 5 s apart, without the statement. The loop fits Automation's two-minute cancellation limit.
+            deadline = time.time() + 75
+            clean = 0
+            while time.time() < deadline:
+                policy, rev = read_policy(ddb, arn)
+                keep = [s for s in statements(policy) if s.get("Sid") != SID]
+                if len(keep) == len(statements(policy)):
+                    clean += 1
+                    if clean >= 6:
+                        print(SID + " is not on " + arn)
+                        return {"tableArn": arn, "remainingSids": [s.get("Sid", "") for s in keep]}
+                else:
+                    clean = 0
+                    try:
+                        if keep:
+                            new = dict(policy)
+                            new["Statement"] = keep
+                            ddb.put_resource_policy(ResourceArn=arn, Policy=json.dumps(new), ExpectedRevisionId=rev)
+                        else:
+                            ddb.delete_resource_policy(ResourceArn=arn, ExpectedRevisionId=rev)
+                        print("Removed " + SID + " from " + arn + " (expected revision " + rev + ")")
+                    except ClientError as e:
+                        print("Write failed (" + e.response["Error"]["Code"] + "); reading the policy again")
+                time.sleep(5)
+            raise Exception(SID + " is still on " + arn + " after 75 s")
       InputPayload:
-        tableArn: "{{ applyDenyPolicy.tableArn }}"
-        targetRegion: "{{ applyDenyPolicy.targetRegion }}"
         tableName: "{{ tableName }}"
-        existingPolicy: "{{ applyDenyPolicy.existingPolicy }}"
+        targetRegion: "{{ targetRegion }}"

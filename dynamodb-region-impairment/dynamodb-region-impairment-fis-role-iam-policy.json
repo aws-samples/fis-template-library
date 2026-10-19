@@ -2,35 +2,45 @@
     "Version": "2012-10-17",
     "Statement": [
         {
+            "Sid": "AllowPauseReplicationPolicyChanges",
             "Effect": "Allow",
             "Action": [
-                "dynamodb:PauseReplication",
-                "dynamodb:ResumeReplication",
                 "dynamodb:PutResourcePolicy",
                 "dynamodb:DeleteResourcePolicy",
                 "dynamodb:GetResourcePolicy",
-                "dynamodb:DescribeTable",
-                "dynamodb:ListTagsOfResource",
-                "dynamodb:ListTables",
+                "dynamodb:DescribeTable"
+            ],
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
+        },
+        {
+            "Sid": "AllowTargetResolution",
+            "Effect": "Allow",
+            "Action": [
                 "tag:GetResources"
             ],
             "Resource": "*"
         },
         {
+            "Sid": "AllowSSMDocumentExecution",
             "Effect": "Allow",
             "Action": [
                 "ssm:StartAutomationExecution",
                 "ssm:GetAutomationExecution",
                 "ssm:StopAutomationExecution"
             ],
-            "Resource": "*"
+            "Resource": [
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DynamoDB-Region-Impairment",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-definition/DynamoDB-Region-Impairment:*",
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+            ]
         },
         {
+            "Sid": "AllowPassSSMAutomationRole",
             "Effect": "Allow",
             "Action": [
                 "iam:PassRole"
             ],
-            "Resource": "arn:aws:iam::*:role/*SSM*"
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"
         }
     ]
 }
