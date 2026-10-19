@@ -7,8 +7,8 @@
       "description": "Reboot Redis primary node and monitor recovery",
       "parameters": {
         "maxDuration": "PT30M",
-        "documentArn": "arn:aws:ssm:us-east-1:<YOUR-ACCOUNT-ID>:document/ElastiCache-Redis-Primary-Node-Reboot",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"region\": \"us-east-1\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR-ACCOUNT-ID>:role/ElastiCache-SSM-Automation-Role\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ElastiCache-Redis-Primary-Node-Reboot",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\"}"
       },
       "targets": {}
     }
@@ -18,7 +18,7 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR-ACCOUNT-ID>:role/ElastiCache-FIS-Role",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
   "tags": {
     "Name": "ElastiCacheRedisPrimaryNodeRebootTest",
     "Purpose": "resilience-testing"
