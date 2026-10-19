@@ -206,7 +206,7 @@ mainSteps:
 
   - name: verifyHealthy
     action: aws:executeScript
-    timeoutSeconds: 110
+    timeoutSeconds: 60
     isEnd: true
     inputs:
       Runtime: python3.11
@@ -259,7 +259,7 @@ mainSteps:
                     healthy_since = None
                 elif healthy_since is None:
                     healthy_since = time.time()
-                if healthy_since is not None and time.time() - healthy_since >= 30:
+                if healthy_since is not None and time.time() - healthy_since >= 20:
                     print("All tagged replication groups are healthy")
                     return {"Status": "healthy"}
                 if time.time() > deadline:
@@ -270,12 +270,12 @@ mainSteps:
                                "cancelled: the node restarts on its own, and its data is cleared.")
                     print(message)
                     return {"Status": message}
-                time.sleep(10)
+                time.sleep(5)
       InputPayload:
         region: "{{ global:REGION }}"
         tagKey: "{{ tagKey }}"
         tagValue: "{{ tagValue }}"
-        timeoutSeconds: "85"
+        timeoutSeconds: "30"
     outputs:
       - Name: Status
         Selector: $.Payload.Status
