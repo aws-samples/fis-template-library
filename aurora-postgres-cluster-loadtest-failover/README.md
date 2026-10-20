@@ -1,4 +1,4 @@
-# AWS Fault Injection Service Experiment: Aurora Cluster CPU Overload and Failover
+# AWS Fault Injection Service Experiment: Aurora PostgreSQL Cluster Load Test and Failover
 
 This is an experiment template for use with AWS Fault Injection Service (FIS) and fis-template-library-tooling. This experiment template requires deployment into your AWS account and requires resources in your AWS account to inject faults into.
 
@@ -6,7 +6,7 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Description
 
-This experiment simulates CPU overload on an Aurora PostgreSQL cluster and then initiates a failover to test the resilience of your database infrastructure under stress conditions.
+This experiment runs a database load test against an Aurora PostgreSQL cluster from an EC2 instance, and fails over the cluster 5 minutes after the load test starts, while the load is still running. It tests how your database and application behave when the writer changes under load. The load test does not saturate the database: in our tests with db.t4g.medium instances, it raised the writer's CPU utilization from about 10% to about 72%.
 
 ## Hypothesis
 
@@ -16,36 +16,39 @@ When high CPU load occurs on an Aurora cluster followed by a subsequent failover
 
 Before running this experiment, ensure that:
 
-1. You have an Aurora PostgreSQL cluster tagged with `FIS-Ready=True`
-2. **You have an EC2 instance tagged with `FIS-Ready=True` that serves as the load generator**
-   - This instance must have network connectivity to your Aurora cluster
-   - The instance must have the SSM Agent installed and running
-   - The instance requires appropriate IAM permissions to execute SSM documents
-   - The instance will execute CPU-intensive database queries against the Aurora cluster
-3. The Aurora cluster is configured for Multi-AZ deployment with writer and reader instances
-4. You have created the required IAM role with the provided policy document
-5. You have deployed the SSM document for load testing
-6. You have configured appropriate CloudWatch monitoring and alarms
+1. You have the necessary permissions to execute the FIS experiment and to create the resources listed below.
+2. The IAM role specified in the `roleArn` field has the permissions in `aurora-postgres-cluster-loadtest-failover-iam-policy.json` and the trust policy in `fis-iam-trust-relationship.json`. Replace `<YOUR ROLE NAME>` in the template with the role's name.
+3. The Aurora PostgreSQL cluster you want to target has the `FIS-Ready=True` tag and at least one reader instance, so that it can fail over.
+4. The EC2 instance that generates the load has the `FIS-Ready=True` tag and meets the requirements in [EC2 Instance Setup](#ec2-instance-setup).
+5. Both targets use `selectionMode` `ALL`. Every cluster of resource type `aws:rds:cluster` that has the tag in the Region fails over, and every EC2 instance that has the tag runs the load test.
+6. In the same Region, you have created:
+   - the SSM document `aurora-cluster-loadtest-document` from `aurora-postgres-cluster-loadtest-failover-ssm-template.json`. The template refers to the document by this name.
+   - a Parameter Store `String` parameter `/aurora-cluster/endpoint` whose value is the cluster endpoint. The document reads the database host from it.
+   - a Secrets Manager secret `aurora-cluster-password` whose secret string is JSON with a `password` key that holds the database user's password. The document reads the password from it at run time.
+   - the database user `postgres` and the database `mydb` on the cluster. The user must be able to create tables in `mydb`.
+   - the CloudWatch Logs log group `FISExperimentLogs`. The template sends the experiment log there.
+
+   To use another host, port, database or user, set `DBHost`, `DBPort`, `DBName` or `DBUser` in the template's `documentParameters`, or change the document's defaults.
 
 ## Architecture Overview
 
 This experiment uses the following components:
 
-- **Aurora PostgreSQL Cluster**: The target database that will experience CPU load and failover
-- **EC2 Load Generator Instance**: Executes the SSM document to generate database load
-- **SSM Document**: Contains the load testing scripts that create CPU-intensive queries
-- **FIS Experiment**: Orchestrates the load generation and failover sequence
+- **Aurora PostgreSQL Cluster**: The target database that receives the load and fails over
+- **EC2 Load Generator Instance**: Runs the SSM document that generates the database load
+- **SSM Document**: Installs the PostgreSQL client and runs the load test queries
+- **FIS Experiment**: Starts the load test and, 5 minutes later, the failover
 
-**Critical**: The EC2 instance acts as the load generator and must be able to connect to your Aurora cluster. The SSM document will be executed on this instance, not directly on the Aurora cluster.
+**Critical**: The EC2 instance acts as the load generator and must be able to connect to your Aurora cluster. The SSM document runs on this instance, not on the Aurora cluster.
 
 ## EC2 Instance Setup
 
 Your EC2 instance must meet these requirements:
 
-1. **Network Access**: Security groups must allow outbound connections to Aurora on port 5432
-2. **PostgreSQL Client**: Install `postgresql-client` or equivalent for database connectivity
+1. **Network Access**: The instance's security group allows outbound connections to the cluster on port 5432, and the cluster's security group allows inbound connections from the instance on port 5432. The instance also needs outbound HTTPS to Systems Manager, Secrets Manager and the operating system's package repositories.
+2. **PostgreSQL Client**: The SSM document's first step installs the client with `yum` or `apt-get` on Amazon Linux, CentOS, RHEL, Ubuntu and Debian, and fails on other operating systems. Our tests used Amazon Linux 2023.
 3. **SSM Agent**: Ensure SSM Agent is installed and the instance appears in Systems Manager
-4. **IAM Role**: Attach an IAM role with `AmazonSSMManagedInstanceCore` policy
+4. **IAM Role**: Attach an instance profile whose role has the `AmazonSSMManagedInstanceCore` policy and `secretsmanager:GetSecretValue` on the secret `aurora-cluster-password`
 5. **Tagging**: Tag the instance with `FIS-Ready=True`
 
 Test connectivity before running the experiment:
@@ -63,7 +66,7 @@ psql -h your-aurora-endpoint -U your-username -d your-database -c "SELECT 1;"
 
 ### Impact:
 - Tables will persist after the experiment completes
-- Test data will be inserted during load testing
+- No rows are inserted: the tables stay empty, and the document's `NumRecords` parameter is not used
 - No existing data will be modified or deleted
 - Tables use `IF NOT EXISTS` clauses to avoid conflicts
 - Indexes will be created for performance testing
@@ -77,34 +80,44 @@ DROP TABLE IF EXISTS load_test_users;
 
 ## How it works
 
-This experiment simulates a high CPU load scenario followed by an Aurora DB cluster failover:
+This experiment runs a database load test and fails over the Aurora DB cluster while the load runs:
 
-1. **Baseline establishment**: 5-minute delay to establish baseline metrics
-2. **CPU load generation**: SSM document executes CPU-intensive queries on the Aurora cluster
-3. **Failover initiation**: After the delay, promotes an Aurora Replica to be the primary writer
-4. **Impact observation**: Load test continues to observe failover impact on performance
+1. **Load generation**: `RunLoadTest` starts with the experiment. It runs the SSM document on the load generator with `Duration` 600 and `Concurrency` 10. The document installs the PostgreSQL client, connects to the database, creates the tables if they don't exist, and starts 10 loops. Each loop opens a new connection, runs a query that joins the two tables, and waits 0.1 seconds. After 600 seconds the document stops the loops.
+2. **Baseline**: `DelayAction` waits 5 minutes.
+3. **Failover**: `FailoverCluster` then calls `FailoverDBCluster`, which promotes a reader instance to writer while the load test is still running.
+4. **After the failover**: the load test keeps running against the cluster endpoint, which now points to the new writer, until its 600 seconds are up. The document doesn't record any results, because it discards the queries' output and errors. Watch your own metrics, such as the cluster's CloudWatch metrics and your application's error rate.
+
+Measured in our tests, with db.t4g.medium instances, in the two runs that ran to completion:
+- The load ran at about 220 transactions per second, and the writer's CPU utilization rose from about 10% to about 72%.
+- FIS called `FailoverDBCluster` 301-302 seconds after the load started. RDS reported the failover complete 15-20 seconds later, and the cluster had one writer and one available reader again 26-27 seconds after that.
+- Our test clients saw 1-7 seconds of failed requests, and no acknowledged write was lost.
+- The load ended with the document's 600 seconds, 3 seconds after FIS marked the `RunLoadTest` action completed.
 
 The experiment targets resources with the `FIS-Ready=True` tag for safety and control.
 
-## Observability and stop conditions
+## Stop Conditions
 
-This template does not include stop conditions by default. You should add CloudWatch alarms based on your specific operational metrics to automatically halt the experiment if critical thresholds are breached.
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until the load test finishes, 10 minutes after the experiment starts. If you stop the experiment while the load test runs, FIS cancels the load test's command and the load stops: in our tests it stopped within 2 seconds of the stop, and no load test process was left on the instance. Stopping doesn't undo a failover that has already run.
+
+Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
+business metric requiring an immediate end of the fault injection. This 
+template makes no assumptions about your application and the relevant metrics 
+and does not include stop conditions by default.
 
 ## Files included
 
-- `aurora-cluster-failover-template.json`: Main FIS experiment template
-- `aurora-cluster-failover-iam-policy.json`: Required IAM permissions
-- `aurora-cluster-failover-ssm-template.json`: SSM document for load testing
+- `aurora-postgres-cluster-loadtest-failover-template.json`: Main FIS experiment template
+- `aurora-postgres-cluster-loadtest-failover-iam-policy.json`: Required IAM permissions
+- `aurora-postgres-cluster-loadtest-failover-ssm-template.json`: SSM document for load testing
 - `fis-iam-trust-relationship.json`: IAM trust policy for FIS service
 
-## Next steps
+## Next Steps
+As you adapt this scenario to your needs, we recommend:
+1. Reviewing the tag names you use to ensure they fit your specific use case.
+2. Identifying business metrics tied to the database operations your application runs on the targeted cluster.
+3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the load and the failover.
+4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
+5. Testing the experiment in a non-production environment first, and checking how your application's connection handling copes with the writer change.
 
-1. Review and customize the experiment parameters for your environment
-2. Set up CloudWatch monitoring and create appropriate alarms
-3. Add stop conditions based on your operational metrics
-4. Test the experiment in a non-production environment first
-5. Create a CloudWatch dashboard to visualize experiment effects
-
-## Import experiment
-
-You can import the JSON experiment template into your AWS account via CLI or AWS CDK. For step-by-step instructions, see the [fis-template-library-tooling](https://github.com/aws-samples/fis-template-library-tooling) repository.
+## Import Experiment
+You can import the json experiment template into your AWS account via cli or aws cdk. For step by step instructions on how, [click here](https://github.com/aws-samples/fis-template-library-tooling).
