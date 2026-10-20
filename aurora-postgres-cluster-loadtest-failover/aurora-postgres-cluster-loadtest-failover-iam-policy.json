@@ -4,20 +4,14 @@
     {
       "Effect": "Allow",
       "Action": [
-        "fis:InjectApiInternalError",
-        "fis:InjectApiThrottleError",
-        "fis:InjectApiUnavailableError"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
         "rds:FailoverDBCluster",
         "rds:DescribeDBClusters",
         "rds:DescribeDBInstances"
       ],
-      "Resource": "*",
+      "Resource": [
+        "arn:aws:rds:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster:*",
+        "arn:aws:rds:<YOUR REGION>:<YOUR AWS ACCOUNT>:db:*"
+      ],
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/FIS-Ready": "True"
@@ -34,8 +28,7 @@
         "ssm:DescribeDocumentParameters"
       ],
       "Resource": [
-        "arn:aws:ssm:*:*:document/aurora-cluster-loadtest-document",
-        "arn:aws:ssm:*:*:document/AWS-RunShellScript"
+        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/aurora-cluster-loadtest-document"
       ]
     },
     {
@@ -43,7 +36,7 @@
       "Action": [
         "ssm:SendCommand"
       ],
-      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/FIS-Ready": "True"
@@ -64,6 +57,21 @@
         "logs:PutResourcePolicy",
         "logs:DescribeResourcePolicies",
         "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:ListCommands",
+        "ssm:CancelCommand"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "tag:GetResources"
       ],
       "Resource": "*"
     }
