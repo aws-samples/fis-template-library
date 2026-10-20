@@ -1,3 +1,7 @@
 {
-  "templateVersion": "2020-09-01"
+    "AWSFIS": {
+        "template": {
+            "version": "1.0"
+        }
+    }
 }
