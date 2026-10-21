@@ -5,8 +5,6 @@
             "Effect": "Allow",
             "Action": [
                 "fis:StartExperiment",
-                "fis:GetExperimentSummary",
-                "fis:GetExperimentResults",
                 "fis:StopExperiment"
             ],
             "Resource": "*"
@@ -53,6 +51,7 @@
             "Action": [
                 "ssm:GetCommandInvocation",
                 "ssm:ListCommands",
+                "ssm:CancelCommand",
                 "ssm:ListCommandInvocations",
                 "ssm:DescribeInstanceInformation"
             ],
