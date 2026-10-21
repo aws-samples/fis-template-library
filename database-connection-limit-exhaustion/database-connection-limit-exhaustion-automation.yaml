@@ -274,8 +274,8 @@ mainSteps:
 
   - name: ExhaustConnectionLimit
     action: 'aws:runCommand'
-    onFailure: 'step:TerminateInstance'
-    onCancel: 'step:TerminateInstance'
+    onFailure: 'step:StopHarness'
+    onCancel: 'step:StopHarness'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
@@ -293,8 +293,31 @@ mainSteps:
             import time
             import json
             import threading
+            import signal
             import boto3
             from datetime import datetime
+
+            # Track every open connection so an early stop (SIGTERM from the StopHarness step) can close them while
+            # the instance network is still up. Otherwise the instance is terminated with the connections open and the
+            # server holds the slots until its TCP keepalive drops the dead client (~6 min), so the exhaustion
+            # outlives the stop.
+            _CONNS = []
+            _CONNS_LOCK = threading.Lock()
+
+            def _register(conn):
+                with _CONNS_LOCK:
+                    _CONNS.append(conn)
+
+            def _shutdown(signum, frame):
+                with _CONNS_LOCK:
+                    n = len(_CONNS)
+                    for c in _CONNS:
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
+                print(f"SIGTERM: closed {n} connection(s), exiting", flush=True)
+                sys.exit(0)
 
             # Parse ISO8601 duration to seconds
             def parse_iso8601_duration(duration):
@@ -329,6 +352,7 @@ mainSteps:
                             password=password,
                             connect_timeout=10
                         )
+                        _register(conn)
                         cursor = conn.cursor()
                         
                         # Keepalive loop
@@ -358,6 +382,7 @@ mainSteps:
                             password=password,
                             connection_timeout=10
                         )
+                        _register(conn)
                         cursor = conn.cursor()
                         
                         # Keepalive loop
@@ -381,6 +406,7 @@ mainSteps:
                         import pyodbc
                         conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes'
                         conn = pyodbc.connect(conn_str, timeout=10)
+                        _register(conn)
                         cursor = conn.cursor()
                         
                         # Keepalive loop
@@ -461,6 +487,7 @@ mainSteps:
                 # Record start time
                 start_time = time.time()
                 threads = []
+                signal.signal(signal.SIGTERM, _shutdown)
                 
                 if ramp_time == 0:
                     # Immediate mode
@@ -475,6 +502,7 @@ mainSteps:
                             target=connection_worker,
                             args=(i + 1, engine, endpoint, port, dbname, user, password, hold_time)
                         )
+                        thread.daemon = True
                         thread.start()
                         threads.append(thread)
                         time.sleep(0.1)
@@ -521,6 +549,7 @@ mainSteps:
                                 target=connection_worker,
                                 args=(total_opened, engine, endpoint, port, dbname, user, password, hold_time)
                             )
+                            thread.daemon = True
                             thread.start()
                             threads.append(thread)
                             time.sleep(0.05)
@@ -590,6 +619,28 @@ mainSteps:
               "{{ RampTime }}" \
               "{{ RampSteps }}" \
               "{{ global:REGION }}"
+
+  - name: StopHarness
+    action: 'aws:runCommand'
+    timeoutSeconds: 90
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      Parameters:
+        executionTimeout: '60'
+        commands:
+          - |
+            #!/bin/bash
+            # Stop the harness while the instance network is up so it closes its connections and the server frees the
+            # slots; terminating the instance instead strands them until the server keepalive (~6 min).
+            H=/tmp/exhaust_pool.py
+            pgrep -f "$H" >/dev/null || { echo "harness not running"; exit 0; }
+            pkill -TERM -f "$H"
+            for i in $(seq 1 15); do pgrep -f "$H" >/dev/null || { echo "stopped after SIGTERM"; exit 0; }; sleep 1; done
+            pkill -KILL -f "$H" || true; echo "killed after 15s"
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'
