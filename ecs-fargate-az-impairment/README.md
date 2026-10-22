@@ -78,22 +78,25 @@ T+1m                      ▼
         still a valid placement target, so replacement tasks CAN be scheduled
         back into the bad AZ — this is expected. What you're measuring is
         whether those replacements are then detected as degraded (via
-        `disrupt-az-connectivity` and packet loss) rather than whether ECS
-        avoids the AZ altogether.
+        `disrupt-az-connectivity`; packet loss does not reach them) rather
+        than whether ECS avoids the AZ altogether.
                           │
-T+15m                     ▼  Packet loss duration ends
+T+15m                     ▼  inject-network-packet-loss action ends (the tasks
+                             it targeted were stopped at T+1m, see below)
 T+15m                     ▼  disrupt-az-connectivity duration ends, FIS restores
                              the subnet's original network ACL association automatically
 ```
 
 **Why `disrupt-az-connectivity` runs for the full 15 minutes:** `aws:network:disrupt-connectivity` (`scope: availability-zone`) works by temporarily cloning the subnet's network ACL, adding deny rules for intra-VPC traffic to/from other AZs, and associating the clone with the subnet — a purely network-layer, non-invasive fault. FIS automatically restores the original network ACL association when the action's duration elapses; no cleanup step is required. This is what makes any task placed in that AZ (old or freshly replaced) observably unreachable from the rest of the VPC for the duration of the experiment, independent of whatever ECS does with task placement.
 
+**Packet loss reaches only the tasks running in the target AZ when the experiment starts.** FIS chooses its targets once, at experiment start, and keeps them for the whole experiment (see [Targets for AWS FIS](https://docs.aws.amazon.com/fis/latest/userguide/targets.html)). In our tests, FIS sent the packet-loss command only to the task that was running in the target AZ at T+0. `stop-tasks-in-az` stopped that task at T+1m, which ended its packet loss. Both times, ECS placed the replacement task in the target AZ. That task got no packet loss. `disrupt-az-connectivity` alone made it unreachable from the other AZs, from the time it started (about T+2m) until FIS restored the original network ACL, at T+15m in our 15-minute run. For the rest of its 15 minutes, `inject-network-packet-loss` kept sending the command to the stopped task about every 20 seconds, as it had before the stop. Each of those calls failed with `InvalidInstanceId` (41 calls in our 15-minute run), and the action still ended as `completed`. So a `completed` status does not mean that any task had packet loss for 15 minutes.
+
 ### Actions Detail
 
 | Action | Action ID | Description | Starts | Duration |
 |--------|-----------|-------------|--------|----------|
 | `disrupt-az-connectivity` | `aws:network:disrupt-connectivity` | Denies intra-VPC traffic to/from the target AZ's subnet, simulating an AZ network partition. Auto-restored by FIS at the end of duration. | T+0 | 15 minutes |
-| `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss for tasks in the target AZ | T+0 | 15 minutes |
+| `inject-network-packet-loss` | `aws:ecs:task-network-packet-loss` | Injects 100% packet loss into the tasks running in the target AZ at experiment start (T+0). `stop-tasks-in-az` stops those tasks at T+1m, and replacement tasks get no packet loss (see above). | T+0 | 15 minutes |
 | `wait-before-stop` | `aws:fis:wait` | Delay to let the network disruption and packet loss take effect before hard stop | T+0 | 1 minute |
 | `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
 
@@ -139,7 +142,7 @@ Before running the experiment, update these placeholder values:
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 15-16 minutes total).
+The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 15-16 minutes total). In our test we stopped the experiment about 5 minutes in. FIS put the subnet's original network ACL back and deleted its own network ACL about 1 second after the stop request, and 18 seconds after the stop, the task in the target AZ answered requests from the other AZs. FIS also cancelled the packet-loss command at that moment, but `stop-tasks-in-az` had already stopped the only task it targeted, so the test did not show packet loss being removed from a running task.
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
@@ -172,7 +175,7 @@ As you adapt this scenario to your needs, we recommend:
 2. Identifying business metrics tied to your ECS Fargate service health (request latency, error rates, task health, throughput).
 3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of AZ impairment on service availability.
 4. Adding a stop condition tied to the alarm to automatically halt the experiment if critical thresholds are breached.
-5. **Running a real end-to-end test in a non-production environment before trusting this template's documented behavior.** Confirm with your own service that: replacement tasks placed in the impaired AZ during the window are actually observed as unreachable by your health checks/alarms, and that packet loss + connectivity disruption are both cleanly reverted at T+15m with no lingering network ACL association.
+5. **Running a real end-to-end test in a non-production environment before trusting this template's documented behavior.** Confirm with your own service that replacement tasks placed in the impaired AZ during the window are actually observed as unreachable by your health checks and alarms, and that the connectivity disruption is reverted at T+15m with no lingering network ACL association.
 6. Adjusting the experiment duration (default 15 minutes) based on your testing requirements and recovery time objectives.
 7. Once you've validated detection behavior with this template, consider running [`ecs-fargate-az-evacuation`](../ecs-fargate-az-evacuation/README.md) to test whether your operational response (automated or manual) correctly evacuates the AZ.
 8. Documenting the expected behavior and actual results to build a runbook for real AZ failures.
