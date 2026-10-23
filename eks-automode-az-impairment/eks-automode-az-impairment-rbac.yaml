@@ -25,8 +25,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "delete"]
-# EKS Auto Mode serves NodePools under eks.amazonaws.com; upstream Karpenter uses
-# karpenter.sh. The automation tries both, so both are granted.
+# EKS Auto Mode serves NodePools under karpenter.sh, as upstream Karpenter does (a
+# Kubernetes 1.37 Auto Mode cluster has no nodepools resource in eks.amazonaws.com).
+# The automation tries eks.amazonaws.com first and then karpenter.sh, so both are granted.
 - apiGroups: ["karpenter.sh"]
   resources: ["nodepools"]
   verbs: ["get", "patch"]
