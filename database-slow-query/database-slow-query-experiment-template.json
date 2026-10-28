@@ -1,0 +1,30 @@
+{
+    "description": "Database Slow Query - Creates ephemeral load generator to run deliberately long-running queries, so long-running-query monitoring and alarms can be validated",
+    "targets": {},
+    "actions": {
+        "ExecuteSlowQueries": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Run concurrent long-running queries for a configurable duration and report whether they were visible to server-side monitoring",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DatabaseSlowQuery-Automation",
+                "documentParameters": "{\"DatabaseEngine\": \"postgres\", \"DatabaseEndpoint\": \"<YOUR DATABASE ENDPOINT>\", \"DatabasePort\": \"5432\", \"DatabaseName\": \"postgres\", \"DatabaseUser\": \"postgres\", \"DatabasePasswordSecretArn\": \"<YOUR SECRET ARN>\", \"QueryPattern\": \"realistic\", \"QueryDuration\": \"PT15M\", \"ExperimentDuration\": \"PT15M\", \"ConcurrentQueries\": \"3\", \"LongQueryThresholdSeconds\": \"60\", \"MinLongQueriesObserved\": \"1\", \"CpuWorkUnits\": \"100000\", \"TargetTableName\": \"\", \"ScanRowCount\": \"500000\", \"SubnetId\": \"<YOUR SUBNET ID>\", \"VpcId\": \"<YOUR VPC ID>\", \"DatabaseSecurityGroupId\": \"<YOUR DATABASE SECURITY GROUP ID>\", \"InstanceType\": \"t3.small\"}",
+                "maxDuration": "PT240M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/DatabaseSlowQuery-FIS-Role",
+    "tags": {
+        "Name": "Database-slow-query",
+        "ExperimentType": "DatabaseSlowQuery",
+        "DatabaseEngine": "postgres"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

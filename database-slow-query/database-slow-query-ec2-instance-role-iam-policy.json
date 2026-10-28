@@ -1,0 +1,22 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowSecretsManagerAccessForDatabasePassword",
+            "Effect": "Allow",
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": "<YOUR SECRET ARN>"
+        },
+        {
+            "Sid": "AllowKMSDecryptForSecret",
+            "Effect": "Allow",
+            "Action": "kms:Decrypt",
+            "Resource": "<YOUR CUSTOMER MANAGED KMS KEY ARN>",
+            "Condition": {
+                "StringEquals": {
+                    "kms:ViaService": "secretsmanager.<YOUR REGION>.amazonaws.com"
+                }
+            }
+        }
+    ]
+}
