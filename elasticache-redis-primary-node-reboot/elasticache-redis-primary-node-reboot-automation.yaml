@@ -38,10 +38,13 @@ mainSteps:
         # aws:executeScript doesn't retry throttled calls itself, so the client does. The timeouts stop one
         # call from hanging until the step times out.
         CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
-        # Fewer attempts for the reboot itself, so that one call (at most about 80 s) can't outlast the step.
+        # Few attempts for the status read before each reboot call (at most about 48 s: 3 attempts of up to 15 s,
+        # plus up to 3 s of backoff) and for the reboot call itself (at most about 78 s: 3 attempts of up to 25 s).
+        SSM_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=5, read_timeout=10)
         REBOOT_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=5, read_timeout=20)
         STEP_NAME = "rebootPrimaryNode"
-        # No reboot call starts after this many seconds of the step's 300-s timeout.
+        # A reboot call starts only if this many seconds or fewer have passed since the script started, checked
+        # after the status read, so the call (at most about 78 s) ends before the step's 300-s timeout.
         REBOOT_CUTOFF_SECONDS = 200
         # Step 1 hands its targets to the waits through its output, which holds at most 100 KB.
         MAX_GROUPS = 20
@@ -108,6 +111,9 @@ mainSteps:
             mine = [st.get("StepStatus") for st in ex.get("StepExecutions", []) if st.get("StepName") == STEP_NAME]
             if mine != ["InProgress"]:
                 return "this step's status is {}".format(mine)
+            # Check the time again: the status read above can retry, and the reboot call starts right after this.
+            if time.time() - started > REBOOT_CUTOFF_SECONDS:
+                return "the step has run for more than {} s".format(REBOOT_CUTOFF_SECONDS)
             return None
 
 
@@ -115,7 +121,7 @@ mainSteps:
             started = time.time()
             ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
             ec_reboot = boto3.client("elasticache", region_name=events["region"], config=REBOOT_CONFIG)
-            ssm = boto3.client("ssm", region_name=events["region"], config=CONFIG)
+            ssm = boto3.client("ssm", region_name=events["region"], config=SSM_CONFIG)
             groups = tagged_groups(ec, events["tagKey"], events["tagValue"])
             if not groups:
                 raise Exception("No replication group found with tag {}={}".format(events["tagKey"], events["tagValue"]))
@@ -137,7 +143,11 @@ mainSteps:
                                 "primary cluster and node available): " + "; ".join(not_ready))
             rebooted, failed = [], []
             for i, (rg_id, cluster_id, node_id) in enumerate(targets):
-                reason = why_not_reboot(ssm, events["executionId"], started)
+                try:
+                    reason = why_not_reboot(ssm, events["executionId"], started)
+                except Exception as e:
+                    # The status is unknown, so make no more calls, and say which groups were already rebooted.
+                    reason = "the run's status could not be read ({})".format(e)
                 if reason:
                     raise Exception("No more reboots: {}. Not rebooted: {}. Reboot already requested: {}. Failed: {}".format(
                         reason, [g for g, _, _ in targets[i:]], [r["group"] for r in rebooted], failed))
@@ -146,7 +156,11 @@ mainSteps:
                 try:
                     ec_reboot.reboot_cache_cluster(CacheClusterId=cluster_id, CacheNodeIdsToReboot=[node_id])
                 except Exception as e:
-                    failed.append("{} (primary {} node {}): {}".format(rg_id, cluster_id, node_id, e))
+                    note = ""
+                    if "InvalidCacheClusterState" in str(e):
+                        # The client may have retried after a timeout, so an earlier attempt may have been accepted.
+                        note = " (an earlier attempt of this call may have been accepted; the report step shows the node's state)"
+                    failed.append("{} (primary {} node {}): {}{}".format(rg_id, cluster_id, node_id, e, note))
                     print("RebootCacheCluster failed for primary {} node {} of {}: {}".format(cluster_id, node_id, rg_id, e))
                     continue
                 rebooted.append({"group": rg_id, "cluster": cluster_id, "node": node_id, "since": since})
