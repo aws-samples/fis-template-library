@@ -4,7 +4,7 @@ This is an experiment template for use with AWS Fault Injection Service (FIS) an
 
 THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## Example Hypothesis
+## Hypothesis
 
 When DynamoDB experiences a complete regional failure in us-east-1 which impacts my global table application, an alarm should be raised and the DevOps team notified within 5 minutes. The application should automatically failover to the us-west-2 replica within 2 minutes. During the impairment, all read and write operations should be redirected to the healthy region. Once the regional failure is resolved, the application should resume normal cross-region operation within 5 minutes.
 
@@ -21,42 +21,47 @@ When DynamoDB experiences a complete regional failure in us-east-1 which impacts
 
 Before running this experiment, ensure that:
 
-1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided.
-2. You have created the SSM Automation Document from the sample provided (dynamodb-region-impairment-automation.yaml)
-3. You have created the FIS Experiment Template from the sample provided (dynamodb-region-impairment-experiment-template.json)
-4. **Update all region references** in the template files to match your target region (currently set to us-east-1 as an example)
-5. **Update table names** in the template files to match your DynamoDB global table names
-6. The DynamoDB global table(s) you want to target have the "FIS-Ready":"True" tag and value
-7. You have appropriate monitoring and observability in place to track the impact of the experiment.
+1. You have created the IAM role for FIS from `dynamodb-region-impairment-fis-role-iam-policy.json` and `fis-iam-trust-relationship.json`, and the IAM role for SSM Automation from `dynamodb-region-impairment-ssm-automation-role-iam-policy.json` and `ssm-iam-trust-relationship.json`.
+2. You have created an SSM Automation document named `DynamoDB-Region-Impairment` from `dynamodb-region-impairment-automation.yaml`.
+3. You have created the FIS experiment template from `dynamodb-region-impairment-experiment-template.json`, and replaced `<YOUR REGION>`, `<YOUR AWS ACCOUNT>`, `<YOUR TABLE NAME>`, `<YOUR ROLE NAME>` and `<YOUR SSM AUTOMATION ROLE NAME>` in the template and in both policy files.
+4. The DynamoDB global table (version 2019.11.21) you want to target has the `FIS-Ready=True` tag on its replica in the target Region. The pause action targets every global table with this tag, but the SSM document blocks only the table named in `tableName`. Tag only that table, or add one SSM action per table.
+5. You have appropriate monitoring and observability in place to track the impact of the experiment.
 
 ## How it works
 
 This experiment simulates a complete regional DynamoDB failure by combining two complementary actions:
 
 ### Timeline
-- **T+0**: Both actions start simultaneously
-- **T+10s**: SSM automation applies application-blocking policy (after FIS policy is established)  
-- **T+10m**: SSM automation completes and cleans up its policy statements
-- **T+12m**: FIS built-in action completes and auto-expires its policy statements
+Measured times in parentheses are from the experiment start in our tests.
+- **T+0**: Both actions start. FIS adds its pause statements to the table and stream policies.
+- **T+10s**: The SSM automation adds the `FISDenyAccess` statement to the table policy, after the FIS statements are in place (36 s).
+- **T+10m10s**: The SSM automation removes `FISDenyAccess` (10 min 40 s).
+- **T+12m**: The FIS action ends and removes its pause statements (12 min 35 s).
 
 **Note**: The durations can be modified to fit your testing needs, but the staggered timing should be maintained to prevent race conditions and ensure proper cleanup sequencing.
+
+**Eventual consistency**: The SSM automation blocks access with the DynamoDB `PutResourcePolicy` API. When you attach a resource-based policy using this API, [the policy application is eventually consistent](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_PutResourcePolicy.html). Increase the experiment duration to account for this: raise `duration` in the SSM action's `documentParameters`, and raise the pause action's `duration` and the SSM action's `maxDuration` by the same amount. This keeps the 2-minute recovery window, and the automation keeps the same time to clean up before `maxDuration`.
+
+**Measured behavior**: In five live tests in us-east-1 with a us-west-2 replica:
+- Replication from us-east-1 to us-west-2 stopped within seconds. Replication into us-east-1 continued for 2 to 4 minutes, within the 5 minutes that the [FIS actions reference](https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html) allows.
+- Replication resumed 13 seconds to 3 minutes after the pause ended or the experiment was stopped. No successful write was lost.
 
 ### Actions
 
 **1. Native FIS Action (aws:dynamodb:global-table-pause-replication)**
 - Blocks DynamoDB replication service from synchronizing data between regions
 - Duration: 12 minutes
-- Uses time-based auto-expiring resource policy statements
-- Automatically cleans up when experiment completes
+- Adds deny statements with an expiry time to the table and stream policies
+- Removes its statements when the action ends or the experiment is stopped
 
 **2. Custom SSM Automation (blockDynamoDBAccess)**
-- Blocks all application access (reads/writes) to the table in the target region
+- Blocks reads and writes on the named table and its indexes in the target Region: `GetItem`, `BatchGetItem`, `Query`, `Scan`, `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`, `ConditionCheckItem` and PartiQL statements. Transactions are blocked through the same actions.
+- Denies every principal except the DynamoDB replication service-linked role, so replication stays under the FIS pause action's control
 - Duration: 10 minutes with 10-second initial delay to avoid race conditions
-- Uses resource policy with role exclusions for FIS, SSM, and DynamoDB service roles
-- Includes proper cleanup logic to remove only its policy statements
+- Removes only its own statement and keeps every other statement. The removal also runs if the experiment is stopped or a step fails.
 
 ### Race Condition Prevention
-Both actions start simultaneously but modify the same DynamoDB resource policy. A 10-second sleep was added at the start of the SSM automation document to prevent race conditions - allowing the built-in FIS action to successfully apply its policy first.
+Both actions change the same resource policy, and [`GetResourcePolicy` is eventually consistent](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_PutResourcePolicy.html). The SSM automation waits until the FIS statement is visible and writes with `ExpectedRevisionId`, so it cannot overwrite a newer version of the policy. DynamoDB blocks policy updates for 15 seconds after each update, so the automation retries until its write is accepted.
 
 ### Recovery Window Testing
 This creates a 2-minute recovery window (minutes 10-12) where application access is restored but replication remains paused, allowing testing of partial recovery scenarios and cross-region failover behavior.
@@ -74,13 +79,11 @@ watch -n 5 'aws dynamodb get-item --table-name my-global-table --key "{\"id\":{\
 watch -n 5 'aws dynamodb put-item --table-name my-global-table --item "{\"id\":{\"S\":\"test-$(date +%s)\"},\"message\":{\"S\":\"test message\"}}" --region us-west-2 --no-cli-pager'
 ```
 
-During the impairment periods, you should see "AccessDenied" errors when attempting operations on the us-east-1 table, while us-west-2 operations continue normally.
+During the impairment periods, you should see "AccessDenied" errors when attempting operations on the us-east-1 table, while us-west-2 operations continue normally. Replace `id` with your table's partition key attribute. Because the policy application is eventually consistent, the first errors may not appear right away.
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined. It will continue to run until all actions are completed or until manually stopped.
-
-## Observability and stop conditions
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until both actions complete (12 minutes by default). If you stop it, FIS removes its pause statements and the SSM automation's `cleanupPolicy` step removes `FISDenyAccess`. If that step fails, remove the `FISDenyAccess` statement from the table's resource policy yourself, because until then every client stays blocked from the table.
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 

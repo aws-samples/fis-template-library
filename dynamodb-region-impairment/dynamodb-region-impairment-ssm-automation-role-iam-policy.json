@@ -2,21 +2,15 @@
     "Version": "2012-10-17",
     "Statement": [
         {
+            "Sid": "AllowTablePolicyChanges",
             "Effect": "Allow",
             "Action": [
-                "dynamodb:PutResourcePolicy",
-                "dynamodb:DeleteResourcePolicy",
+                "dynamodb:DescribeTable",
                 "dynamodb:GetResourcePolicy",
-                "dynamodb:DescribeTable"
+                "dynamodb:PutResourcePolicy",
+                "dynamodb:DeleteResourcePolicy"
             ],
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "sts:GetCallerIdentity"
-            ],
-            "Resource": "*"
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/<YOUR TABLE NAME>"
         }
     ]
 }
