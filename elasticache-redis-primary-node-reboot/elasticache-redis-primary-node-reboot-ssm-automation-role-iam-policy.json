@@ -24,6 +24,14 @@
           "aws:ResourceTag/FIS-Ready": "True"
         }
       }
+    },
+    {
+      "Sid": "AllowReadOwnAutomationStatus",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetAutomationExecution"
+      ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
     }
   ]
 }

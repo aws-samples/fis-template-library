@@ -87,8 +87,16 @@ mainSteps:
             return (rg_id, cluster_id, node_id), []
 
 
+        def stopped(ssm, execution_id):
+            # When SSM cancels this step, the script keeps running. Don't reboot anything after a stop.
+            status = ssm.get_automation_execution(
+                AutomationExecutionId=execution_id)["AutomationExecution"]["AutomationExecutionStatus"]
+            return status in ("Cancelling", "Cancelled")
+
+
         def reboot_primary(events, context):
             ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            ssm = boto3.client("ssm", region_name=events["region"], config=CONFIG)
             groups = tagged_groups(ec, events["tagKey"], events["tagValue"])
             if not groups:
                 raise Exception("No replication group found with tag {}={}".format(events["tagKey"], events["tagValue"]))
@@ -106,6 +114,9 @@ mainSteps:
                                 "primary cluster and node available): " + "; ".join(not_ready))
             rebooted, failed = [], []
             for rg_id, cluster_id, node_id in targets:
+                if stopped(ssm, events["executionId"]):
+                    raise Exception("The run was stopped. Not rebooted: {}. Rebooted before the stop: {}".format(
+                        rg_id, [r["cluster"] for r in rebooted]))
                 # Events from before this moment can't count as this run's restart.
                 since = datetime.now(timezone.utc).isoformat()
                 try:
@@ -121,6 +132,7 @@ mainSteps:
             return {"RebootedNodes": json.dumps(rebooted), "RebootErrors": json.dumps(failed)}
       InputPayload:
         region: "{{ global:REGION }}"
+        executionId: "{{ automation:EXECUTION_ID }}"
         tagKey: "{{ tagKey }}"
         tagValue: "{{ tagValue }}"
     outputs:
