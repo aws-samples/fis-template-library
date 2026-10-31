@@ -1,5 +1,5 @@
 {
-  "description": "Block DynamoDB traffic at the network level and pause global table replication to simulate complete regional DynamoDB failure",
+  "description": "Block DynamoDB traffic from the tagged subnets at the network level and pause replication of the tagged global table replicas, to simulate losing DynamoDB in this Region for those subnets and tables",
   "targets": {
     "subnets": {
       "resourceType": "aws:ec2:subnet",
