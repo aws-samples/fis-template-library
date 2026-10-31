@@ -54,15 +54,25 @@
             }
         },
         {
-            "Sid": "AllowReplaceNetworkAclAssociation",
+            "Sid": "AllowReplaceNetworkAclAssociationAnyNetworkAcl",
             "Effect": "Allow",
             "Action": [
                 "ec2:ReplaceNetworkAclAssociation"
             ],
-            "Resource": [
-                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/*",
-                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
-            ]
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
+        },
+        {
+            "Sid": "AllowReplaceNetworkAclAssociationOnFISReadySubnets",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:ReplaceNetworkAclAssociation"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
         },
         {
             "Sid": "AllowDescribeNetwork",
@@ -84,15 +94,36 @@
             "Resource": "arn:aws:ec2:<YOUR REGION>:*:prefix-list/*"
         },
         {
-            "Sid": "AllowPauseReplicationPolicyChanges",
+            "Sid": "AllowReadTableAndStreamPolicies",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:DescribeTable",
+                "dynamodb:GetResourcePolicy"
+            ],
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
+        },
+        {
+            "Sid": "AllowChangeFISReadyTablePolicies",
             "Effect": "Allow",
             "Action": [
                 "dynamodb:PutResourcePolicy",
-                "dynamodb:DeleteResourcePolicy",
-                "dynamodb:GetResourcePolicy",
-                "dynamodb:DescribeTable"
+                "dynamodb:DeleteResourcePolicy"
             ],
-            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowChangeStreamPoliciesStreamsDoNotInheritTableTags",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:PutResourcePolicy",
+                "dynamodb:DeleteResourcePolicy"
+            ],
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*/stream/*"
         },
         {
             "Sid": "AllowTargetResolution",
