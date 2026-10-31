@@ -30,7 +30,7 @@ Before running this experiment, ensure that:
 5. Each targeted replication group uses the Redis OSS engine, is cluster mode disabled (`RebootCacheCluster` does not support cluster mode enabled), has `MultiAZ=enabled` and `AutomaticFailover=enabled`, has one primary and at least one replica, is not a member of a Global Datastore, and is `available`, with its primary cluster and node `available`. The experiment checks each of these for every tagged group, and if any group fails one, it fails before it reboots anything. Valkey groups are refused.
 6. Losing the data in the targeted replication groups is acceptable. Rebooting a primary node clears its data, and ElastiCache does not fail over to a replica. AWS documents that "when the primary is rebooted, it's cleared of data when it comes back online. When the read replicas see the cleared primary cluster, they clear their copy of the data, which causes data loss" ([Minimizing downtime in ElastiCache by using Multi-AZ](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/AutoFailover.html)). Run this experiment only on replication groups whose contents you can afford to lose.
 7. You have appropriate monitoring and observability in place to track the impact of the experiment.
-8. Tested with: Awaiting test (planned: Redis OSS 7.1, `cache.t4g.micro`, one primary and one replica, one tagged group, `us-east-1`). Other engine versions, node types, more replicas, several tagged groups and other Regions have not been tested.
+8. Tested with: Redis OSS 7.1, `cache.t4g.micro`, one primary and one replica, one and two tagged groups, in `eu-west-2`. Other engine versions, node types, more replicas, more tagged groups and other Regions have not been tested.
 
 ## How it works
 
@@ -38,8 +38,10 @@ This experiment reboots the Redis primary node to test application resilience du
 
 1. **rebootPrimaryNode**: Lists every replication group in the Region, page by page, and keeps the ones tagged `FIS-Ready=True`. It fails if there are none. For each one it reads the group and its primary again and checks the conditions in Prerequisites item 5. If any group fails a check, the step fails and nothing is rebooted. It then calls `RebootCacheCluster` on the primary node of each group. Before each call it reads its own execution, and makes no more calls unless both the run and this step are still `InProgress`, in case SSM leaves the script running after a stop or a timeout. If that read fails, it makes no more calls. It also makes no call once 200 seconds have passed since the script started, checked after the read, so that a call, which gives up after about 80 seconds, ends inside the step's 300-second timeout. If a call fails, for example because of a missing permission, the step records the error and goes on to the other groups. If no call succeeds, the step fails.
 2. **waitForReboot** and **waitForRebootContinued**: For each rebooted node, wait until it has restarted, and its cluster, the node, the replication group and every node in the group are `available` again. A node counts as restarted when its status was seen as `rebooting` after the call, or when ElastiCache records the event `Cache node <id> restarted` after the call. When the group is back, the step checks that the rebooted node is still the primary, and fails if it isn't. An `aws:executeScript` step runs for at most 10 minutes, so the wait is split over two steps (up to 17 minutes in total). It fails if the wait runs out, or if a cluster or group starts being deleted. At the end, if any reboot call failed in step 1, the run fails with that error once the other nodes are back. FIS keeps the action running until this wait ends.
-3. **reportAfterFailure**: Runs only if a step fails. It finds the tagged groups again and checks, for about 25 seconds in all, whether every tagged group is `available` with one primary and every cluster and node `available`, prints what it found, and fails the run.
+3. **reportAfterFailure**: Runs only if a step fails. It finds the tagged groups again and checks, for about 30 seconds in all, whether every tagged group is `available` with one primary and every cluster and node `available`, prints what it found, and fails the run.
 4. **reportAfterStop**: Runs only if the experiment is stopped. It makes the same check and prints what it found. Automation gives a cancelled run at most two minutes to finish, so the check is kept short. If it can't read every replication group in the Region in that time, it says so, and reports only the tagged groups it found.
+
+If any group is still not healthy when the check's time runs out, both report steps print "Not healthy yet: {}" and list every group as not checked, including groups they found healthy, so the message doesn't say which group is still rebooting. Check the groups yourself with the commands below.
 
 Each script retries throttled ElastiCache calls. The experiment changes nothing that it has to undo: there is no failover to reverse, and the cleared data can't be brought back.
 
@@ -65,15 +67,15 @@ watch -n 5 'redis-cli -h <redis-endpoint> ping'
 curl -I https://<your-app>/health
 ```
 
-During the experiment, the cluster status changes from `available` to `rebooting cache cluster nodes` as soon as the reboot is requested. The node status changes to `rebooting` only when the node actually restarts. Then the event `Cache node 0001 restarted` appears, and the cluster and node return to `available`. (Awaiting test.)
+During the experiment, the cluster status changes from `available` to `rebooting cache cluster nodes` as soon as the reboot is requested. The node status changes to `rebooting` only when the node actually restarts. Then the event `Cache node 0001 restarted` appears, and the cluster and node return to `available`.
 
-> **Note**: To be measured in Awaiting test runs on a two-node Redis OSS 7.1 replication group (`cache.t4g.micro`) in `us-east-1`, with a client opening a new connection to the primary endpoint every second:
+> **Note**: Measured in test runs on two-node Redis OSS 7.1 replication groups (`cache.t4g.micro`) in `eu-west-2`, with a client opening a new connection to the primary endpoint and to the reader endpoint every second, with 1-second connect and read timeouts:
 >
-> * The node kept serving for Awaiting test seconds after `RebootCacheCluster` was called, then restarted.
-> * Writes on the primary endpoint failed for Awaiting test seconds while it restarted. The same node stayed primary.
-> * After every restart the data was gone: Awaiting test.
-> * The cluster showed `available` again Awaiting test seconds after the call.
-> * Stopping the experiment within 10 seconds of the call did not prevent the restart or the data loss: Awaiting test.
+> * The node kept serving for 13 to 33 seconds after `RebootCacheCluster` was called, then restarted.
+> * Writes on the primary endpoint failed for 6 to 7 seconds while it restarted. The same node stayed primary. Reads on the reader endpoint didn't fail.
+> * After every restart the data was gone.
+> * The experiment's wait saw the group `available` again 95 to 213 seconds after the call.
+> * Stopping the experiment 3 seconds after the call did not prevent the restart or the data loss: the node restarted 21 seconds after the call, 18 seconds after the experiment had ended.
 
 ### What else is affected
 
@@ -91,9 +93,11 @@ Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 
 What a stop does depends on when it comes:
 
-* **Before the `RebootCacheCluster` call** (in rebootPrimaryNode): no more calls are made once the step reads a status other than `InProgress`. A call that is already being sent when the stop arrives, or that starts in the moment between the status check and the call, can't be stopped. AWS doesn't document how soon after a stop the step's status changes. Until it does, the loop goes on, so a slow change can let every tagged group not yet rebooted (up to 20) be rebooted after the stop. How soon the status changes, and how many groups a stop can still reach, is Awaiting test. `reportAfterStop` reports the groups' state within about 25 seconds, and the experiment ends within about a minute (Awaiting test).
-* **After the call** (in rebootPrimaryNode, waitForReboot or waitForRebootContinued): the stop ends the wait, not the reboot. A reboot that ElastiCache has accepted can't be cancelled: the node restarts on its own and its data is cleared, possibly after the experiment has ended. How long after the call the restart lands is Awaiting test. `reportAfterStop` reports whether the groups are still rebooting within about 25 seconds, and the experiment ends within about a minute (Awaiting test).
-* **During reportAfterFailure**: the stop moves the run to `reportAfterStop`, which makes the same check, and the run ends Cancelled (Awaiting test).
+* **Before the `RebootCacheCluster` call** (in rebootPrimaryNode): no more calls are made once the step reads a status other than `InProgress`. A call that is already being sent when the stop arrives, or that starts in the moment between the status check and the call, can't be stopped. AWS doesn't document how soon after a stop the step's status changes. Until it does, the loop goes on, so a slow change can let every tagged group not yet rebooted (up to 20) be rebooted after the stop. In the test runs SSM didn't end the step's script at the stop: the script went on to its next status read, 29 and 37 seconds after the stop, saw the stop there and made no more calls. How many groups a stop can still reach when the calls follow each other without a pause wasn't measured.
+* **After the call** (in rebootPrimaryNode, waitForReboot or waitForRebootContinued): the stop ends the wait, not the reboot. A reboot that ElastiCache has accepted can't be cancelled: the node restarts on its own and its data is cleared, possibly after the experiment has ended. In the test runs the restart came 19 to 39 seconds after the call.
+* **During reportAfterFailure**: the stop moves the run to `reportAfterStop`, which makes the same check, and the run ends Cancelled (not tested).
+
+In the test runs, FIS showed the experiment stopped within a second of the stop. `reportAfterStop` then ran for about 31 seconds, and the SSM execution ended Cancelled 31 to 33 seconds after the stop.
 
 A stopped experiment can't be resumed ([Stop an experiment](https://docs.aws.amazon.com/fis/latest/userguide/stop-experiment.html)). Starting it again reboots the primaries again and clears their data again.
 
