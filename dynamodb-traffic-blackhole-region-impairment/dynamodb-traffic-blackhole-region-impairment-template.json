@@ -47,7 +47,7 @@
   "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
   "experimentOptions": {
     "accountTargeting": "single-account",
-    "emptyTargetResolutionMode": "skip"
+    "emptyTargetResolutionMode": "fail"
   },
   "tags": {
     "Name": "DynamoDBTrafficBlackholeRegionImpairment"

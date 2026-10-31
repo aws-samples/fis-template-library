@@ -6,7 +6,7 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Hypothesis
 
-When network connectivity to DynamoDB is completely blocked from my application subnets, monitoring systems should detect the connectivity failure within 2-3 minutes and trigger alerts. The DevOps team should be notified within 5 minutes through our alerting channels. If automated failover is configured, it should activate within 10 minutes. For manual intervention, the team should acknowledge the incident within 15 minutes and complete failover procedures within 30-45 minutes. All DynamoDB operations should fail with network timeout errors during the 10-minute impairment period.
+If network traffic between the tagged subnets and DynamoDB is blocked and replication of the tagged global tables is paused for 10 minutes, DynamoDB calls from those subnets should fail with network timeouts, while calls from other subnets and calls to other AWS services keep working. Monitoring should detect the failure within 2-3 minutes and notify the team within 5 minutes. If automated failover to another Region is configured, it should complete before the 10-minute fault ends. To test a manual failover that takes longer, raise both actions' `duration` so the fault lasts until the failover should be complete.
 
 ### What does this enable me to verify?
 
@@ -23,11 +23,21 @@ Before running this experiment, ensure that:
 
 1. You have created the IAM role for FIS from `fis-iam-trust-relationship.json` and `dynamodb-traffic-blackhole-region-impairment-iam-policy.json`, after replacing `<YOUR REGION>` and `<YOUR AWS ACCOUNT>` in the policy. The policy covers multi-Region eventually consistent (MREC) global tables. For multi-Region strongly consistent (MRSC) global tables, also allow `dynamodb:InjectError`, which the [FIS actions reference](https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html#global-table-pause-replication) lists for them.
 2. You have created the FIS experiment template from `dynamodb-traffic-blackhole-region-impairment-template.json`, after replacing `<YOUR AWS ACCOUNT>` and `<YOUR ROLE NAME>` in `roleArn`.
-3. The EC2 subnets containing your application instances have the `FIS-Ready=True` tag, and your application reaches DynamoDB from them through the Regional endpoint, for example through a DynamoDB gateway endpoint.
+3. The EC2 subnets containing your application instances have the `FIS-Ready=True` tag, and your application reaches DynamoDB from them through the Regional endpoint, for example through a DynamoDB gateway endpoint. Use subnets dedicated to the experiment: every resource with a network interface in a tagged subnet loses DynamoDB access (see [What else is affected](#what-else-is-affected)).
 4. The DynamoDB global tables your application uses have the `FIS-Ready=True` tag on their replica in the Region where you run the experiment. The template pauses replication of every global table with this tag in that Region.
-5. The network ACL of each tagged subnet has room for the deny rules FIS adds. The [FIS actions reference](https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html#disrupt-connectivity) says: "When the scope is not `all`, the maximum number of entries in network ACLs is 20."
-6. Your application instances are running in the tagged subnets and actively using DynamoDB.
-7. You have appropriate monitoring and observability in place to track the impact.
+5. Both targets match something. The template sets `emptyTargetResolutionMode` to `fail`, so if no subnet or no global table replica in the Region carries the tag, the experiment fails before it changes anything ([experiment options](https://docs.aws.amazon.com/fis/latest/userguide/experiment-options.html)). To run only the network part, remove the `pauseReplication` action and the `dynamodbTables` target.
+6. The network ACL of each tagged subnet has room for the deny rules FIS adds: one in each direction for each CIDR in the Region's DynamoDB prefix list. The [FIS actions reference](https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html#disrupt-connectivity) says: "When the scope is not `all`, the maximum number of entries in network ACLs is 20." In testing, the `com.amazonaws.us-east-1.dynamodb` prefix list had 8 CIDRs, and the network ACL FIS created from the VPC's default network ACL had 20 entries. To count the CIDRs in your Region:
+
+   ```bash
+   PL=$(aws ec2 describe-managed-prefix-lists --region <YOUR REGION> \
+     --filters Name=prefix-list-name,Values=com.amazonaws.<YOUR REGION>.dynamodb \
+     --query 'PrefixLists[0].PrefixListId' --output text)
+   aws ec2 get-managed-prefix-list-entries --region <YOUR REGION> --prefix-list-id "$PL" --query 'Entries[].Cidr'
+   ```
+
+7. Your application instances are running in the tagged subnets and actively using DynamoDB.
+8. You have appropriate monitoring and observability in place to track the impact.
+9. The experiment was tested in us-east-1, with two tagged subnets on the VPC's default network ACL, a DynamoDB gateway endpoint, and multi-Region eventually consistent global tables replicated to us-west-2. Interface (PrivateLink) endpoints for DynamoDB, IPv6, network ACLs with more rules than the default one, and strongly consistent global tables weren't tested.
 
 ## How it works
 
@@ -48,25 +58,28 @@ FIS temporarily:
 
 - **Duration**: 10 minutes for both actions (configurable via each action's `duration` parameter)
 - **Scope**: DynamoDB regional endpoints only - other AWS services remain accessible
-- **Traffic Blocked**: All inbound and outbound DynamoDB API calls from target subnets
+- **Traffic Blocked**: All traffic between the target subnets and the CIDRs in the Region's DynamoDB prefix list, in both directions
 - **Intra-subnet**: Traffic between instances in the same subnet remains unaffected
 - **Replication**: Paused for every global table tagged `FIS-Ready=True` in the Region where the experiment runs
 
-**Measured behavior**: In four live tests in us-east-1, with two tagged subnets on the VPC's default network ACL, a DynamoDB gateway endpoint, and global tables replicated to us-west-2:
+**Measured behavior**: In four live tests in the configuration that Prerequisite 9 describes, with a Lambda function in the tagged subnets that called DynamoDB once a second with a 1-second connect timeout, a 2-second read timeout and no retries:
 - FIS created one network ACL tagged `managedByFIS=true` for both subnets. It kept the original allow rule (renumbered from 100 to 155) and added a deny rule in each direction for each of the 8 CIDRs in the `com.amazonaws.us-east-1.dynamodb` prefix list.
 - DynamoDB calls from the tagged subnets failed with network timeouts within 5 seconds of the association. They succeeded again within 2 seconds of FIS restoring the original association, both when the action ended and when the experiment was stopped.
 - During the fault, an S3 call through an S3 gateway endpoint in the same subnets kept working, and so did DynamoDB calls from an untagged subnet that uses the same network ACL.
 - Replication from us-east-1 to us-west-2 stopped within seconds. Replication into us-east-1 continued for up to 3.6 minutes. Both directions resumed within 4.6 minutes after the pause ended or the experiment was stopped, and no successful write was lost.
 
-## Target Resources
+### What else is affected
 
-This experiment targets EC2 subnets tagged with `FIS-Ready: True`. All instances in these subnets will lose DynamoDB connectivity during the experiment. It also targets the DynamoDB global table replicas tagged with `FIS-Ready: True` in the Region where it runs, and pauses their replication.
+- The experiment targets every subnet in the Region tagged `FIS-Ready: True`, and every resource with a network interface in those subnets loses DynamoDB connectivity, whether or not it belongs to your application. Other experiments in this library use the same tag on subnets, so a subnet you tagged for one of them is a target here too.
+- It also targets every DynamoDB global table replica tagged `FIS-Ready: True` in the Region where it runs, and pauses its replication. Every reader of those tables' replicas in other Regions sees data that stops changing, whatever subnet it runs in.
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until both actions complete (10 minutes by default). When the actions end, or when you stop the experiment, FIS restores each subnet's original network ACL association, deletes the network ACL it created, and removes its statements from the table and stream policies.
+The experiment does not have any specific stop conditions defined. It will continue to run until manually stopped or until both actions complete (10 minutes by default).
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+
+When the actions end, or when you stop the experiment, FIS restores each subnet's original network ACL association, deletes the network ACL it created, and removes its statements from the table and stream policies. In testing, DynamoDB calls from the tagged subnets succeeded again within 2 seconds of the restore, and replication resumed in both directions within 4.6 minutes. A stop condition stops the experiment the same way. A stopped experiment can't be resumed; start a new one. To check a stop condition before you rely on it, set its alarm to `ALARM` with `aws cloudwatch set-alarm-state` while a run is in progress, and check that FIS stops the experiment ([SetAlarmState](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_SetAlarmState.html)).
 
 Monitor these metrics during the experiment:
 - DynamoDB API call success/failure rates
