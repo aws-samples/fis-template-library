@@ -6,7 +6,7 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Hypothesis
 
-If power is interrupted to the ElastiCache nodes in a target Availability Zone while the primary node is in that AZ, the time from the node in that AZ no longer answering to the first successful write on the primary endpoint should not exceed 30 seconds, once automatic failover has promoted a replica in a healthy AZ. Applications using the primary endpoint reconnect automatically after the role change. Replica replacements remain blocked in the impaired AZ for the experiment duration, so the cluster operates at reduced capacity. After the power interruption ends, nodes in the target AZ rejoin the replication group and the cluster returns to full capacity.
+If power is interrupted to the ElastiCache nodes in a target Availability Zone while the primary node is in that AZ, the time from the node in that AZ no longer answering to the first successful write on the primary endpoint should not exceed 30 seconds, once automatic failover has promoted a replica in a healthy AZ. Applications using the primary endpoint should reconnect without manual action after the role change. In testing, the client's long-lived connection did, 31 seconds after the node stopped answering. Replica replacements remain blocked in the impaired AZ for the experiment duration, so the cluster operates at reduced capacity. After the power interruption ends, nodes in the target AZ rejoin the replication group and the cluster returns to full capacity.
 
 ### What does this enable me to verify?
 
@@ -14,7 +14,7 @@ If power is interrupted to the ElastiCache nodes in a target Availability Zone w
 * Applications handle primary endpoint changes gracefully without manual intervention
 * Connection pool retry and reconnect logic functions correctly during AZ-level disruption
 * Cluster behavior under reduced replica capacity while an AZ remains impaired
-* CloudWatch alarms detect `ReplicationLag` spikes and `IsMaster` role changes as expected
+* Your CloudWatch alarms on `ReplicationLag` and `IsMaster` behave as you expect (see the note on `IsMaster` under How it works)
 
 ## Prerequisites
 
@@ -67,10 +67,10 @@ watch -n 5 'aws elasticache describe-replication-groups \
   --output table'
 ```
 
-This shows roles, not reachability: as the note above says, the group and its members show `available` minutes before a recovering node answers. To see when a node stops and starts answering, send it `PING` directly once a second with a 1-second timeout, as the tests did. Each node's address is in `NodeGroupMembers[].ReadEndpoint.Address` in the same `describe-replication-groups` output. Run the probe from a host that can reach the node, with `redis-cli` 6.0 or later, and add `--tls` if in-transit encryption is on. If the group uses AUTH, put the token in the `REDISCLI_AUTH` environment variable rather than passing `-a`, which shows it in the process list, and for RBAC also pass `--user <USER NAME>`. Any reply from the node, even an error such as `NOAUTH`, means it is answering:
+This shows roles, not reachability: as the note above says, the group and its members show `available` minutes before a recovering node answers. To see when a node stops and starts answering, send it `PING` directly about once a second with a 1-second timeout, as the tests did. Each node's address is in `NodeGroupMembers[].ReadEndpoint.Address` in the same `describe-replication-groups` output. Run the probe from a host that can reach the node, with `redis-cli` 6.0 or later, and add `--tls` if in-transit encryption is on. If the group uses AUTH, put the token in the `REDISCLI_AUTH` environment variable rather than passing `-a`, which shows it in the process list, and for RBAC also pass `--user <USER NAME>`. A reply from the node, even an error such as `NOAUTH`, means it is answering. `no answer`, or `redis-cli`'s own `Could not connect to Redis` line, means it isn't:
 
 ```bash
-# Prints the time, then what redis-cli got back, or "no answer" if nothing came back within 1 second
+# Prints the time, then the node's reply, redis-cli's connection error, or "no answer" after a 1-second timeout
 while true; do
   printf '%s ' "$(date -u +%H:%M:%S)"
   timeout 1 redis-cli -h <NODE-ENDPOINT> -p 6379 PING; [ $? -eq 124 ] && echo "no answer"
