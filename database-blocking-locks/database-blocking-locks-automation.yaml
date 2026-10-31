@@ -279,8 +279,8 @@ mainSteps:
 
   - name: InjectBlockingLocks
     action: 'aws:runCommand'
-    onFailure: 'step:TerminateInstance'
-    onCancel: 'step:TerminateInstance'
+    onFailure: 'step:StopHarness'
+    onCancel: 'step:StopHarness'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
@@ -295,6 +295,7 @@ mainSteps:
             # Write the blocking-locks harness to a local file.
             cat > /tmp/blocking_locks_harness.py << 'PYTHON_EOF'
             import json
+            import signal
             import sys
             import threading
             import time
@@ -1277,7 +1278,14 @@ mainSteps:
                 return value
 
 
+            def _exit_on_sigterm(signum, frame) -> None:
+                # SIGTERM (from StopHarness, or from a cancelled run) -> SystemExit runs the finally blocks:
+                # close the blocker connection (releasing the lock) and drop the table.
+                raise SystemExit(128 + signum)
+
+
             def main(argv: Optional[List[str]] = None) -> None:
+                signal.signal(signal.SIGTERM, _exit_on_sigterm)
                 argv = list(sys.argv if argv is None else argv)
                 if len(argv) != 13:
                     sys.stderr.write("Usage: %s ENGINE ENDPOINT PORT DBNAME USER SECRET_ARN WAITERS DURATION RAMP_TIME RAMP_STEPS REGION TARGET_TABLE\n" % (argv[0] if argv else "harness.py",))
@@ -1347,6 +1355,28 @@ mainSteps:
               "{{ RampSteps }}" \
               "{{ global:REGION }}" \
               "{{ TargetTableName }}"
+
+  - name: StopHarness
+    action: 'aws:runCommand'
+    timeoutSeconds: 90
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      Parameters:
+        executionTimeout: '60'
+        commands:
+          - |
+            #!/bin/bash
+            # Stop the harness while the network is up so its DB connections close and the lock releases;
+            # terminating the instance instead strands them until the server keepalive (~6 min).
+            H=/tmp/blocking_locks_harness.py
+            pgrep -f "$H" >/dev/null || { echo "harness not running"; exit 0; }
+            pkill -TERM -f "$H"
+            for i in $(seq 1 15); do pgrep -f "$H" >/dev/null || { echo "stopped after SIGTERM"; exit 0; }; sleep 1; done
+            pkill -KILL -f "$H" || true; echo "killed after 15s"
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'
