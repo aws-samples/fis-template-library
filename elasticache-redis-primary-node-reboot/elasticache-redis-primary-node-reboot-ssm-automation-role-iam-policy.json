@@ -1,0 +1,37 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowElastiCacheDiscoveryAndMonitoring",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeEvents",
+        "elasticache:ListTagsForResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowRebootOnTaggedClusters",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:RebootCacheCluster"
+      ],
+      "Resource": "arn:aws:elasticache:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    },
+    {
+      "Sid": "AllowReadOwnAutomationStatus",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetAutomationExecution"
+      ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+    }
+  ]
+}
