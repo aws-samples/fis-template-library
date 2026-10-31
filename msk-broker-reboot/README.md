@@ -8,7 +8,7 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 When a single Amazon MSK broker is rebooted, the cluster should remain available and continue serving produce and consume requests using the remaining brokers, after a brief and recoverable disruption while partition leadership moves off the rebooted broker. Specifically:
 
-- Partition leadership for partitions led by the rebooted broker should automatically move to in-sync replicas on other brokers. Clients briefly see retriable errors (for example `NotLeaderOrFollowerException`) for those partitions, refresh metadata, and reconnect to the new leaders, usually within seconds. Requests a client already sent to the rebooted broker can wait until they time out before they are retried (see [Expected application impact and client resilience](#expected-application-impact-and-client-resilience)).
+- Partition leadership for partitions led by the rebooted broker should automatically move to in-sync replicas on other brokers. Clients see retriable errors (for example `NotLeaderOrFollowerException`) for those partitions, refresh metadata, and reconnect to the new leaders. Deliveries to those partitions should not stall for longer than your application allows. In testing, they took at most 150 ms in 3 of 5 reboots, and stalled for 36 and 62 seconds in the other 2, the reboots in which the broker didn't close the producer's connections (see [Expected application impact and client resilience](#expected-application-impact-and-client-resilience)).
 - With a replication factor of 3 and `min.insync.replicas=2`, producers using `acks=all` (and idempotence enabled) should continue writing without data loss across the leadership change.
 - `UnderReplicatedPartitions` may rise briefly while the broker is down but should return to 0 after recovery.
 - `OfflinePartitionsCount` should remain 0 throughout (no partition should lose all replicas).
@@ -28,9 +28,10 @@ Before running this experiment, ensure that:
 1. You have the roles created for FIS and SSM Automation to use. Example IAM policy documents and trust policies are provided (`msk-broker-reboot-fis-role-iam-policy.json`, `msk-broker-reboot-ssm-role-iam-policy.json`, `fis-iam-trust-relationship.json`, `ssm-iam-trust-relationship.json`).
 2. You have created the SSM Automation Document from the sample provided (`msk-broker-reboot-automation.yaml`) with the name `msk-broker-reboot-automation`.
 3. You have created the FIS Experiment Template from the sample provided (`msk-broker-reboot-experiment-template.json`) and replaced all placeholder values (`<YOUR ...>`).
-4. The MSK cluster you want to target is a **provisioned** cluster (not Serverless), is in the `ACTIVE` state, and has the `FIS-Ready=True` tag applied. The SSM automation role's `kafka:RebootBroker` permission is scoped with a `FIS-Ready=True` resource-tag condition, so an untagged cluster is both skipped by discovery and denied the reboot.
+4. The MSK cluster you want to target is a **provisioned** cluster (not Serverless), is in the `ACTIVE` state, and has the `FIS-Ready=True` tag applied. The SSM automation role's `kafka:RebootBroker` permission is scoped with a `FIS-Ready=True` resource-tag condition, so an untagged cluster is both skipped by discovery and denied the reboot. Tag only one cluster per Region: the automation has no parameter that names a cluster, and with several tagged clusters it reboots a broker on the first `ACTIVE` one that `ListClustersV2` returns.
 5. Your cluster has a replication factor of at least 3 across at least 2 (ideally 3) Availability Zones, with `min.insync.replicas` set to at least 2, so a single broker reboot does not cause data loss or offline partitions.
 6. You have appropriate monitoring and observability in place to track the impact of the experiment (see [Recommended Metrics for Stop Conditions](#recommended-metrics-for-stop-conditions)).
+7. The experiment was tested in `us-east-2` on a provisioned cluster of three `kafka.m7g.large` brokers running Apache Kafka 3.9 in KRaft mode, with TLS, a 6-partition topic with replication factor 3 and `min.insync.replicas=2`, and a confluent-kafka 2.16 (librdkafka) producer sending 100 messages a second with the settings in [Expected application impact and client resilience](#expected-application-impact-and-client-resilience). Other broker types and counts, ZooKeeper-based clusters, Java clients and other Regions weren't tested.
 
 ## How it works
 
@@ -54,7 +55,7 @@ watch -n 10 'aws kafka describe-cluster-v2 --cluster-arn <YOUR-CLUSTER-ARN> --qu
 
 During the experiment, the targeted broker restarts and rejoins the cluster, and partition leadership rebalances. The reboot cluster operation (`OperationType=REBOOT_NODE`) moves through `PENDING` and `REBOOT_IN_PROGRESS` to the terminal state `REBOOT_COMPLETE`, and the cluster state is `REBOOTING_BROKER` until it returns to `ACTIVE`. In testing on a three-broker cluster (`kafka.m7g.large`, Apache Kafka 3.9 in KRaft mode), the operation took 130 to 192 seconds, and the cluster was `ACTIVE` again 135 to 196 seconds after the reboot started. The automation treats any terminal `*COMPLETE` operation state as success and any `*FAILED` state as failure.
 
-## Expected application impact and client resilience
+### Expected application impact and client resilience
 
 A broker reboot is not transparent to clients — there is a brief window while leadership moves to other brokers. What a well-configured application experiences, and the settings that make it resilient:
 
@@ -70,11 +71,20 @@ A broker reboot is not transparent to clients — there is a brief window while 
 
 If your application surfaces errors to end users, drops messages, or stalls for longer than your SLA allows during this experiment, that indicates client retry/timeout settings, `acks`, replication factor, or capacity need tuning.
 
+### What else is affected
+
+- Every client of the cluster sees the reboot, not only your test clients: the leadership change, the stalls above, and the load the surviving brokers take over.
+- Any other cluster in the Region that carries the tag can be the one rebooted, as Prerequisite 4 says.
+
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined by default. The reboot completes automatically when the broker rejoins and the cluster returns to `ACTIVE`. Stopping the experiment cancels the automation's monitoring step but not the reboot: in testing, the broker finished rebooting 82 seconds after the stop, and there was nothing to restore. The automation only selects an `ACTIVE` cluster, and the cluster is `REBOOTING_BROKER` while a broker reboots, so a second run started during a reboot fails with `No ACTIVE provisioned MSK cluster found with tag FIS-Ready=True` even though the cluster exists. Run one broker-reboot experiment per cluster at a time.
+The experiment does not have any specific stop conditions defined by default. It ends when the automation does: when the reboot operation completes or fails, or when the automation's monitoring window runs out.
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+
+Once the reboot has started, stopping the experiment ends the automation's monitoring step but not the reboot: in testing, the broker finished rebooting 82 seconds after the stop, and there was nothing to restore. A stop condition works the same way, so it can't shorten a reboot that has started. A stopped experiment can't be resumed; start a new one. To check a stop condition before you rely on it, set its alarm to `ALARM` with `aws cloudwatch set-alarm-state` while a run is in progress, and check that FIS stops the experiment ([SetAlarmState](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_SetAlarmState.html)).
+
+The automation only selects an `ACTIVE` cluster, and the cluster is `REBOOTING_BROKER` while a broker reboots. In testing, a second run started 47 seconds after the first, with one tagged cluster, failed at discovery with `No ACTIVE provisioned MSK cluster found with tag <tagKey>=<tagValue>` even though the cluster exists. If another `ACTIVE` cluster in the Region carries the tag, a second run reboots a broker on that cluster instead. Run one broker-reboot experiment per cluster at a time.
 
 ### Recommended Metrics for Stop Conditions
 
