@@ -29,13 +29,22 @@ mainSteps:
       Handler: reboot_primary
       Script: |
         import json
+        import time
         from datetime import datetime, timezone
 
         import boto3
         from botocore.config import Config
 
-        # aws:executeScript doesn't retry throttled calls itself, so the client does.
-        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"})
+        # aws:executeScript doesn't retry throttled calls itself, so the client does. The timeouts stop one
+        # call from hanging until the step times out.
+        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
+        # Fewer attempts for the reboot itself, so that one call (at most about 80 s) can't outlast the step.
+        REBOOT_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=5, read_timeout=20)
+        STEP_NAME = "rebootPrimaryNode"
+        # No reboot call starts after this many seconds of the step's 300-s timeout.
+        REBOOT_CUTOFF_SECONDS = 200
+        # Step 1 hands its targets to the waits through its output, which holds at most 100 KB.
+        MAX_GROUPS = 20
 
 
         def tagged_groups(ec, key, value):
@@ -87,19 +96,33 @@ mainSteps:
             return (rg_id, cluster_id, node_id), []
 
 
-        def stopped(ssm, execution_id):
-            # When SSM cancels this step, the script keeps running. Don't reboot anything after a stop.
-            status = ssm.get_automation_execution(
-                AutomationExecutionId=execution_id)["AutomationExecution"]["AutomationExecutionStatus"]
-            return status in ("Cancelling", "Cancelled")
+        def why_not_reboot(ssm, execution_id, started):
+            # SSM may leave this script running after it cancels or times out the step, so before each call
+            # check that the step is still within its own time, and that the run and this step are both
+            # still InProgress. Any other status stops the reboots.
+            if time.time() - started > REBOOT_CUTOFF_SECONDS:
+                return "the step has run for more than {} s".format(REBOOT_CUTOFF_SECONDS)
+            ex = ssm.get_automation_execution(AutomationExecutionId=execution_id)["AutomationExecution"]
+            if ex["AutomationExecutionStatus"] != "InProgress":
+                return "the run's status is " + ex["AutomationExecutionStatus"]
+            mine = [st.get("StepStatus") for st in ex.get("StepExecutions", []) if st.get("StepName") == STEP_NAME]
+            if mine != ["InProgress"]:
+                return "this step's status is {}".format(mine)
+            return None
 
 
         def reboot_primary(events, context):
+            started = time.time()
             ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            ec_reboot = boto3.client("elasticache", region_name=events["region"], config=REBOOT_CONFIG)
             ssm = boto3.client("ssm", region_name=events["region"], config=CONFIG)
             groups = tagged_groups(ec, events["tagKey"], events["tagValue"])
             if not groups:
                 raise Exception("No replication group found with tag {}={}".format(events["tagKey"], events["tagValue"]))
+            if len(groups) > MAX_GROUPS:
+                raise Exception("Nothing was rebooted. {} replication groups have tag {}={}; this experiment supports at "
+                                "most {}: {}".format(len(groups), events["tagKey"], events["tagValue"], MAX_GROUPS,
+                                                     ", ".join(groups)))
             targets, not_ready = [], []
             for rg_id in groups:
                 target, reasons = check_group(ec, rg_id)
@@ -113,14 +136,15 @@ mainSteps:
                                 "enabled, one primary and at least one replica, not in a Global Datastore, and the "
                                 "primary cluster and node available): " + "; ".join(not_ready))
             rebooted, failed = [], []
-            for rg_id, cluster_id, node_id in targets:
-                if stopped(ssm, events["executionId"]):
-                    raise Exception("The run was stopped. Not rebooted: {}. Rebooted before the stop: {}".format(
-                        rg_id, [r["cluster"] for r in rebooted]))
+            for i, (rg_id, cluster_id, node_id) in enumerate(targets):
+                reason = why_not_reboot(ssm, events["executionId"], started)
+                if reason:
+                    raise Exception("No more reboots: {}. Not rebooted: {}. Reboot already requested: {}. Failed: {}".format(
+                        reason, [g for g, _, _ in targets[i:]], [r["group"] for r in rebooted], failed))
                 # Events from before this moment can't count as this run's restart.
                 since = datetime.now(timezone.utc).isoformat()
                 try:
-                    ec.reboot_cache_cluster(CacheClusterId=cluster_id, CacheNodeIdsToReboot=[node_id])
+                    ec_reboot.reboot_cache_cluster(CacheClusterId=cluster_id, CacheNodeIdsToReboot=[node_id])
                 except Exception as e:
                     failed.append("{} (primary {} node {}): {}".format(rg_id, cluster_id, node_id, e))
                     print("RebootCacheCluster failed for primary {} node {} of {}: {}".format(cluster_id, node_id, rg_id, e))
@@ -162,7 +186,7 @@ mainSteps:
         import boto3
         from botocore.config import Config
 
-        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"})
+        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
         GONE_CLUSTER = ("deleting", "deleted", "incompatible-network", "restore-failed")
         GONE_GROUP = ("deleting", "create-failed")
 
@@ -217,6 +241,10 @@ mainSteps:
             while True:
                 waiting = {}
                 for t in targets:
+                    # Check the deadline before each target too, so one slow pass can't run past the step.
+                    if time.time() > deadline:
+                        waiting[t["cluster"]] = "not checked again before this step's deadline"
+                        continue
                     state = reboot_state(ec, t, progress)
                     if state:
                         waiting[t["cluster"]] = state
@@ -237,7 +265,7 @@ mainSteps:
         rebootedNodes: "{{ rebootPrimaryNode.RebootedNodes }}"
         rebootErrors: "{{ rebootPrimaryNode.RebootErrors }}"
         progress: "{}"
-        timeoutSeconds: "540"
+        timeoutSeconds: "510"
         failIfNotDone: "false"
     outputs:
       - Name: Status
@@ -267,7 +295,7 @@ mainSteps:
         import boto3
         from botocore.config import Config
 
-        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"})
+        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
         GONE_CLUSTER = ("deleting", "deleted", "incompatible-network", "restore-failed")
         GONE_GROUP = ("deleting", "create-failed")
 
@@ -322,6 +350,10 @@ mainSteps:
             while True:
                 waiting = {}
                 for t in targets:
+                    # Check the deadline before each target too, so one slow pass can't run past the step.
+                    if time.time() > deadline:
+                        waiting[t["cluster"]] = "not checked again before this step's deadline"
+                        continue
                     state = reboot_state(ec, t, progress)
                     if state:
                         waiting[t["cluster"]] = state
@@ -342,7 +374,7 @@ mainSteps:
         rebootedNodes: "{{ rebootPrimaryNode.RebootedNodes }}"
         rebootErrors: "{{ rebootPrimaryNode.RebootErrors }}"
         progress: "{{ waitForReboot.Progress }}"
-        timeoutSeconds: "540"
+        timeoutSeconds: "510"
         failIfNotDone: "true"
     outputs:
       - Name: Status
@@ -366,18 +398,22 @@ mainSteps:
         import boto3
         from botocore.config import Config
 
-        # Few retries: on a stop, this step has to finish inside the two-minute cancel window.
-        CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"})
+        # Few retries and short timeouts: on a stop, this step has to finish inside the two-minute cancel
+        # window, and a call that starts just before the deadline must still end inside the 60-s step.
+        CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=3, read_timeout=5)
 
 
-        def tagged_groups(ec, key, value):
+        def tagged_groups(ec, key, value, deadline):
+            # Returns the tagged groups found and whether every group in the Region was read before the deadline.
             groups = []
             for page in ec.get_paginator("describe_replication_groups").paginate():
                 for rg in page["ReplicationGroups"]:
+                    if time.time() > deadline:
+                        return groups, False
                     tags = ec.list_tags_for_resource(ResourceName=rg["ARN"]).get("TagList", [])
                     if any(t["Key"] == key and t["Value"] == value for t in tags):
                         groups.append(rg["ReplicationGroupId"])
-            return groups
+            return groups, True
 
 
         def problems(ec, rg_id):
@@ -401,29 +437,37 @@ mainSteps:
 
         def report(events, context):
             ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
-            groups = tagged_groups(ec, events["tagKey"], events["tagValue"])
+            # One deadline for finding the groups and checking them.
             deadline = time.time() + int(events["timeoutSeconds"])
+            groups, listed_all = tagged_groups(ec, events["tagKey"], events["tagValue"], deadline)
+            scope = "" if listed_all else (" Only part of the Region's replication groups could be read before the "
+                                           "deadline, so other tagged groups may not be included.")
             healthy_since = None
             while True:
-                bad = {}
+                bad, unchecked = {}, []
                 for rg_id in groups:
+                    if time.time() > deadline:
+                        unchecked.append(rg_id)
+                        continue
                     issues = problems(ec, rg_id)
                     if issues:
                         bad[rg_id] = issues
-                if bad:
+                if bad or unchecked:
                     healthy_since = None
                 elif healthy_since is None:
                     healthy_since = time.time()
                 if not groups:
-                    message = "No replication group found with tag {}={}".format(events["tagKey"], events["tagValue"])
+                    message = "No replication group found with tag {}={}.{}".format(
+                        events["tagKey"], events["tagValue"], scope)
                     break
                 if (healthy_since is not None and time.time() - healthy_since >= 20) or (
-                        not bad and time.time() > deadline):
-                    message = "Every tagged replication group is healthy: " + ", ".join(groups)
+                        not bad and not unchecked and time.time() > deadline):
+                    message = "Every tagged replication group found is healthy: {}.{}".format(", ".join(groups), scope)
                     break
                 if time.time() > deadline:
-                    message = ("Not healthy yet: {}. A reboot that ElastiCache has accepted can't be cancelled: the "
-                               "node restarts on its own, and its data is cleared.".format(bad))
+                    message = ("Not healthy yet: {}. Not checked before the deadline: {}. A reboot that ElastiCache "
+                               "has accepted can't be cancelled: the node restarts on its own, and its data is "
+                               "cleared.{}".format(bad, unchecked, scope))
                     break
                 time.sleep(5)
             print(message)
@@ -434,7 +478,7 @@ mainSteps:
         region: "{{ global:REGION }}"
         tagKey: "{{ tagKey }}"
         tagValue: "{{ tagValue }}"
-        timeoutSeconds: "30"
+        timeoutSeconds: "25"
         failRun: "true"
     outputs:
       - Name: Status
@@ -457,18 +501,22 @@ mainSteps:
         import boto3
         from botocore.config import Config
 
-        # Few retries: on a stop, this step has to finish inside the two-minute cancel window.
-        CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"})
+        # Few retries and short timeouts: on a stop, this step has to finish inside the two-minute cancel
+        # window, and a call that starts just before the deadline must still end inside the 60-s step.
+        CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=3, read_timeout=5)
 
 
-        def tagged_groups(ec, key, value):
+        def tagged_groups(ec, key, value, deadline):
+            # Returns the tagged groups found and whether every group in the Region was read before the deadline.
             groups = []
             for page in ec.get_paginator("describe_replication_groups").paginate():
                 for rg in page["ReplicationGroups"]:
+                    if time.time() > deadline:
+                        return groups, False
                     tags = ec.list_tags_for_resource(ResourceName=rg["ARN"]).get("TagList", [])
                     if any(t["Key"] == key and t["Value"] == value for t in tags):
                         groups.append(rg["ReplicationGroupId"])
-            return groups
+            return groups, True
 
 
         def problems(ec, rg_id):
@@ -492,29 +540,37 @@ mainSteps:
 
         def report(events, context):
             ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
-            groups = tagged_groups(ec, events["tagKey"], events["tagValue"])
+            # One deadline for finding the groups and checking them.
             deadline = time.time() + int(events["timeoutSeconds"])
+            groups, listed_all = tagged_groups(ec, events["tagKey"], events["tagValue"], deadline)
+            scope = "" if listed_all else (" Only part of the Region's replication groups could be read before the "
+                                           "deadline, so other tagged groups may not be included.")
             healthy_since = None
             while True:
-                bad = {}
+                bad, unchecked = {}, []
                 for rg_id in groups:
+                    if time.time() > deadline:
+                        unchecked.append(rg_id)
+                        continue
                     issues = problems(ec, rg_id)
                     if issues:
                         bad[rg_id] = issues
-                if bad:
+                if bad or unchecked:
                     healthy_since = None
                 elif healthy_since is None:
                     healthy_since = time.time()
                 if not groups:
-                    message = "No replication group found with tag {}={}".format(events["tagKey"], events["tagValue"])
+                    message = "No replication group found with tag {}={}.{}".format(
+                        events["tagKey"], events["tagValue"], scope)
                     break
                 if (healthy_since is not None and time.time() - healthy_since >= 20) or (
-                        not bad and time.time() > deadline):
-                    message = "Every tagged replication group is healthy: " + ", ".join(groups)
+                        not bad and not unchecked and time.time() > deadline):
+                    message = "Every tagged replication group found is healthy: {}.{}".format(", ".join(groups), scope)
                     break
                 if time.time() > deadline:
-                    message = ("Not healthy yet: {}. A reboot that ElastiCache has accepted can't be cancelled: the "
-                               "node restarts on its own, and its data is cleared.".format(bad))
+                    message = ("Not healthy yet: {}. Not checked before the deadline: {}. A reboot that ElastiCache "
+                               "has accepted can't be cancelled: the node restarts on its own, and its data is "
+                               "cleared.{}".format(bad, unchecked, scope))
                     break
                 time.sleep(5)
             print(message)
@@ -525,7 +581,7 @@ mainSteps:
         region: "{{ global:REGION }}"
         tagKey: "{{ tagKey }}"
         tagValue: "{{ tagValue }}"
-        timeoutSeconds: "30"
+        timeoutSeconds: "25"
         failRun: "false"
     outputs:
       - Name: Status
