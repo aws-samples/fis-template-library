@@ -6,13 +6,14 @@ THIS TEMPLATE WILL INJECT REAL FAULTS! THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
 
 ## Hypothesis
 
-When a single Amazon MSK broker is rebooted, the cluster should remain available and continue serving produce and consume requests using the remaining brokers, after a brief and recoverable disruption while partition leadership moves off the rebooted broker. Specifically:
+If a single broker of a provisioned Amazon MSK cluster is rebooted, the cluster should keep serving produce and consume requests on the remaining brokers while partition leadership moves off the rebooted broker to in-sync replicas, and:
 
-- Partition leadership for partitions led by the rebooted broker should automatically move to in-sync replicas on other brokers. Clients see retriable errors (for example `NotLeaderOrFollowerException`) for those partitions, refresh metadata, and reconnect to the new leaders. Deliveries to those partitions should not stall for longer than your application allows. In testing, they took at most 150 ms in 3 of 5 reboots, and stalled for 36 and 62 seconds in the other 2, the reboots in which the broker didn't close the producer's connections (see [Expected application impact and client resilience](#expected-application-impact-and-client-resilience)).
-- With a replication factor of 3 and `min.insync.replicas=2`, producers using `acks=all` (and idempotence enabled) should continue writing without data loss across the leadership change.
-- `UnderReplicatedPartitions` may rise briefly while the broker is down but should return to 0 after recovery.
-- `OfflinePartitionsCount` should remain 0 throughout (no partition should lose all replicas).
-- The broker should rejoin the cluster and the cluster should return to `ACTIVE` within a few minutes, and the surviving brokers should absorb the rebooted broker's share of load (expect a temporary CPU increase, since one of three brokers represents roughly a third of cluster capacity).
+- The longest delivery stall on the partitions the rebooted broker led should not exceed what your application allows. Clients refresh their metadata and send to the new leaders. In testing, the longest delivery to those partitions took at most 150 ms in 3 of 5 reboots, and 36 and 62 seconds in the other 2, and the producer reported no error to the application (see [Expected application impact and client resilience](#expected-application-impact-and-client-resilience)).
+- With a replication factor of 3 and `min.insync.replicas=2`, producers using `acks=all` and idempotence should lose no acknowledged message.
+- `OfflinePartitionsCount` should stay at 0.
+- `UnderReplicatedPartitions` should return to 0 within a few minutes after the broker rejoins. In testing, it did within a minute.
+- The cluster should be `ACTIVE` again within a few minutes. In testing, it was 135 to 196 seconds after the reboot started.
+- While the surviving brokers carry the rebooted broker's share of the load, their CPU (`CpuUser` plus `CpuSystem`) should stay below the headroom you plan for. One of three brokers is roughly a third of the cluster's capacity.
 
 ### What does this enable me to verify?
 
@@ -45,8 +46,9 @@ This experiment reboots a single MSK broker to test cluster resilience and parti
 To verify the experiment is working properly, you can monitor cluster and broker state and watch your client traffic:
 
 ```bash
-# Watch the reboot cluster operation (the list is not in time order, so take the newest)
-aws kafka list-cluster-operations-v2 --cluster-arn <YOUR-CLUSTER-ARN> \
+# Watch the reboot cluster operation (the list is not in time order, so take the newest; --output json makes
+# the query run once over all pages rather than once per page)
+aws kafka list-cluster-operations-v2 --cluster-arn <YOUR-CLUSTER-ARN> --output json \
   --query 'sort_by(ClusterOperationInfoList, &StartTime)[-1].{Type:OperationType,State:OperationState}'
 
 # Watch cluster state return to ACTIVE
@@ -74,15 +76,16 @@ If your application surfaces errors to end users, drops messages, or stalls for 
 ### What else is affected
 
 - Every client of the cluster sees the reboot, not only your test clients: the leadership change, the stalls above, and the load the surviving brokers take over.
+- While the cluster is `REBOOTING_BROKER`, Amazon MSK refuses update operations on it, such as configuration changes or scaling, from anyone, until it is `ACTIVE` again ([cluster states](https://docs.aws.amazon.com/msk/latest/developerguide/msk-cluster-states.html)). In testing, that lasted 135 to 196 seconds.
 - Any other cluster in the Region that carries the tag can be the one rebooted, as Prerequisite 4 says.
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined by default. It ends when the automation does: when the reboot operation completes or fails, or when the automation's monitoring window runs out.
+The experiment does not have any specific stop conditions defined by default. It ends when the automation does: when discovery or broker selection fails, when the reboot operation completes or fails, or when the automation's monitoring window runs out.
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
-Once the reboot has started, stopping the experiment ends the automation's monitoring step but not the reboot: in testing, the broker finished rebooting 82 seconds after the stop, and there was nothing to restore. A stop condition works the same way, so it can't shorten a reboot that has started. A stopped experiment can't be resumed; start a new one. To check a stop condition before you rely on it, set its alarm to `ALARM` with `aws cloudwatch set-alarm-state` while a run is in progress, and check that FIS stops the experiment ([SetAlarmState](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_SetAlarmState.html)).
+Once the reboot has started, stopping the experiment ends the automation's monitoring step but not the reboot: in testing, FIS reported the experiment stopped about a second after the stop request, the broker finished rebooting 82 seconds after the stop, and there was nothing to restore. A stop in the first seconds of the run, before the automation has called `RebootBroker`, may or may not prevent the reboot; this wasn't tested, so check the cluster's operations with the command in How it works afterwards. A stop condition works the same way as a stop, so it can't shorten a reboot that has started. A stopped experiment can't be resumed; start a new one. To check a stop condition before you rely on it, set its alarm to `ALARM` while a run is in progress, with `aws cloudwatch set-alarm-state --alarm-name <YOUR ALARM NAME> --state-value ALARM --state-reason "Testing the FIS stop condition"`, and check that FIS stops the experiment ([SetAlarmState](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_SetAlarmState.html)).
 
 The automation only selects an `ACTIVE` cluster, and the cluster is `REBOOTING_BROKER` while a broker reboots. In testing, a second run started 47 seconds after the first, with one tagged cluster, failed at discovery with `No ACTIVE provisioned MSK cluster found with tag <tagKey>=<tagValue>` even though the cluster exists. If another `ACTIVE` cluster in the Region carries the tag, a second run reboots a broker on that cluster instead. Run one broker-reboot experiment per cluster at a time.
 
