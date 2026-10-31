@@ -13,7 +13,7 @@ If a single broker of a provisioned Amazon MSK cluster is rebooted, the cluster 
 - `OfflinePartitionsCount` should stay at 0.
 - `UnderReplicatedPartitions` should return to 0 within a few minutes after the broker rejoins. In testing, it did within a minute.
 - The cluster should be `ACTIVE` again within a few minutes. In testing, it was 135 to 196 seconds after the reboot started.
-- While the surviving brokers carry the rebooted broker's share of the load, their CPU (`CpuUser` plus `CpuSystem`) should stay below the headroom you plan for. One of three brokers is roughly a third of the cluster's capacity.
+- While the surviving brokers carry the rebooted broker's share of the load, their CPU (`CpuUser` plus `CpuSystem`) should stay below the headroom you plan for. One of three brokers is roughly a third of the cluster's capacity. CPU wasn't measured in testing.
 
 ### What does this enable me to verify?
 
