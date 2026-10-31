@@ -67,13 +67,13 @@ watch -n 5 'aws elasticache describe-replication-groups \
   --output table'
 ```
 
-This shows roles, not reachability: as the note above says, the group and its members show `available` minutes before a recovering node answers. To see when a node stops and starts answering, send it `PING` directly once a second with a 1-second timeout, as the tests did. Each node's address is in `NodeGroupMembers[].ReadEndpoint.Address` in the same `describe-replication-groups` output. Run the probe from a host that can reach the node, and add `--tls` if in-transit encryption is on:
+This shows roles, not reachability: as the note above says, the group and its members show `available` minutes before a recovering node answers. To see when a node stops and starts answering, send it `PING` directly once a second with a 1-second timeout, as the tests did. Each node's address is in `NodeGroupMembers[].ReadEndpoint.Address` in the same `describe-replication-groups` output. Run the probe from a host that can reach the node, with `redis-cli` 6.0 or later, and add `--tls` if in-transit encryption is on. If the group uses AUTH, put the token in the `REDISCLI_AUTH` environment variable rather than passing `-a`, which shows it in the process list, and for RBAC also pass `--user <USER NAME>`. Any reply from the node, even an error such as `NOAUTH`, means it is answering:
 
 ```bash
-# Prints the time, then PONG or "no answer", once a second
+# Prints the time, then what redis-cli got back, or "no answer" if nothing came back within 1 second
 while true; do
   printf '%s ' "$(date -u +%H:%M:%S)"
-  timeout 1 redis-cli -h <NODE-ENDPOINT> -p 6379 PING || echo "no answer"
+  timeout 1 redis-cli -h <NODE-ENDPOINT> -p 6379 PING; [ $? -eq 124 ] && echo "no answer"
   sleep 1
 done
 ```
