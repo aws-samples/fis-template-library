@@ -103,27 +103,16 @@
             "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
         },
         {
-            "Sid": "AllowChangeFISReadyTablePolicies",
+            "Sid": "AllowChangeTableAndStreamPoliciesNoTagConditionLockoutCheck",
             "Effect": "Allow",
             "Action": [
                 "dynamodb:PutResourcePolicy",
                 "dynamodb:DeleteResourcePolicy"
             ],
-            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*",
-            "Condition": {
-                "StringEquals": {
-                    "aws:ResourceTag/FIS-Ready": "True"
-                }
-            }
-        },
-        {
-            "Sid": "AllowChangeStreamPoliciesStreamsDoNotInheritTableTags",
-            "Effect": "Allow",
-            "Action": [
-                "dynamodb:PutResourcePolicy",
-                "dynamodb:DeleteResourcePolicy"
-            ],
-            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*/stream/*"
+            "Resource": [
+                "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*",
+                "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*/stream/*"
+            ]
         },
         {
             "Sid": "AllowTargetResolution",
