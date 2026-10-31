@@ -320,8 +320,8 @@ mainSteps:
 
   - name: ExhaustDatabaseIO
     action: 'aws:runCommand'
-    onFailure: 'step:TerminateInstance'
-    onCancel: 'step:TerminateInstance'
+    onFailure: 'step:CleanupTables'
+    onCancel: 'step:CleanupTables'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
@@ -601,6 +601,125 @@ mainSteps:
                     if conn:
                         conn.close()
 
+            def _cleanup_connect(engine, endpoint, port, dbname, user, password):
+                # Mirrors each worker's own connect so the cleanup path cannot drift from the load path.
+                if engine == 'postgres':
+                    import psycopg2
+                    return psycopg2.connect(host=endpoint, port=port, database=dbname, user=user,
+                                            password=password, connect_timeout=10)
+                if engine == 'mysql':
+                    import mysql.connector
+                    return mysql.connector.connect(host=endpoint, port=port, database=dbname, user=user,
+                                                   password=password, connection_timeout=10)
+                if engine == 'sqlserver':
+                    import pyodbc
+                    cs = (f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};'
+                          f'DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes')
+                    return pyodbc.connect(cs, timeout=10)
+                if engine == 'oracle':
+                    import oracledb
+                    oracledb.init_oracle_client()
+                    return oracledb.connect(user=user, password=password,
+                                            dsn=oracledb.makedsn(endpoint, port, service_name=dbname))
+                raise ValueError('unknown engine ' + engine)
+
+            def _quote_ident(engine, name):
+                # Safely quote a catalog-sourced table identifier by doubling the engine's
+                # quote character, so a crafted table name cannot break out of the statement.
+                if engine == 'mysql':
+                    return '`' + name.replace('`', '``') + '`'
+                if engine == 'sqlserver':
+                    return '[' + name.replace(']', ']]') + ']'
+                return '"' + name.replace('"', '""') + '"'
+
+            def _set_cleanup_timeouts(engine, cur):
+                # Make a blocked DROP fail fast instead of waiting forever on a lock held by a
+                # not-yet-reaped orphaned backend, so cleanup cannot exhaust the cancellation
+                # budget and leave the instance running.
+                try:
+                    if engine == 'postgres':
+                        cur.execute("SET lock_timeout = '5s'")
+                        cur.execute("SET statement_timeout = '20s'")
+                    elif engine == 'mysql':
+                        cur.execute("SET SESSION lock_wait_timeout = 10")
+                        cur.execute("SET SESSION innodb_lock_wait_timeout = 5")
+                    elif engine == 'sqlserver':
+                        cur.execute("SET LOCK_TIMEOUT 10000")
+                    elif engine == 'oracle':
+                        cur.execute("ALTER SESSION SET DDL_LOCK_TIMEOUT = 10")
+                except Exception:
+                    pass
+
+            def cleanup_tables(engine, endpoint, port, dbname, user, password, exec_suffix):
+                """Drop every per-worker table this execution created (fis_io_<exec_suffix>_*). A normal completion
+                already dropped them in each worker, so this is then a no-op; after an early stop or failure, which
+                kills the load generator before its per-worker DROP runs, this removes them so they do not accumulate
+                in the database. Only ever touches this execution's own tables."""
+                conn = _cleanup_connect(engine, endpoint, port, dbname, user, password)
+                conn.autocommit = True
+                cur = conn.cursor()
+                _set_cleanup_timeouts(engine, cur)
+                try:
+                    if engine == 'postgres':
+                        from psycopg2 import sql
+                        cur.execute("SELECT tablename FROM pg_tables WHERE tablename ~ %s", ('^fis_io_' + exec_suffix + '_',))
+                        names = [r[0] for r in cur.fetchall()]
+                        for t in names:
+                            try:
+                                cur.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(sql.Identifier(t)))
+                            except Exception:
+                                pass
+                    elif engine == 'mysql':
+                        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = %s "
+                                    "AND table_name LIKE %s", (dbname, 'fis\\_io\\_' + exec_suffix + '\\_%'))
+                        names = [r[0] for r in cur.fetchall()]
+                        for t in names:
+                            try:
+                                cur.execute('DROP TABLE IF EXISTS ' + _quote_ident('mysql', t))
+                            except Exception:
+                                pass
+                    elif engine == 'sqlserver':
+                        cur.execute("SELECT name FROM sys.tables WHERE name LIKE ?", ('fis[_]io[_]' + exec_suffix + '[_]%',))
+                        names = [r[0] for r in cur.fetchall()]
+                        for t in names:
+                            try:
+                                cur.execute('DROP TABLE IF EXISTS ' + _quote_ident('sqlserver', t))
+                            except Exception:
+                                pass
+                    elif engine == 'oracle':
+                        cur.execute("SELECT table_name FROM user_tables WHERE table_name LIKE :1 ESCAPE '\\'",
+                                    ['FIS\\_IO\\_' + exec_suffix.upper() + '\\_%'])
+                        names = [r[0] for r in cur.fetchall()]
+                        for t in names:
+                            try:
+                                cur.execute('DROP TABLE ' + _quote_ident('oracle', t) + ' PURGE')
+                            except Exception:
+                                pass
+                    else:
+                        names = []
+                    return {"matched": len(names), "names": names}
+                finally:
+                    cur.close()
+                    conn.close()
+
+            def cleanup_entry(argv):
+                engine, endpoint, port, dbname, user, secret_arn, region, execution_id = (
+                    argv[0], argv[1], int(argv[2]), argv[3], argv[4], argv[5], argv[6], argv[7])
+                exec_suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
+                print("=== Database I/O Exhaustion Cleanup ===")
+                print(f"Engine: {engine}  Suffix: {exec_suffix}")
+                try:
+                    sm = boto3.client('secretsmanager', region_name=region)
+                    response = sm.get_secret_value(SecretId=secret_arn)
+                    secret = json.loads(response['SecretString'])
+                    password = secret.get('password', response['SecretString'])
+                except Exception as e:
+                    print(f"ERROR: Failed to retrieve password: {str(e)}")
+                    sys.exit(1)
+                out = cleanup_tables(engine, endpoint, port, dbname, user, password, exec_suffix)
+                print(json.dumps(out))
+                print(f"Removed {out['matched']} leftover table(s) matching fis_io_{exec_suffix}_*")
+
             def main():
                 engine = sys.argv[1]
                 endpoint = sys.argv[2]
@@ -714,7 +833,10 @@ mainSteps:
                     sys.exit(1)
 
             if __name__ == '__main__':
-                main()
+                if len(sys.argv) > 1 and sys.argv[1] == '--cleanup':
+                    cleanup_entry(sys.argv[2:])
+                else:
+                    main()
             PYTHON_EOF
 
             python3 /tmp/exhaust_io.py \
@@ -731,6 +853,42 @@ mainSteps:
               "{{ automation:EXECUTION_ID }}" \
               "{{ SeedRowCount }}" \
               "{{ MinActiveWorkerPercentage }}"
+
+  - name: CleanupTables
+    action: 'aws:runCommand'
+    onFailure: 'Continue'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 600
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            # Stop the load generator, then drop any per-worker tables this execution left behind. Stopping an FIS
+            # experiment cancels the run command at the automation level but does not kill the load generator process
+            # on the instance, which otherwise keeps creating and holding tables until the instance is terminated.
+            # Signal it here first: killing the process closes its database connections (the kernel resets the
+            # sockets while the instance network is still up), which releases any locks and stops new tables being
+            # created, so the drop below neither blocks nor races the load generator. On a normal completion the load
+            # generator has already exited and each worker dropped its own table, so both steps are a no-op. Only
+            # this execution's own tables (fis_io_<execution-suffix>_*) are ever removed. The pkill runs before the
+            # cleanup invocation below, so it does not match this script's own cleanup process.
+            pkill -TERM -f '/tmp/exhaust_io.py' 2>/dev/null || true
+            for i in $(seq 1 15); do pgrep -f '/tmp/exhaust_io.py' >/dev/null 2>&1 || break; sleep 1; done
+            pkill -KILL -f '/tmp/exhaust_io.py' 2>/dev/null || true
+            sleep 3
+            python3 /tmp/exhaust_io.py --cleanup \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}"
 
   - name: TerminateInstance
     action: 'aws:changeInstanceState'

@@ -70,14 +70,18 @@ SSM Automation Document
 8. Verify a minimum percentage of workers actually recorded I/O operations;
    fail the automation if the fault was not reliably injected
     ↓
-9. Cleanup: each worker drops its own uniquely-named table
+9. Each worker drops its own uniquely-named table on a normal finish
     ↓
-10. Terminate EC2 instance
+10. Stop the load generator if it is still running, then drop any of this run's
+    per-worker tables that remain (CleanupTables), before the instance is
+    terminated
     ↓
-11. Revoke ingress rule from database SG (idempotent - runs even if the load
+11. Terminate EC2 instance
+    ↓
+12. Revoke ingress rule from database SG (idempotent - runs even if the load
     generator failed to launch)
     ↓
-12. Delete temporary security group
+13. Delete temporary security group
 ```
 
 ## Prerequisites
@@ -185,11 +189,12 @@ The experiment requires the following parameters:
 
 ### Phase 4: Cleanup
 12. Each worker thread drops its own test table (in a `finally` block, so this runs even if the timed loop hit errors)
-13. Terminates the EC2 instance
-14. Waits for instance termination to complete
-15. Revokes the ingress rule from the database security group - idempotent, and reached even if `LaunchLoadGenerator` itself failed, so a partially-created run never leaves an orphaned ingress rule blocking security group deletion
-16. Deletes the temporary security group
-17. Returns execution summary including total I/O operations, error counts, and whether the fault was successfully injected
+13. Stops the load-generator process if it is still running, then drops any of this run's per-worker tables that remain (`CleanupTables`). An FIS stop cancels the run command but leaves the load-generator process running, so the step stops it first (which also closes its database connections) and then normally removes the tables it created; on a normal finish the process has already exited and each worker dropped its own table, so the step is usually a no-op
+14. Terminates the EC2 instance
+15. Waits for instance termination to complete
+16. Revokes the ingress rule from the database security group - idempotent, and reached even if `LaunchLoadGenerator` itself failed, so a partially-created run never leaves an orphaned ingress rule blocking security group deletion
+17. Deletes the temporary security group
+18. Returns execution summary including total I/O operations, error counts, and whether the fault was successfully injected
 
 ## Stop Conditions
 
@@ -197,8 +202,6 @@ The experiment template does not have any specific stop conditions defined by de
 - All actions complete successfully or one fails
 - Manually stopped via FIS console/API
 - A custom CloudWatch alarm triggers (if configured)
-
-## Observability and Stop Conditions
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
