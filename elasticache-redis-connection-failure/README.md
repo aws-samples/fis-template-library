@@ -29,13 +29,13 @@ Before running this experiment, ensure that:
 2. You have created the SSM Automation Document from the sample provided (redis-connection-failure-automation.yaml)
 3. You have created the FIS Experiment Template from the sample provided (redis-connection-failure-experiment-template.json)
 4. The ElastiCache Redis cluster(s) you want to target have the "FIS-Ready":"True" tag and value
-5. The target clusters use security groups of their own. The experiment removes port 6379 rules from the security groups of every tagged node, which cuts off every other resource that relies on those rules (see [What else is affected](#what-else-is-affected)).
+5. The target clusters use security groups of their own. The experiment removes port 6379 rules from the security groups of the tagged nodes it acts on (at most 100, see [How it works](#how-it-works)), which cuts off every other resource that relies on those rules (see [What else is affected](#what-else-is-affected)).
 6. The target nodes run the Redis engine. Nodes that run Valkey are not targeted.
 7. You run the experiment in the standard AWS partition. The automation builds each node's ARN with `arn:aws`, so in AWS GovCloud (US) and China Regions it finds no node and changes nothing.
 8. Your applications implement proper Redis client circuit breakers and retry logic
 9. You have appropriate monitoring and observability in place to track the impact of the experiment.
 10. The experiment was tested on a two-node Redis OSS 7.1 replication group (`cache.t4g.micro`, cluster mode disabled) in `us-east-1`, with one security group that held one port 6379 rule whose source was a security group. Cluster mode enabled, ports other than 6379, rules with an IP address range as their source, and nodes with more than one security group weren't tested.
-11. Before every run, save the rules of each target node's security groups, for example `aws ec2 describe-security-groups --group-ids <SECURITY GROUP ID> > <SECURITY GROUP ID>-before.json`. If a stop or a failed restore leaves rules removed, this copy and the automation's output are the only records of them (see [Stop Conditions](#stop-conditions)).
+11. Before every run, save the rules of each target node's security groups, for example `aws ec2 describe-security-groups --group-ids <SECURITY GROUP ID> > <SECURITY GROUP ID>-before.json`. If a stop or a failed restore leaves rules removed, this copy, the automation's output and CloudTrail's record of each `RevokeSecurityGroupIngress` call (kept 90 days in event history) are the records of them (see [Stop Conditions](#stop-conditions)).
 12. The README's commands need the AWS CLI and `redis-cli`.
 
 ## How it works
@@ -45,7 +45,7 @@ This experiment simulates Redis connection failures by removing rules from the n
 1. **Dynamic Discovery**: Scans every ElastiCache cache cluster (node) that runs the Redis engine and selects those tagged with "FIS-Ready":"True". It reads each node's own tags; tags you add to a replication group are also added to all of its nodes ([Tagging your ElastiCache resources](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Tagging-Resources.html)). It hands the next step its list of tagged nodes as a step output, which SSM cuts to 100 items ([aws:executeScript](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-action-executeScript.html)), so the automation acts on at most 100 tagged nodes and skips the rest without an error.
 2. **Connection Disruption**: For each tagged node it received, removes from each of its security groups the ingress rules whose `FromPort` and `ToPort` are both 6379, whatever their protocol, and records them in the step's output for the restore. Only those exact rules are removed: a rule for a port range that includes 6379, an all-traffic rule, or another security group that allows port 6379 keeps the node reachable, and a node that listens on another port isn't affected. If no tagged node is found, no rule matches, or a tag read or a security group call fails, the automation still ends `Success`, with no fault on the nodes it couldn't change. A failed call to list the cache clusters fails the run before anything changes. During a run, check with the `describe-security-groups` command below, for each of the node's security groups, that no rule still admits port 6379.
 3. **Sustained Failure**: Maintains connection disruption for specified duration to test resilience
-4. **Restoration**: Adds the recorded rules back. A failed restore is listed in the automation's output, but the run still ends `Success`, so after every run check with the `describe-security-groups` command below that the rules are back, and add any that are missing.
+4. **Restoration**: Adds the recorded rules back. A failed restore is listed in the automation's output, but the run still ends `Success`, so after every run check with the `describe-security-groups` command below that the rules are back, and add any that are missing. The record of removed rules is the change step's output, which SSM limits to 100 KB, and the restore's list of results is limited to 100 entries, so with many security groups compare against the copy you saved before the run, not the output.
 
 The connection failure is implemented using an SSM Automation Document invoked by FIS. The SSM Automation Document modifies security group rules to block access to Redis, then restores connectivity after the specified duration.
 
@@ -68,7 +68,7 @@ During the experiment, you should observe connection timeouts when attempting to
 
 ### What else is affected
 
-* Every resource that uses the tagged nodes' security groups loses the port 6379 rules for the length of the fault, whether or not it carries the tag: other cache clusters, and anything else that relies on those rules. Give the target clusters security groups of their own.
+* Every resource that uses the security groups of the tagged nodes the experiment acts on (at most 100) loses the port 6379 rules for the length of the fault, whether or not it carries the tag: other cache clusters, and anything else that relies on those rules. Give the target clusters security groups of their own.
 * Open connections that the security group doesn't track drop at once (see the note above).
 * If CloudFormation or CDK manages the security groups, the rules change outside the stack. Drift detection shows the security groups as changed during the run, and the rules the restore adds back get new security group rule IDs. Don't update the stack during a run: if the update adds a removed rule back, the restore's call to add the rules fails as a duplicate, the other rules in that call stay removed, and the run still ends `Success`.
 
@@ -86,7 +86,7 @@ What a stop does depends on which step of the automation is running. A stop cond
 * **While it adds the rules back** (`restoreRedisConnections`): not tested. This step has no cancel handler, so a stop may leave rules removed. So may the action reaching the template's `maxDuration` of 30 minutes, which can happen with a `duration` close to it, or if the script steps run slowly: they have no timeout of their own and can each run for up to 600 seconds, so on the normal path the restore can also take that long.
 * **After the restore**: nothing changes.
 
-A failed restore doesn't fail the run, so after every stop compare the security groups with the copy you saved before the run. To add missing rules back by hand, find the automation run, read the rules its `disableRedisConnections` step removed, and add them back for each security group:
+A failed restore doesn't fail the run, so after every stop compare the security groups with the copy you saved before the run. To add missing rules back by hand, find the automation run, read the rules its `disableRedisConnections` step removed, and add them back for each security group. That output is limited to 100 KB, so if it looks cut off, use your saved copy, or the `RevokeSecurityGroupIngress` calls in CloudTrail:
 
 ```bash
 # FIS starts the automation by document ARN, so filter by start time, not document name
