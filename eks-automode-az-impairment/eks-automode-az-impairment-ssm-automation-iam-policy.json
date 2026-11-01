@@ -2,6 +2,12 @@
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ValidateClusterAndSubnet",
+      "Effect": "Allow",
+      "Action": "eks:DescribeCluster",
+      "Resource": "arn:aws:eks:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster/<YOUR EKS CLUSTER>"
+    },
+    {
       "Sid": "AllowEC2DescribeActions",
       "Effect": "Allow",
       "Action": [
@@ -9,7 +15,8 @@
         "ec2:DescribeInstanceStatus",
         "ec2:DescribeNetworkInterfaces",
         "ec2:DescribeSecurityGroups",
-        "ec2:DescribeImages"
+        "ec2:DescribeImages",
+        "ec2:DescribeSubnets"
       ],
       "Resource": "*"
     },
