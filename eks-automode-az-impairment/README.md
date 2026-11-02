@@ -69,21 +69,26 @@ Before running this experiment, ensure that:
    > **Which identity calls the Kubernetes API?** The Kubernetes work runs **on the temporary EC2 instance**, so it uses the **instance profile role's** credentials and the EKS bearer token is minted for that role. The SSM automation role only orchestrates. The EKS access entry and RBAC below must map the instance profile role.
 
 2. **EKS cluster access**: create an EKS access entry for the **instance profile role**, mapped to the username the RBAC binds (`fis-az-impairment-client`):
+
    ```bash
    aws eks create-access-entry \
      --principal-arn arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR INSTANCE PROFILE ROLE NAME> \
      --username fis-az-impairment-client \
      --cluster-name <YOUR EKS CLUSTER>
    ```
+
    The FIS execution role and the SSM automation role do not need an access entry.
 
 3. **Kubernetes RBAC**:
+
    ```bash
    kubectl apply -f eks-automode-az-impairment-rbac.yaml
    ```
+
    This grants the `fis-az-impairment-client` user permission to read and cordon nodes, list and delete pods, and read and patch NodePools. The username in the `ClusterRoleBinding` must match the `--username` above.
 
 4. **SSM automation document**:
+
    ```bash
    aws ssm create-document \
      --name "eks-automode-az-impairment-automation" \
@@ -93,6 +98,7 @@ Before running this experiment, ensure that:
    ```
 
 5. **Zonal shift on the cluster**: enable zonal shift once, and tag the cluster so the FIS target can find it. Enabling it has no effect on the cluster until a shift starts, and ARC zonal shift has [no additional charge](https://aws.amazon.com/application-recovery-controller/pricing/). ARC zonal shift support for EKS Auto Mode was [announced in July 2026](https://aws.amazon.com/about-aws/whats-new/2026/07/eks-auto-mode-arc-zonal-shift/).
+
    ```bash
    aws eks update-cluster-config --name <YOUR EKS CLUSTER> \
      --zonal-shift-config enabled=true
@@ -100,6 +106,7 @@ Before running this experiment, ensure that:
      --resource-arn arn:aws:eks:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster/<YOUR EKS CLUSTER> \
      --tags FIS-Ready=True
    ```
+
    If your cluster cannot use zonal shift, delete the `wait-for-recovery-action` and `shift-away-from-az` actions and the `eks-cluster-for-zonal-shift` target from the template. The built-in NodePools can then launch nodes in the target AZ from requests that list several AZs.
 
 6. **Multi-AZ deployment**: the cluster must have subnets in at least 2 AZs, with workloads distributed across them. **3 AZs is recommended**: with `DoNotSchedule` and `maxSkew: 1`, a 3-AZ cluster lets evicted pods redistribute across both surviving AZs, whereas a 2-AZ cluster leaves them `Pending`. See [Number of Availability Zones](#3-number-of-availability-zones).
@@ -109,6 +116,7 @@ Before running this experiment, ensure that:
 8. **NodePool**: identify the custom NodePool your workloads use (`kubectl get nodepools`). It must not be `general-purpose` or `system`, and its zone requirement must use the `In` operator.
 
 9. **Tag the target subnets**: the network disruption resolves its target by tag, so the subnet(s) in the AZ you want to impair must carry `FIS-Ready=True`:
+
    ```bash
    aws ec2 create-tags \
      --resources <YOUR SUBNET ID IN TARGET AZ> \
@@ -133,6 +141,7 @@ The automation checks the path itself before it changes anything: the `ValidateE
 - The network disruption is not the cause of an API timeout, provided `SubnetId` is in a surviving AZ.
 
 **Check the cluster's endpoint access mode:**
+
 ```bash
 aws eks describe-cluster --name <YOUR EKS CLUSTER> \
   --query 'cluster.resourcesVpcConfig.{public:endpointPublicAccess,private:endpointPrivateAccess,cidrs:publicAccessCidrs}'
@@ -181,7 +190,7 @@ kubectl describe node <node> | grep -A5 'Allocated resources'
 
 If existing nodes have headroom, failover is as fast as pod startup — no EC2 launch required. If they do not, Auto Mode provisions new nodes and failover additionally waits on instance launch and node registration (typically 60–90s). Make sure nothing prevents that scale-up: a `spec.limits` on the NodePool, an insufficient `maxSkew`, or restrictive instance-type requirements can all cap it.
 
-### Which behaviour to expect
+### Which behavior to expect
 
 | Workload configuration | AZs | During impairment | What it demonstrates |
 |---|---|---|---|
@@ -197,7 +206,7 @@ Both settings are legitimate tests, but they answer different questions. `DoNotS
 
 ### 3. Number of Availability Zones
 
-The number of AZs in your cluster changes both the blast radius and the redistribution behaviour during impairment.
+The number of AZs in your cluster changes both the blast radius and the redistribution behavior during impairment.
 
 | Cluster AZs | Pods lost | Surviving pods | Where replacements land | Effective capacity during impairment |
 |---|---|---|---|---|
@@ -230,12 +239,13 @@ This makes the 3-AZ topology fundamentally different: `DoNotSchedule` no longer 
 Regardless of `whenUnsatisfiable` or AZ count, replicas do **not** automatically migrate back once the impaired AZ is restored. Topology spread constraints are evaluated only at scheduling time — they never evict a running pod to satisfy a spread. Additionally, with `consolidationPolicy: WhenEmpty`, no new node is reprovisioned in the restored AZ because no scheduling demand exists there.
 
 The post-restore state is:
+
 - NodePool zone requirement includes all original AZs again ✓
 - No cordoned nodes remain ✓
 - No leftover NACLs (FIS restores these automatically) ✓
 - **Pods stay where they landed during impairment** — the cluster has capacity in the restored AZ but nothing triggers rebalancing
 
-This is realistic production behaviour: after an AZ recovers, workloads drift from their intended spread until an explicit action redistributes them. See [Recovery Behavior](#recovery-behavior) for how to rebalance.
+This is realistic production behavior: after an AZ recovers, workloads drift from their intended spread until an explicit action redistributes them. See [Recovery Behavior](#recovery-behavior) for how to rebalance.
 
 ## How It Works
 
@@ -243,7 +253,7 @@ The experiment starts the SSM automation, the capacity faults and a wait togethe
 
 ### Experiment Flow
 
-```
+```text
 t=0       FIS starts together:
             - cordon-and-exclude-az  (SSM automation)
             - insufficient-capacity-in-az, insufficient-capacity-in-az-node-groups (20 min)
@@ -318,11 +328,13 @@ The insufficient capacity actions act on the **IAM role (or Auto Scaling group) 
 
 - **EKS Auto Mode**: Auto Mode launches instances with the **EKS cluster role** (the role your cluster was created with). Set the `node-launch-roles` target to that role's ARN and the `AllowInsufficientCapacityForNodeLaunchRoles` statement in the FIS role policy to the same ARN. CloudTrail shows these calls as `CreateFleet` made by that role and invoked by `eks.amazonaws.com`.
 - **Managed node groups**: their Auto Scaling groups launch the instances. The `managed-node-group-asgs` target selects them by the tag `k8s.io/cluster-autoscaler/<YOUR EKS CLUSTER>` set to `owned`. Check that your node group's Auto Scaling group has the tag:
+
   ```bash
   aws autoscaling describe-tags \
     --filters Name=key,Values=k8s.io/cluster-autoscaler/<YOUR EKS CLUSTER> \
     --query 'Tags[].ResourceId'
   ```
+
   The template sets `emptyTargetResolutionMode: skip`, so a cluster with no managed node groups runs without error and the node group action does nothing.
 - **Self-managed Karpenter, or any other component that launches EC2 instances**: these use other IAM roles. Add each role's ARN to the `resourceArns` of the `node-launch-roles` target, and add the same ARN to the `ec2:FisTargetArns` condition of the `AllowInsufficientCapacityForNodeLaunchRoles` statement.
 
@@ -349,6 +361,7 @@ Beyond blocking launches, the zonal shift changes what the experiment measures:
 FIS cannot combine a fixed resource ARN with the parameters of the zonal shift target, so the cluster is selected by its `FIS-Ready=True` tag. Pod termination is handled by the SSM automation, not by a FIS `aws:eks:pod` target (see [Why This Experiment Uses No `aws:eks:pod` Actions](#why-this-experiment-uses-no-awsekspod-actions)).
 
 ### Target Requirements
+
 - The subnets must carry `FIS-Ready=True` and be in the AZ named by the target's `availabilityZoneIdentifier` and the automation's `TargetAZ`, so the network disruption and the Kubernetes-level impairment affect the same AZ
 - The cluster must carry `FIS-Ready=True` and have zonal shift enabled (prerequisite 5)
 - Nodes must carry the standard `topology.kubernetes.io/zone` label (EKS applies it automatically)
