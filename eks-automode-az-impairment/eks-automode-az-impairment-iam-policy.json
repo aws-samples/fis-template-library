@@ -39,7 +39,7 @@
             "aws:ec2:api-insufficient-instance-capacity-error"
           ]
         },
-        "StringLike": {
+        "ForAllValues:StringLike": {
           "ec2:FisTargetArns": [
             "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR EKS CLUSTER ROLE NAME>"
           ]
@@ -57,7 +57,7 @@
             "aws:ec2:asg-insufficient-instance-capacity-error"
           ]
         },
-        "StringLike": {
+        "ForAllValues:StringLike": {
           "ec2:FisTargetArns": [
             "arn:aws:autoscaling:<YOUR REGION>:<YOUR AWS ACCOUNT>:autoScalingGroup:*:autoScalingGroupName/*"
           ]

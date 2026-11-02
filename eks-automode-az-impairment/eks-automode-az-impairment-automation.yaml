@@ -698,8 +698,11 @@ mainSteps:
                     errors.append(f"Node {node['name']}: {exc}")
 
             if errors:
+                # SSM truncates the step failure message, so print the notice first and
+                # the long state record after it.
+                print('MANUAL RECOVERY REQUIRED: ' + json.dumps(errors))
                 print('ORIGINAL STATE ' + json.dumps(state))
-                raise SystemExit('MANUAL RECOVERY REQUIRED: ' + json.dumps(errors))
+                raise SystemExit('MANUAL RECOVERY REQUIRED. The recorded original state is in the step output.')
             state['phase'] = 'RESTORED'
             save_state(state)
             print(json.dumps({'Status': 'RESTORED', 'NodePool': state['nodePool'], 'Uncordoned': uncordoned}))

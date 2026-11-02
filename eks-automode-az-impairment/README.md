@@ -334,7 +334,7 @@ Beyond blocking launches, the zonal shift changes what the experiment measures:
 
 - Auto Mode cordons every node in the shifted AZ and excludes the AZ from launches for every NodePool.
 - The ARC zonal shift also moves in-cluster service traffic away from pods in the AZ, so the experiment covers the AZ failure plus the documented recovery action, not only the cluster's unaided response. To measure how long the cluster runs before that recovery action starts, set `wait-for-recovery-action` to the detection time you want to test.
-- **When the shift ends, Auto Mode uncordons every node in the AZ, including a node an operator had cordoned before the run.** The automation restores only what it cordoned itself, but the shift ending can undo a cordon it left in place. Do not rely on a manually cordoned node staying cordoned across the end of the shift.
+- **When the shift ends, Auto Mode uncordons every node in the AZ, including a node an operator had cordoned before the run.** During the shift Auto Mode adds an `eks-arc-zonal-shift/impaired-zone` taint and marks the nodes unschedulable; when the shift ends it removes both, and the operator's own cordon goes with them. The automation restores only what it cordoned itself and skips a node that was already cordoned, but the end of the shift still clears that cordon. Note which nodes are cordoned before the run and cordon them again afterwards, or drain them out of the AZ before the run.
 - ARC zonal shift has [no additional charge](https://aws.amazon.com/application-recovery-controller/pricing/).
 
 ## Targets
@@ -444,7 +444,7 @@ After the experiment completes:
 2. **Zonal shift**: FIS cancels the shift when the action ends or the experiment is stopped. Auto Mode then uncordons the nodes in the AZ.
 3. **Capacity faults**: they end with their duration. Auto Mode launches the nodes that pods were waiting for within about 30 seconds.
 4. **NodePool**: `RestoreNodePool` restores the zone requirement and the weight to their recorded original values (or removes the weight if the NodePool had none).
-5. **Nodes**: `RestoreNodePool` uncordons only the nodes this run cordoned. A node that was already cordoned when the run started is left cordoned, but see the note about the end of the zonal shift in [What the zonal shift changes](#what-the-zonal-shift-changes). A node that was replaced or no longer exists is not touched.
+5. **Nodes**: `RestoreNodePool` uncordons only the nodes this run cordoned. It does not touch a node that was already cordoned when the run started, or a node that was replaced or no longer exists. The end of the zonal shift does uncordon a node an operator cordoned before the run; see [What the zonal shift changes](#what-the-zonal-shift-changes).
 6. **Temporary resources**: the cluster security group rule, the client instance and its security group are removed, and the step fails if any remains.
 7. **Pods**: behavior depends on your workload configuration, described in [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome):
    - With `ScheduleAnyway`, pods that failed over stay in the surviving AZs. The spread is a preference, so a running pod is never moved to satisfy it.
