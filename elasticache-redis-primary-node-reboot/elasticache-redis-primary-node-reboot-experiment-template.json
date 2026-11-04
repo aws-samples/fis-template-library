@@ -1,14 +1,14 @@
 {
-  "description": "Simulate ElastiCache Redis primary node reboot to test application resilience",
+  "description": "Reboot the primary node of each ElastiCache (Redis OSS) replication group tagged FIS-Ready=True, which clears its data, to test application resilience",
   "targets": {},
   "actions": {
     "triggerPrimaryNodeReboot": {
       "actionId": "aws:ssm:start-automation-execution",
-      "description": "Reboot Redis primary node and monitor recovery",
+      "description": "Reboot the primary node of each tagged replication group and wait until the group is available again",
       "parameters": {
         "maxDuration": "PT30M",
-        "documentArn": "arn:aws:ssm:us-east-1:<YOUR-ACCOUNT-ID>:document/ElastiCache-Redis-Primary-Node-Reboot",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"region\": \"us-east-1\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR-ACCOUNT-ID>:role/ElastiCache-SSM-Automation-Role\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ElastiCache-Redis-Primary-Node-Reboot",
+        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\"}"
       },
       "targets": {}
     }
@@ -18,13 +18,13 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR-ACCOUNT-ID>:role/ElastiCache-FIS-Role",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
   "tags": {
     "Name": "ElastiCacheRedisPrimaryNodeRebootTest",
     "Purpose": "resilience-testing"
   },
   "experimentOptions": {
     "accountTargeting": "single-account",
-    "emptyTargetResolutionMode": "skip"
+    "emptyTargetResolutionMode": "fail"
   }
 }

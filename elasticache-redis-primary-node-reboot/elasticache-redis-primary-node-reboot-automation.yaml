@@ -1,175 +1,604 @@
-description: "Simulate ElastiCache Redis primary node reboot to test application resilience"
+description: "Reboot the primary node of each ElastiCache (Redis OSS, cluster mode disabled) replication group that carries the given tag, and wait until the node has restarted, is still the primary, and every node in the group is available again. Rebooting a primary clears the data on the primary and its replicas."
 schemaVersion: "0.3"
 assumeRole: "{{ AutomationAssumeRole }}"
 parameters:
   tagKey:
     type: String
-    description: "Tag key to identify ElastiCache clusters to target"
+    description: "Tag key that selects the ElastiCache replication groups to target. The SSM role's policy allows the reboot only on clusters tagged FIS-Ready=True; change it too if you change this."
     default: "FIS-Ready"
+    allowedPattern: "^[A-Za-z0-9 _.:/=+@-]{1,128}$"
   tagValue:
     type: String
-    description: "Tag value to identify ElastiCache clusters to target"
+    description: "Tag value that selects the ElastiCache replication groups to target"
     default: "True"
-  region:
-    type: String
-    description: "AWS Region of the ElastiCache clusters"
-    default: "{{global:REGION}}"
+    allowedPattern: "^[A-Za-z0-9 _.:/=+@-]{1,256}$"
   AutomationAssumeRole:
     type: String
-    description: "IAM role for the automation execution"
-    default: ""
+    description: "ARN of the IAM role the automation runs as (the SSM Automation role)"
+    allowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$"
 
 mainSteps:
-  - name: triggerNodeFailover
+  - name: rebootPrimaryNode
     action: aws:executeScript
+    timeoutSeconds: 300
+    isCritical: true
+    onFailure: step:reportAfterFailure
+    onCancel: step:reportAfterStop
     inputs:
       Runtime: python3.11
-      Handler: trigger_failover
+      Handler: reboot_primary
       Script: |
-        import boto3
+        import json
+        import time
+        from datetime import datetime, timezone
 
-        def trigger_failover(events, context):
-            region = events["region"]
-            tag_key = events["tagKey"]
-            tag_value = events["tagValue"]
-            
-            elasticache = boto3.client("elasticache", region_name=region)
-            results = []
-            
-            # Get replication groups
-            response = elasticache.describe_replication_groups()
-            
-            for rg in response["ReplicationGroups"]:
-                if rg["Status"] == "available" and rg.get("AutomaticFailover") == "enabled":
-                    rg_id = rg["ReplicationGroupId"]
-                    
-                    try:
-                        # Check tags
-                        account_id = boto3.client("sts").get_caller_identity()["Account"]
-                        arn = "arn:aws:elasticache:{}:{}:replicationgroup:{}".format(region, account_id, rg_id)
-                        tags_response = elasticache.list_tags_for_resource(ResourceName=arn)
-                        tags = {tag["Key"]: tag["Value"] for tag in tags_response.get("TagList", [])}
-                        
-                        if tags.get(tag_key) == tag_value:
-                            # Find primary cluster
-                            primary_cluster_id = None
-                            for node_group in rg["NodeGroups"]:
-                                for member in node_group["NodeGroupMembers"]:
-                                    if member["CurrentRole"] == "primary":
-                                        primary_cluster_id = member["CacheClusterId"]
-                                        break
-                                if primary_cluster_id:
-                                    break
-                            
-                            if primary_cluster_id:
-                                # Reboot primary node
-                                elasticache.reboot_cache_cluster(
-                                    CacheClusterId=primary_cluster_id,
-                                    CacheNodeIdsToReboot=["0001"]
-                                )
-                                results.append("SUCCESS: Triggered failover for {} (primary: {})".format(rg_id, primary_cluster_id))
-                            else:
-                                results.append("ERROR: No primary found for {}".format(rg_id))
-                                
-                    except Exception as e:
-                        results.append("ERROR: Failed to process {}: {}".format(rg_id, str(e)))
-            
-            return results
+        import boto3
+        from botocore.config import Config
+
+        # aws:executeScript doesn't retry throttled calls itself, so the client does. The timeouts stop one
+        # call from hanging until the step times out.
+        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
+        # Few attempts for the status read before each reboot call (at most about 48 s: 3 attempts of up to 15 s,
+        # plus up to 3 s of backoff) and for the reboot call itself (at most about 78 s: 3 attempts of up to 25 s).
+        SSM_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=5, read_timeout=10)
+        REBOOT_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=5, read_timeout=20)
+        STEP_NAME = "rebootPrimaryNode"
+        # A reboot call starts only if this many seconds or fewer have passed since the script started, checked
+        # after the status read, so the call (at most about 78 s) ends before the step's 300-s timeout.
+        REBOOT_CUTOFF_SECONDS = 200
+        # Step 1 hands its targets to the waits through its output, which holds at most 100 KB.
+        MAX_GROUPS = 20
+
+
+        def tagged_groups(ec, key, value):
+            # Every page, and every tag read: any error fails the step, so no tagged group is missed.
+            groups = []
+            for page in ec.get_paginator("describe_replication_groups").paginate():
+                for rg in page["ReplicationGroups"]:
+                    tags = ec.list_tags_for_resource(ResourceName=rg["ARN"]).get("TagList", [])
+                    if any(t["Key"] == key and t["Value"] == value for t in tags):
+                        groups.append(rg["ReplicationGroupId"])
+            return groups
+
+
+        def check_group(ec, rg_id):
+            # Read the group and its primary now, not from the discovery listing.
+            g = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+            reasons = []
+            if g["Status"] != "available":
+                reasons.append("group status " + g["Status"])
+            node_groups = g.get("NodeGroups", [])
+            if g.get("ClusterEnabled") or len(node_groups) != 1:
+                reasons.append("cluster mode enabled")
+            if g.get("AutomaticFailover") != "enabled":
+                reasons.append("AutomaticFailover {}".format(g.get("AutomaticFailover")))
+            if g.get("MultiAZ") != "enabled":
+                reasons.append("MultiAZ {}".format(g.get("MultiAZ")))
+            global_info = g.get("GlobalReplicationGroupInfo") or {}
+            if global_info.get("GlobalReplicationGroupId"):
+                reasons.append("member of Global Datastore " + global_info["GlobalReplicationGroupId"])
+            members = node_groups[0].get("NodeGroupMembers", []) if node_groups else []
+            primaries = [m for m in members if m.get("CurrentRole") == "primary"]
+            if len(primaries) != 1:
+                reasons.append("{} primary nodes".format(len(primaries)))
+            if len(members) < 2:
+                reasons.append("{} nodes, needs a primary and at least one replica".format(len(members)))
+            if reasons:
+                return None, reasons
+            cluster_id, node_id = primaries[0]["CacheClusterId"], primaries[0]["CacheNodeId"]
+            c = ec.describe_cache_clusters(CacheClusterId=cluster_id, ShowCacheNodeInfo=True)["CacheClusters"][0]
+            if c.get("Engine") != "redis":
+                reasons.append("engine {}".format(c.get("Engine")))
+            if c["CacheClusterStatus"] != "available":
+                reasons.append("primary cluster {} status {}".format(cluster_id, c["CacheClusterStatus"]))
+            statuses = [n["CacheNodeStatus"] for n in c.get("CacheNodes", []) if n["CacheNodeId"] == node_id]
+            if statuses != ["available"]:
+                reasons.append("primary node {} status {}".format(node_id, statuses))
+            if reasons:
+                return None, reasons
+            return (rg_id, cluster_id, node_id), []
+
+
+        def why_not_reboot(ssm, execution_id, started):
+            # SSM may leave this script running after it cancels or times out the step, so before each call
+            # check that the step is still within its own time, and that the run and this step are both
+            # still InProgress. Any other status stops the reboots.
+            if time.time() - started > REBOOT_CUTOFF_SECONDS:
+                return "the step has run for more than {} s".format(REBOOT_CUTOFF_SECONDS)
+            ex = ssm.get_automation_execution(AutomationExecutionId=execution_id)["AutomationExecution"]
+            if ex["AutomationExecutionStatus"] != "InProgress":
+                return "the run's status is " + ex["AutomationExecutionStatus"]
+            mine = [st.get("StepStatus") for st in ex.get("StepExecutions", []) if st.get("StepName") == STEP_NAME]
+            if mine != ["InProgress"]:
+                return "this step's status is {}".format(mine)
+            # Check the time again: the status read above can retry, and the reboot call starts right after this.
+            if time.time() - started > REBOOT_CUTOFF_SECONDS:
+                return "the step has run for more than {} s".format(REBOOT_CUTOFF_SECONDS)
+            return None
+
+
+        def reboot_primary(events, context):
+            started = time.time()
+            ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            ec_reboot = boto3.client("elasticache", region_name=events["region"], config=REBOOT_CONFIG)
+            ssm = boto3.client("ssm", region_name=events["region"], config=SSM_CONFIG)
+            groups = tagged_groups(ec, events["tagKey"], events["tagValue"])
+            if not groups:
+                raise Exception("No replication group found with tag {}={}".format(events["tagKey"], events["tagValue"]))
+            if len(groups) > MAX_GROUPS:
+                raise Exception("Nothing was rebooted. {} replication groups have tag {}={}; this experiment supports at "
+                                "most {}: {}".format(len(groups), events["tagKey"], events["tagValue"], MAX_GROUPS,
+                                                     ", ".join(groups)))
+            targets, not_ready = [], []
+            for rg_id in groups:
+                target, reasons = check_group(ec, rg_id)
+                if reasons:
+                    not_ready.append("{} ({})".format(rg_id, ", ".join(reasons)))
+                else:
+                    targets.append(target)
+            if not_ready:
+                raise Exception("Nothing was rebooted. Tagged replication groups not ready for a primary reboot (needs "
+                                "status available, Redis OSS, cluster mode disabled, AutomaticFailover and MultiAZ "
+                                "enabled, one primary and at least one replica, not in a Global Datastore, and the "
+                                "primary cluster and node available): " + "; ".join(not_ready))
+            rebooted, failed = [], []
+            for i, (rg_id, cluster_id, node_id) in enumerate(targets):
+                try:
+                    reason = why_not_reboot(ssm, events["executionId"], started)
+                except Exception as e:
+                    # The status is unknown, so make no more calls, and say which groups were already rebooted.
+                    reason = "the run's status could not be read ({})".format(e)
+                if reason:
+                    raise Exception("No more reboots: {}. Not rebooted: {}. Reboot already requested: {}. Failed: {}".format(
+                        reason, [g for g, _, _ in targets[i:]], [r["group"] for r in rebooted], failed))
+                # Events from before this moment can't count as this run's restart.
+                since = datetime.now(timezone.utc).isoformat()
+                try:
+                    ec_reboot.reboot_cache_cluster(CacheClusterId=cluster_id, CacheNodeIdsToReboot=[node_id])
+                except Exception as e:
+                    note = ""
+                    if "InvalidCacheClusterState" in str(e):
+                        # The client may have retried after a timeout, so an earlier attempt may have been accepted.
+                        note = " (an earlier attempt of this call may have been accepted; the report step shows the node's state)"
+                    failed.append("{} (primary {} node {}): {}{}".format(rg_id, cluster_id, node_id, e, note))
+                    print("RebootCacheCluster failed for primary {} node {} of {}: {}".format(cluster_id, node_id, rg_id, e))
+                    continue
+                rebooted.append({"group": rg_id, "cluster": cluster_id, "node": node_id, "since": since})
+                print("RebootCacheCluster called for primary {} node {} of {}".format(cluster_id, node_id, rg_id))
+            if not rebooted:
+                raise Exception("No reboot was accepted: " + "; ".join(failed))
+            return {"RebootedNodes": json.dumps(rebooted), "RebootErrors": json.dumps(failed)}
       InputPayload:
-        region: "{{ region }}"
+        region: "{{ global:REGION }}"
+        executionId: "{{ automation:EXECUTION_ID }}"
         tagKey: "{{ tagKey }}"
         tagValue: "{{ tagValue }}"
     outputs:
-      - Name: results
-        Selector: $.Payload
-        Type: StringList
-    description: "Trigger node failover by rebooting primary nodes"
+      - Name: RebootedNodes
+        Selector: $.Payload.RebootedNodes
+        Type: String
+      - Name: RebootErrors
+        Selector: $.Payload.RebootErrors
+        Type: String
+    description: "Check every tagged replication group, then reboot the primary node of each one"
 
-  - name: monitorPrimaryNodeRecovery
+  - name: waitForReboot
     action: aws:executeScript
+    timeoutSeconds: 570
+    isCritical: true
+    onFailure: step:reportAfterFailure
+    onCancel: step:reportAfterStop
     inputs:
       Runtime: python3.11
-      Handler: monitor_node
+      Handler: wait_for_reboot
+      # The script below is the same in waitForReboot and waitForRebootContinued. Change both together.
       Script: |
+        import json
+        import time
+        from datetime import datetime
+
         import boto3
+        from botocore.config import Config
+
+        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
+        GONE_CLUSTER = ("deleting", "deleted", "incompatible-network", "restore-failed")
+        GONE_GROUP = ("deleting", "create-failed")
+
+
+        def restart_event_seen(ec, cluster_id, node_id, since):
+            text = "Cache node {} restarted".format(node_id)
+            pages = ec.get_paginator("describe_events").paginate(
+                SourceIdentifier=cluster_id, SourceType="cache-cluster", StartTime=since)
+            return any(text in e["Message"] and e["Date"] >= since for page in pages for e in page["Events"])
+
+
+        def reboot_state(ec, t, progress):
+            cluster_id, node_id = t["cluster"], t["node"]
+            since = datetime.fromisoformat(t["since"])
+            c = ec.describe_cache_clusters(CacheClusterId=cluster_id, ShowCacheNodeInfo=True)["CacheClusters"][0]
+            if c["CacheClusterStatus"] in GONE_CLUSTER:
+                raise Exception("Cluster {} is {}; the reboot can't finish".format(cluster_id, c["CacheClusterStatus"]))
+            nodes = [n["CacheNodeStatus"] for n in c.get("CacheNodes", []) if n["CacheNodeId"] == node_id]
+            # Two signals that the node restarted: its own status passing through rebooting, or the event.
+            if nodes == ["rebooting"]:
+                progress[cluster_id] = "rebooting seen"
+            restarted = progress.get(cluster_id) == "rebooting seen" or restart_event_seen(ec, cluster_id, node_id, since)
+            if not restarted:
+                return "node not restarted yet (cluster status {}, node status {})".format(c["CacheClusterStatus"], nodes)
+            if c["CacheClusterStatus"] != "available" or nodes != ["available"]:
+                return "node restarted, cluster status {}, node status {}".format(c["CacheClusterStatus"], nodes)
+            g = ec.describe_replication_groups(ReplicationGroupId=t["group"])["ReplicationGroups"][0]
+            if g["Status"] in GONE_GROUP:
+                raise Exception("Replication group {} is {}".format(t["group"], g["Status"]))
+            if g["Status"] != "available":
+                return "node available, group status " + g["Status"]
+            for cid in g.get("MemberClusters", []):
+                m = ec.describe_cache_clusters(CacheClusterId=cid, ShowCacheNodeInfo=True)["CacheClusters"][0]
+                bad = [n["CacheNodeStatus"] for n in m.get("CacheNodes", []) if n["CacheNodeStatus"] != "available"]
+                if m["CacheClusterStatus"] != "available" or bad:
+                    return "member cluster {} status {}, node status {}".format(cid, m["CacheClusterStatus"], bad)
+            primaries = [x["CacheClusterId"] for ng in g.get("NodeGroups", []) for x in ng.get("NodeGroupMembers", [])
+                         if x.get("CurrentRole") == "primary"]
+            if primaries != [cluster_id]:
+                raise Exception("{} is back, but the group's primary is now {}, not the rebooted {}. A reboot doesn't "
+                                "fail over, so something else changed the primary during the run".format(
+                                    t["group"], primaries, cluster_id))
+            return None
+
+
+        def wait_for_reboot(events, context):
+            ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            targets = json.loads(events["rebootedNodes"])
+            errors = json.loads(events["rebootErrors"])
+            progress = json.loads(events["progress"]) if events["progress"].startswith("{") else {}
+            deadline = time.time() + int(events["timeoutSeconds"])
+            while True:
+                waiting = {}
+                for t in targets:
+                    # Check the deadline before each target too, so one slow pass can't run past the step.
+                    if time.time() > deadline:
+                        waiting[t["cluster"]] = "not checked again before this step's deadline"
+                        continue
+                    state = reboot_state(ec, t, progress)
+                    if state:
+                        waiting[t["cluster"]] = state
+                if not waiting:
+                    print("Rebooted nodes restarted, still primary, and every node in their groups available: "
+                          + ", ".join("{}:{}".format(t["cluster"], t["node"]) for t in targets))
+                    if events["failIfNotDone"] == "true" and errors:
+                        raise Exception("The nodes above are back, but these reboots were not accepted: " + "; ".join(errors))
+                    return {"Status": "rebooted", "Progress": json.dumps(progress)}
+                if time.time() > deadline:
+                    if events["failIfNotDone"] == "true":
+                        raise Exception("Reboot did not finish in time: " + str(waiting))
+                    print("Still rebooting, continuing in the next step: " + str(waiting))
+                    return {"Status": "still rebooting", "Progress": json.dumps(progress)}
+                time.sleep(5)
+      InputPayload:
+        region: "{{ global:REGION }}"
+        rebootedNodes: "{{ rebootPrimaryNode.RebootedNodes }}"
+        rebootErrors: "{{ rebootPrimaryNode.RebootErrors }}"
+        progress: "{}"
+        timeoutSeconds: "510"
+        failIfNotDone: "false"
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+      - Name: Progress
+        Selector: $.Payload.Progress
+        Type: String
+    description: "Wait until each rebooted node has restarted, is available and still the primary, and every node in its group is available"
+
+  - name: waitForRebootContinued
+    action: aws:executeScript
+    timeoutSeconds: 570
+    isCritical: true
+    onFailure: step:reportAfterFailure
+    onCancel: step:reportAfterStop
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: wait_for_reboot
+      # The script below is the same in waitForReboot and waitForRebootContinued. Change both together.
+      Script: |
+        import json
+        import time
+        from datetime import datetime
+
+        import boto3
+        from botocore.config import Config
+
+        CONFIG = Config(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=5, read_timeout=20)
+        GONE_CLUSTER = ("deleting", "deleted", "incompatible-network", "restore-failed")
+        GONE_GROUP = ("deleting", "create-failed")
+
+
+        def restart_event_seen(ec, cluster_id, node_id, since):
+            text = "Cache node {} restarted".format(node_id)
+            pages = ec.get_paginator("describe_events").paginate(
+                SourceIdentifier=cluster_id, SourceType="cache-cluster", StartTime=since)
+            return any(text in e["Message"] and e["Date"] >= since for page in pages for e in page["Events"])
+
+
+        def reboot_state(ec, t, progress):
+            cluster_id, node_id = t["cluster"], t["node"]
+            since = datetime.fromisoformat(t["since"])
+            c = ec.describe_cache_clusters(CacheClusterId=cluster_id, ShowCacheNodeInfo=True)["CacheClusters"][0]
+            if c["CacheClusterStatus"] in GONE_CLUSTER:
+                raise Exception("Cluster {} is {}; the reboot can't finish".format(cluster_id, c["CacheClusterStatus"]))
+            nodes = [n["CacheNodeStatus"] for n in c.get("CacheNodes", []) if n["CacheNodeId"] == node_id]
+            # Two signals that the node restarted: its own status passing through rebooting, or the event.
+            if nodes == ["rebooting"]:
+                progress[cluster_id] = "rebooting seen"
+            restarted = progress.get(cluster_id) == "rebooting seen" or restart_event_seen(ec, cluster_id, node_id, since)
+            if not restarted:
+                return "node not restarted yet (cluster status {}, node status {})".format(c["CacheClusterStatus"], nodes)
+            if c["CacheClusterStatus"] != "available" or nodes != ["available"]:
+                return "node restarted, cluster status {}, node status {}".format(c["CacheClusterStatus"], nodes)
+            g = ec.describe_replication_groups(ReplicationGroupId=t["group"])["ReplicationGroups"][0]
+            if g["Status"] in GONE_GROUP:
+                raise Exception("Replication group {} is {}".format(t["group"], g["Status"]))
+            if g["Status"] != "available":
+                return "node available, group status " + g["Status"]
+            for cid in g.get("MemberClusters", []):
+                m = ec.describe_cache_clusters(CacheClusterId=cid, ShowCacheNodeInfo=True)["CacheClusters"][0]
+                bad = [n["CacheNodeStatus"] for n in m.get("CacheNodes", []) if n["CacheNodeStatus"] != "available"]
+                if m["CacheClusterStatus"] != "available" or bad:
+                    return "member cluster {} status {}, node status {}".format(cid, m["CacheClusterStatus"], bad)
+            primaries = [x["CacheClusterId"] for ng in g.get("NodeGroups", []) for x in ng.get("NodeGroupMembers", [])
+                         if x.get("CurrentRole") == "primary"]
+            if primaries != [cluster_id]:
+                raise Exception("{} is back, but the group's primary is now {}, not the rebooted {}. A reboot doesn't "
+                                "fail over, so something else changed the primary during the run".format(
+                                    t["group"], primaries, cluster_id))
+            return None
+
+
+        def wait_for_reboot(events, context):
+            ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            targets = json.loads(events["rebootedNodes"])
+            errors = json.loads(events["rebootErrors"])
+            progress = json.loads(events["progress"]) if events["progress"].startswith("{") else {}
+            deadline = time.time() + int(events["timeoutSeconds"])
+            while True:
+                waiting = {}
+                for t in targets:
+                    # Check the deadline before each target too, so one slow pass can't run past the step.
+                    if time.time() > deadline:
+                        waiting[t["cluster"]] = "not checked again before this step's deadline"
+                        continue
+                    state = reboot_state(ec, t, progress)
+                    if state:
+                        waiting[t["cluster"]] = state
+                if not waiting:
+                    print("Rebooted nodes restarted, still primary, and every node in their groups available: "
+                          + ", ".join("{}:{}".format(t["cluster"], t["node"]) for t in targets))
+                    if events["failIfNotDone"] == "true" and errors:
+                        raise Exception("The nodes above are back, but these reboots were not accepted: " + "; ".join(errors))
+                    return {"Status": "rebooted", "Progress": json.dumps(progress)}
+                if time.time() > deadline:
+                    if events["failIfNotDone"] == "true":
+                        raise Exception("Reboot did not finish in time: " + str(waiting))
+                    print("Still rebooting, continuing in the next step: " + str(waiting))
+                    return {"Status": "still rebooting", "Progress": json.dumps(progress)}
+                time.sleep(5)
+      InputPayload:
+        region: "{{ global:REGION }}"
+        rebootedNodes: "{{ rebootPrimaryNode.RebootedNodes }}"
+        rebootErrors: "{{ rebootPrimaryNode.RebootErrors }}"
+        progress: "{{ waitForReboot.Progress }}"
+        timeoutSeconds: "510"
+        failIfNotDone: "true"
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+    description: "Continue the wait (an aws:executeScript step runs for at most 10 minutes), then fail if any reboot was not accepted"
+
+  - name: reportAfterFailure
+    action: aws:executeScript
+    timeoutSeconds: 60
+    isCritical: true
+    onCancel: step:reportAfterStop
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: report
+      # The script below is the same in reportAfterFailure and reportAfterStop. Change both together.
+      Script: |
         import time
 
-        def monitor_node(events, context):
-            region = events["region"]
-            tag_key = events["tagKey"]
-            tag_value = events["tagValue"]
-            
-            elasticache = boto3.client("elasticache", region_name=region)
-            results = []
-            start_time = time.time()
-            
-            # Find the primary node that was rebooted
-            response = elasticache.describe_replication_groups()
-            primary_cluster_id = None
-            
-            for rg in response["ReplicationGroups"]:
-                if rg["Status"] == "available" and rg.get("AutomaticFailover") == "enabled":
-                    rg_id = rg["ReplicationGroupId"]
-                    
-                    try:
-                        # Check tags
-                        account_id = boto3.client("sts").get_caller_identity()["Account"]
-                        arn = "arn:aws:elasticache:{}:{}:replicationgroup:{}".format(region, account_id, rg_id)
-                        tags_response = elasticache.list_tags_for_resource(ResourceName=arn)
-                        tags = {tag["Key"]: tag["Value"] for tag in tags_response.get("TagList", [])}
-                        
-                        if tags.get(tag_key) == tag_value:
-                            # Find primary cluster
-                            for node_group in rg["NodeGroups"]:
-                                for member in node_group["NodeGroupMembers"]:
-                                    if member["CurrentRole"] == "primary":
-                                        primary_cluster_id = member["CacheClusterId"]
-                                        break
-                                if primary_cluster_id:
-                                    break
-                    except Exception as e:
+        import boto3
+        from botocore.config import Config
+
+        # Few retries and short timeouts: on a stop, this step has to finish inside the two-minute cancel
+        # window, and a call that starts just before the deadline must still end inside the 60-s step.
+        CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=3, read_timeout=5)
+
+
+        def tagged_groups(ec, key, value, deadline):
+            # Returns the tagged groups found and whether every group in the Region was read before the deadline.
+            groups = []
+            for page in ec.get_paginator("describe_replication_groups").paginate():
+                for rg in page["ReplicationGroups"]:
+                    if time.time() > deadline:
+                        return groups, False
+                    tags = ec.list_tags_for_resource(ResourceName=rg["ARN"]).get("TagList", [])
+                    if any(t["Key"] == key and t["Value"] == value for t in tags):
+                        groups.append(rg["ReplicationGroupId"])
+            return groups, True
+
+
+        def problems(ec, rg_id):
+            g = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+            out = []
+            if g["Status"] != "available":
+                out.append("group status " + g["Status"])
+            for ng in g.get("NodeGroups", []):
+                n = sum(1 for m in ng.get("NodeGroupMembers", []) if m.get("CurrentRole") == "primary")
+                if n != 1:
+                    out.append("node group {} has {} primaries".format(ng["NodeGroupId"], n))
+            for cid in g.get("MemberClusters", []):
+                c = ec.describe_cache_clusters(CacheClusterId=cid, ShowCacheNodeInfo=True)["CacheClusters"][0]
+                if c["CacheClusterStatus"] != "available":
+                    out.append("cluster {} status {}".format(cid, c["CacheClusterStatus"]))
+                for node in c.get("CacheNodes", []):
+                    if node["CacheNodeStatus"] != "available":
+                        out.append("cluster {} node {} status {}".format(cid, node["CacheNodeId"], node["CacheNodeStatus"]))
+            return out
+
+
+        def report(events, context):
+            ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            # One deadline for finding the groups and checking them.
+            deadline = time.time() + int(events["timeoutSeconds"])
+            groups, listed_all = tagged_groups(ec, events["tagKey"], events["tagValue"], deadline)
+            scope = "" if listed_all else (" Only part of the Region's replication groups could be read before the "
+                                           "deadline, so other tagged groups may not be included.")
+            healthy_since = None
+            while True:
+                bad, unchecked = {}, []
+                for rg_id in groups:
+                    if time.time() > deadline:
+                        unchecked.append(rg_id)
                         continue
-            
-            if not primary_cluster_id:
-                return ["ERROR: Could not find primary node to monitor"]
-            
-            # Monitor the primary node status
-            max_wait_time = 600  # 10 minutes
-            check_interval = 10  # Check every 10 seconds
-            
-            for attempt in range(max_wait_time // check_interval):
-                try:
-                    cluster_response = elasticache.describe_cache_clusters(
-                        CacheClusterId=primary_cluster_id,
-                        ShowCacheNodeInfo=True
-                    )
-                    
-                    cluster = cluster_response["CacheClusters"][0]
-                    cluster_status = cluster["CacheClusterStatus"]
-                    
-                    if cluster_status == "available":
-                        recovery_time = time.time() - start_time
-                        results.append("SUCCESS: Primary node {} recovered to Available in {:.1f} seconds".format(primary_cluster_id, recovery_time))
-                        break
-                    else:
-                        elapsed = time.time() - start_time
-                        results.append("MONITORING: Primary node {} status: {} after {:.1f}s".format(primary_cluster_id, cluster_status, elapsed))
-                        time.sleep(check_interval)
-                        
-                except Exception as e:
-                    results.append("ERROR: Failed to check primary node {}: {}".format(primary_cluster_id, str(e)))
+                    issues = problems(ec, rg_id)
+                    if issues:
+                        bad[rg_id] = issues
+                if bad or unchecked:
+                    healthy_since = None
+                elif healthy_since is None:
+                    healthy_since = time.time()
+                if not groups:
+                    message = "No replication group found with tag {}={}.{}".format(
+                        events["tagKey"], events["tagValue"], scope)
                     break
-            else:
-                results.append("TIMEOUT: Primary node {} did not recover within {} seconds".format(primary_cluster_id, max_wait_time))
-            
-            return results
+                if (healthy_since is not None and time.time() - healthy_since >= 20) or (
+                        not bad and not unchecked and time.time() > deadline):
+                    message = "Every tagged replication group found is healthy: {}.{}".format(", ".join(groups), scope)
+                    break
+                if time.time() > deadline:
+                    message = ("Not healthy yet: {}. Not checked before the deadline: {}. A reboot that ElastiCache "
+                               "has accepted can't be cancelled: the node restarts on its own, and its data is "
+                               "cleared.{}".format(bad, unchecked, scope))
+                    break
+                time.sleep(5)
+            print(message)
+            if events["failRun"] == "true":
+                raise Exception("A step failed (see its error). " + message)
+            return {"Status": message}
       InputPayload:
-        region: "{{ region }}"
+        region: "{{ global:REGION }}"
         tagKey: "{{ tagKey }}"
         tagValue: "{{ tagValue }}"
+        timeoutSeconds: "25"
+        failRun: "true"
     outputs:
-      - Name: results
-        Selector: $.Payload
-        Type: StringList
-    description: "Monitor primary node recovery until Available status"
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+    description: "Runs only if a step fails: report whether every tagged group is healthy, then fail the run"
+
+  - name: reportAfterStop
+    action: aws:executeScript
+    timeoutSeconds: 60
+    isCritical: true
     isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: report
+      # The script below is the same in reportAfterFailure and reportAfterStop. Change both together.
+      Script: |
+        import time
+
+        import boto3
+        from botocore.config import Config
+
+        # Few retries and short timeouts: on a stop, this step has to finish inside the two-minute cancel
+        # window, and a call that starts just before the deadline must still end inside the 60-s step.
+        CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"}, connect_timeout=3, read_timeout=5)
+
+
+        def tagged_groups(ec, key, value, deadline):
+            # Returns the tagged groups found and whether every group in the Region was read before the deadline.
+            groups = []
+            for page in ec.get_paginator("describe_replication_groups").paginate():
+                for rg in page["ReplicationGroups"]:
+                    if time.time() > deadline:
+                        return groups, False
+                    tags = ec.list_tags_for_resource(ResourceName=rg["ARN"]).get("TagList", [])
+                    if any(t["Key"] == key and t["Value"] == value for t in tags):
+                        groups.append(rg["ReplicationGroupId"])
+            return groups, True
+
+
+        def problems(ec, rg_id):
+            g = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+            out = []
+            if g["Status"] != "available":
+                out.append("group status " + g["Status"])
+            for ng in g.get("NodeGroups", []):
+                n = sum(1 for m in ng.get("NodeGroupMembers", []) if m.get("CurrentRole") == "primary")
+                if n != 1:
+                    out.append("node group {} has {} primaries".format(ng["NodeGroupId"], n))
+            for cid in g.get("MemberClusters", []):
+                c = ec.describe_cache_clusters(CacheClusterId=cid, ShowCacheNodeInfo=True)["CacheClusters"][0]
+                if c["CacheClusterStatus"] != "available":
+                    out.append("cluster {} status {}".format(cid, c["CacheClusterStatus"]))
+                for node in c.get("CacheNodes", []):
+                    if node["CacheNodeStatus"] != "available":
+                        out.append("cluster {} node {} status {}".format(cid, node["CacheNodeId"], node["CacheNodeStatus"]))
+            return out
+
+
+        def report(events, context):
+            ec = boto3.client("elasticache", region_name=events["region"], config=CONFIG)
+            # One deadline for finding the groups and checking them.
+            deadline = time.time() + int(events["timeoutSeconds"])
+            groups, listed_all = tagged_groups(ec, events["tagKey"], events["tagValue"], deadline)
+            scope = "" if listed_all else (" Only part of the Region's replication groups could be read before the "
+                                           "deadline, so other tagged groups may not be included.")
+            healthy_since = None
+            while True:
+                bad, unchecked = {}, []
+                for rg_id in groups:
+                    if time.time() > deadline:
+                        unchecked.append(rg_id)
+                        continue
+                    issues = problems(ec, rg_id)
+                    if issues:
+                        bad[rg_id] = issues
+                if bad or unchecked:
+                    healthy_since = None
+                elif healthy_since is None:
+                    healthy_since = time.time()
+                if not groups:
+                    message = "No replication group found with tag {}={}.{}".format(
+                        events["tagKey"], events["tagValue"], scope)
+                    break
+                if (healthy_since is not None and time.time() - healthy_since >= 20) or (
+                        not bad and not unchecked and time.time() > deadline):
+                    message = "Every tagged replication group found is healthy: {}.{}".format(", ".join(groups), scope)
+                    break
+                if time.time() > deadline:
+                    message = ("Not healthy yet: {}. Not checked before the deadline: {}. A reboot that ElastiCache "
+                               "has accepted can't be cancelled: the node restarts on its own, and its data is "
+                               "cleared.{}".format(bad, unchecked, scope))
+                    break
+                time.sleep(5)
+            print(message)
+            if events["failRun"] == "true":
+                raise Exception("A step failed (see its error). " + message)
+            return {"Status": message}
+      InputPayload:
+        region: "{{ global:REGION }}"
+        tagKey: "{{ tagKey }}"
+        tagValue: "{{ tagValue }}"
+        timeoutSeconds: "25"
+        failRun: "false"
+    outputs:
+      - Name: Status
+        Selector: $.Payload.Status
+        Type: String
+    description: "Runs only if the experiment is stopped: report whether every tagged group is healthy"
