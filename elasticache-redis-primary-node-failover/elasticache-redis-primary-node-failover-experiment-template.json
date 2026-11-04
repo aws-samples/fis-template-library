@@ -7,8 +7,8 @@
       "description": "Force Redis primary node failover and monitor completion",
       "parameters": {
         "maxDuration": "PT30M",
-        "documentArn": "arn:aws:ssm:{{ aws:region }}:<YOUR-ACCOUNT-ID>:document/ElastiCache-Redis-Primary-Node-Failover",
-        "documentParameters": "{\"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\", \"region\": \"{{ aws:region }}\", \"AutomationAssumeRole\": \"arn:aws:iam::<YOUR-ACCOUNT-ID>:role/ElastiCache-Failover-SSM-Role\"}"
+        "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ElastiCache-Redis-Primary-Node-Failover",
+        "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\", \"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\"}"
       },
       "targets": {}
     }
@@ -18,7 +18,7 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR-ACCOUNT-ID>:role/ElastiCache-Failover-FIS-Role",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
   "tags": {
     "Name": "ElastiCacheRedisPrimaryNodeFailoverTest",
     "Purpose": "resilience-testing"

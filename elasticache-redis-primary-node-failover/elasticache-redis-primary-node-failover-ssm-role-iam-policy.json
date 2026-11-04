@@ -2,20 +2,28 @@
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowElastiCacheDiscoveryAndMonitoring",
       "Effect": "Allow",
       "Action": [
         "elasticache:DescribeReplicationGroups",
-        "elasticache:ListTagsForResource",
-        "elasticache:ModifyReplicationGroup"
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeEvents",
+        "elasticache:ListTagsForResource"
       ],
       "Resource": "*"
     },
     {
+      "Sid": "AllowTestFailoverOnTaggedReplicationGroups",
       "Effect": "Allow",
       "Action": [
-        "sts:GetCallerIdentity"
+        "elasticache:TestFailover"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:elasticache:<YOUR REGION>:<YOUR AWS ACCOUNT>:replicationgroup:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
     }
   ]
 }

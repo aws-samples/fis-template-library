@@ -1,16 +1,20 @@
 {
   "schemaVersion": "0.3",
-  "description": "Test ElastiCache Redis failover using tag-based discovery",
-  "assumeRole": "arn:aws:iam::{{ global:ACCOUNT_ID }}:role/ElastiCache-SSM-Automation-Role",
+  "description": "Fail over the primary node of each ElastiCache (Redis OSS) replication group that carries the given tag, using the TestFailover API, and wait until the failover completes and the former primary has recovered as a replica.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
   "parameters": {
+    "AutomationAssumeRole": {
+      "type": "String",
+      "description": "ARN of the IAM role that Systems Manager Automation assumes to run this document"
+    },
     "tagKey": {
       "type": "String",
-      "description": "Tag key to identify ElastiCache clusters to target",
+      "description": "Tag key to identify ElastiCache replication groups to target",
       "default": "FIS-Ready"
     },
     "tagValue": {
       "type": "String",
-      "description": "Tag value to identify ElastiCache clusters to target",
+      "description": "Tag value to identify ElastiCache replication groups to target",
       "default": "True"
     }
   },
@@ -18,10 +22,13 @@
     {
       "name": "triggerFailover",
       "action": "aws:executeScript",
+      "timeoutSeconds": 120,
+      "onFailure": "step:verifyHealthy",
+      "onCancel": "step:verifyHealthy",
       "inputs": {
         "Runtime": "python3.11",
         "Handler": "trigger_failover",
-        "Script": "import boto3\ndef trigger_failover(events, context):\n    region = events[\"region\"]\n    tag_key = events[\"tagKey\"]\n    tag_value = events[\"tagValue\"]\n    elasticache = boto3.client(\"elasticache\", region_name=region)\n    response = elasticache.describe_replication_groups()\n    for rg in response[\"ReplicationGroups\"]:\n        if rg[\"Status\"] == \"available\" and rg.get(\"AutomaticFailover\") == \"enabled\":\n            rg_id = rg[\"ReplicationGroupId\"]\n            try:\n                account_id = boto3.client(\"sts\").get_caller_identity()[\"Account\"]\n                arn = \"arn:aws:elasticache:{}:{}:replicationgroup:{}\".format(region, account_id, rg_id)\n                tags_response = elasticache.list_tags_for_resource(ResourceName=arn)\n                tags = {tag[\"Key\"]: tag[\"Value\"] for tag in tags_response.get(\"TagList\", [])}\n                if tags.get(tag_key) == tag_value:\n                    elasticache.test_failover(ReplicationGroupId=rg_id, NodeGroupId=\"0001\")\n                    return {\"ReplicationGroupId\": rg_id, \"Status\": \"Failover initiated\"}\n            except Exception as e:\n                continue\n    raise Exception(\"No cluster found with tag {}={}\".format(tag_key, tag_value))",
+        "Script": "import boto3\nfrom datetime import datetime, timedelta, timezone\n\n\ndef tagged_groups(ec, key, value):\n    groups = []\n    for page in ec.get_paginator('describe_replication_groups').paginate():\n        for rg in page['ReplicationGroups']:\n            tags = ec.list_tags_for_resource(ResourceName=rg['ARN']).get('TagList', [])\n            if any(t['Key'] == key and t['Value'] == value for t in tags):\n                groups.append(rg)\n    return groups\n\n\ndef trigger_failover(events, context):\n    ec = boto3.client('elasticache', region_name=events['region'])\n    start = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()\n    groups = tagged_groups(ec, events['tagKey'], events['tagValue'])\n    if not groups:\n        raise Exception('No replication group found with tag {}={}'.format(events['tagKey'], events['tagValue']))\n    not_ready = ['{} (status {}, AutomaticFailover {})'.format(g['ReplicationGroupId'], g['Status'], g.get('AutomaticFailover')) for g in groups if g['Status'] != 'available' or g.get('AutomaticFailover') != 'enabled']\n    if not_ready:\n        raise Exception('Tagged replication groups not ready for failover: ' + ', '.join(not_ready))\n    for g in groups:\n        node_group = g['NodeGroups'][0]['NodeGroupId']\n        ec.test_failover(ReplicationGroupId=g['ReplicationGroupId'], NodeGroupId=node_group)\n        print('TestFailover called for {} node group {}'.format(g['ReplicationGroupId'], node_group))\n    return {'ReplicationGroupIds': ','.join(g['ReplicationGroupId'] for g in groups), 'StartTime': start}\n",
         "InputPayload": {
           "region": "{{ global:REGION }}",
           "tagKey": "{{ tagKey }}",
@@ -30,9 +37,116 @@
       },
       "outputs": [
         {
-          "Name": "Result",
-          "Selector": "$.Payload",
-          "Type": "StringMap"
+          "Name": "ReplicationGroupIds",
+          "Selector": "$.Payload.ReplicationGroupIds",
+          "Type": "String"
+        },
+        {
+          "Name": "StartTime",
+          "Selector": "$.Payload.StartTime",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForFailover",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 330,
+      "onFailure": "step:verifyHealthy",
+      "onCancel": "step:verifyHealthy",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "wait_for_failover",
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\n\n\ndef problems(ec, rg_id):\n    g = ec.describe_replication_groups(ReplicationGroupId=rg_id)['ReplicationGroups'][0]\n    out = []\n    if g['Status'] != 'available':\n        out.append('group status ' + g['Status'])\n    for ng in g['NodeGroups']:\n        n = sum(1 for m in ng['NodeGroupMembers'] if m.get('CurrentRole') == 'primary')\n        if n != 1:\n            out.append('node group {} has {} primaries'.format(ng['NodeGroupId'], n))\n    for cid in g.get('MemberClusters', []):\n        status = ec.describe_cache_clusters(CacheClusterId=cid)['CacheClusters'][0]['CacheClusterStatus']\n        if status != 'available':\n            out.append('cluster {} status {}'.format(cid, status))\n    return out\n\n\ndef wait_for_failover(events, context):\n    ec = boto3.client('elasticache', region_name=events['region'])\n    start = datetime.fromisoformat(events['startTime'])\n    groups = [x for x in events['replicationGroupIds'].split(',') if x]\n    deadline = time.time() + int(events['timeoutSeconds'])\n    while True:\n        waiting = {}\n        for rg_id in groups:\n            messages = [e['Message'] for e in ec.describe_events(SourceIdentifier=rg_id, SourceType='replication-group', StartTime=start)['Events']]\n            if not any(m.startswith('Failover from') and 'completed' in m for m in messages):\n                waiting[rg_id] = 'failover not completed yet'\n                continue\n            issues = problems(ec, rg_id)\n            if issues:\n                waiting[rg_id] = '; '.join(issues)\n        if not waiting:\n            print('Failover completed for ' + ', '.join(groups))\n            return {'Status': 'failover completed'}\n        if time.time() > deadline:\n            raise Exception('Failover did not complete in time: ' + str(waiting))\n        time.sleep(10)\n",
+        "InputPayload": {
+          "region": "{{ global:REGION }}",
+          "replicationGroupIds": "{{ triggerFailover.ReplicationGroupIds }}",
+          "startTime": "{{ triggerFailover.StartTime }}",
+          "timeoutSeconds": "300"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForRecovery",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 570,
+      "onFailure": "step:verifyHealthy",
+      "onCancel": "step:verifyHealthy",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "wait_for_recovery",
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\n\n\ndef in_progress(ec, rg_id, since, need_call):\n    g = ec.describe_replication_groups(ReplicationGroupId=rg_id)['ReplicationGroups'][0]\n    found = []\n    for source, kind in [(rg_id, 'replication-group')] + [(c, 'cache-cluster') for c in g.get('MemberClusters', [])]:\n        found += ec.describe_events(SourceIdentifier=source, SourceType=kind, StartTime=since)['Events']\n    state = 'no TestFailover call event yet' if need_call else None\n    for e in sorted(found, key=lambda e: e['Date']):\n        m = e['Message']\n        if m.startswith('Test Failover API called'):\n            state = 'failover in progress'\n        elif m.startswith('Failover from') and 'completed' in m:\n            state = 'former primary recovery pending'\n        elif m.startswith('Recovering cache nodes'):\n            state = 'former primary recovering'\n        elif m.startswith('Finished recovery for cache nodes') and state != 'no TestFailover call event yet':\n            state = None\n    return state\n\n\ndef wait_for_recovery(events, context):\n    ec = boto3.client('elasticache', region_name=events['region'])\n    start = datetime.fromisoformat(events['startTime'])\n    groups = [x for x in events['replicationGroupIds'].split(',') if x]\n    deadline = time.time() + int(events['timeoutSeconds'])\n    while True:\n        waiting = {}\n        for rg_id in groups:\n            state = in_progress(ec, rg_id, start, True)\n            if state:\n                waiting[rg_id] = state\n        if not waiting:\n            print('Former primary recovered for ' + ', '.join(groups))\n            return {'Status': 'recovered'}\n        if time.time() > deadline:\n            if events['failIfNotDone'] == 'true':\n                raise Exception('Node recovery did not finish in time: ' + str(waiting))\n            print('Still recovering, continuing in the next step: ' + str(waiting))\n            return {'Status': 'still recovering'}\n        time.sleep(15)\n",
+        "InputPayload": {
+          "region": "{{ global:REGION }}",
+          "replicationGroupIds": "{{ triggerFailover.ReplicationGroupIds }}",
+          "startTime": "{{ triggerFailover.StartTime }}",
+          "timeoutSeconds": "540",
+          "failIfNotDone": "false"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "waitForRecoveryContinued",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 570,
+      "onFailure": "step:verifyHealthy",
+      "onCancel": "step:verifyHealthy",
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "wait_for_recovery",
+        "Script": "import time\nfrom datetime import datetime\n\nimport boto3\n\n\ndef in_progress(ec, rg_id, since, need_call):\n    g = ec.describe_replication_groups(ReplicationGroupId=rg_id)['ReplicationGroups'][0]\n    found = []\n    for source, kind in [(rg_id, 'replication-group')] + [(c, 'cache-cluster') for c in g.get('MemberClusters', [])]:\n        found += ec.describe_events(SourceIdentifier=source, SourceType=kind, StartTime=since)['Events']\n    state = 'no TestFailover call event yet' if need_call else None\n    for e in sorted(found, key=lambda e: e['Date']):\n        m = e['Message']\n        if m.startswith('Test Failover API called'):\n            state = 'failover in progress'\n        elif m.startswith('Failover from') and 'completed' in m:\n            state = 'former primary recovery pending'\n        elif m.startswith('Recovering cache nodes'):\n            state = 'former primary recovering'\n        elif m.startswith('Finished recovery for cache nodes') and state != 'no TestFailover call event yet':\n            state = None\n    return state\n\n\ndef wait_for_recovery(events, context):\n    ec = boto3.client('elasticache', region_name=events['region'])\n    start = datetime.fromisoformat(events['startTime'])\n    groups = [x for x in events['replicationGroupIds'].split(',') if x]\n    deadline = time.time() + int(events['timeoutSeconds'])\n    while True:\n        waiting = {}\n        for rg_id in groups:\n            state = in_progress(ec, rg_id, start, True)\n            if state:\n                waiting[rg_id] = state\n        if not waiting:\n            print('Former primary recovered for ' + ', '.join(groups))\n            return {'Status': 'recovered'}\n        if time.time() > deadline:\n            if events['failIfNotDone'] == 'true':\n                raise Exception('Node recovery did not finish in time: ' + str(waiting))\n            print('Still recovering, continuing in the next step: ' + str(waiting))\n            return {'Status': 'still recovering'}\n        time.sleep(15)\n",
+        "InputPayload": {
+          "region": "{{ global:REGION }}",
+          "replicationGroupIds": "{{ triggerFailover.ReplicationGroupIds }}",
+          "startTime": "{{ triggerFailover.StartTime }}",
+          "timeoutSeconds": "540",
+          "failIfNotDone": "true"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
+        }
+      ]
+    },
+    {
+      "name": "verifyHealthy",
+      "action": "aws:executeScript",
+      "timeoutSeconds": 110,
+      "isEnd": true,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "verify_healthy",
+        "Script": "import time\nfrom datetime import datetime, timedelta, timezone\n\nimport boto3\n\n\ndef tagged_groups(ec, key, value):\n    groups = []\n    for page in ec.get_paginator('describe_replication_groups').paginate():\n        for rg in page['ReplicationGroups']:\n            tags = ec.list_tags_for_resource(ResourceName=rg['ARN']).get('TagList', [])\n            if any(t['Key'] == key and t['Value'] == value for t in tags):\n                groups.append(rg)\n    return groups\n\n\ndef problems(ec, rg_id):\n    g = ec.describe_replication_groups(ReplicationGroupId=rg_id)['ReplicationGroups'][0]\n    out = []\n    if g['Status'] != 'available':\n        out.append('group status ' + g['Status'])\n    for ng in g['NodeGroups']:\n        n = sum(1 for m in ng['NodeGroupMembers'] if m.get('CurrentRole') == 'primary')\n        if n != 1:\n            out.append('node group {} has {} primaries'.format(ng['NodeGroupId'], n))\n    for cid in g.get('MemberClusters', []):\n        status = ec.describe_cache_clusters(CacheClusterId=cid)['CacheClusters'][0]['CacheClusterStatus']\n        if status != 'available':\n            out.append('cluster {} status {}'.format(cid, status))\n    return out\n\n\ndef in_progress(ec, rg_id, since):\n    g = ec.describe_replication_groups(ReplicationGroupId=rg_id)['ReplicationGroups'][0]\n    found = []\n    for source, kind in [(rg_id, 'replication-group')] + [(c, 'cache-cluster') for c in g.get('MemberClusters', [])]:\n        found += ec.describe_events(SourceIdentifier=source, SourceType=kind, StartTime=since)['Events']\n    state = None\n    for e in sorted(found, key=lambda e: e['Date']):\n        m = e['Message']\n        if m.startswith('Test Failover API called'):\n            state = 'failover in progress'\n        elif m.startswith('Failover from') and 'completed' in m:\n            state = 'former primary recovery pending'\n        elif m.startswith('Recovering cache nodes'):\n            state = 'former primary recovering'\n        elif m.startswith('Finished recovery for cache nodes'):\n            state = None\n    return state\n\n\ndef verify_healthy(events, context):\n    ec = boto3.client('elasticache', region_name=events['region'])\n    deadline = time.time() + int(events['timeoutSeconds'])\n    healthy_since = None\n    while True:\n        since = datetime.now(timezone.utc) - timedelta(minutes=60)\n        bad = {}\n        for g in tagged_groups(ec, events['tagKey'], events['tagValue']):\n            rg_id = g['ReplicationGroupId']\n            issues = problems(ec, rg_id)\n            state = in_progress(ec, rg_id, since)\n            if state:\n                issues.append(state)\n            if issues:\n                bad[rg_id] = issues\n        if bad:\n            healthy_since = None\n        elif healthy_since is None:\n            healthy_since = time.time()\n        if healthy_since is not None and time.time() - healthy_since >= 30:\n            print('All tagged replication groups are healthy')\n            return {'Status': 'healthy'}\n        if time.time() > deadline:\n            if not bad:\n                print('All tagged replication groups are healthy')\n                return {'Status': 'healthy'}\n            message = 'Not healthy yet: ' + str(bad) + '. A started failover cannot be undone; ElastiCache completes it on its own.'\n            print(message)\n            return {'Status': message}\n        time.sleep(10)\n",
+        "InputPayload": {
+          "region": "{{ global:REGION }}",
+          "tagKey": "{{ tagKey }}",
+          "tagValue": "{{ tagValue }}",
+          "timeoutSeconds": "85"
+        }
+      },
+      "outputs": [
+        {
+          "Name": "Status",
+          "Selector": "$.Payload.Status",
+          "Type": "String"
         }
       ]
     }
