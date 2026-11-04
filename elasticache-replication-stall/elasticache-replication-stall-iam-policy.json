@@ -1,0 +1,65 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "FISExperimentControl",
+            "Effect": "Allow",
+            "Action": [
+                "fis:StartExperiment",
+                "fis:GetExperimentSummary",
+                "fis:GetExperimentResults",
+                "fis:StopExperiment"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "SendCommandToDocument",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:SendCommand"
+            ],
+            "Resource": [
+                "arn:aws:ssm:*:*:document/ElastiCacheReplicationStall"
+            ]
+        },
+        {
+            "Sid": "SendCommandToTaggedInjectorInstancesOnly",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:SendCommand"
+            ],
+            "Resource": [
+                "arn:aws:ec2:*:*:instance/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True",
+                    "aws:ResourceTag/FIS-Role": "ElastiCacheInjector"
+                }
+            }
+        },
+        {
+            "Sid": "TrackCommandInvocation",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:ListCommands",
+                "ssm:ListCommandInvocations",
+                "ssm:GetCommandInvocation",
+                "ssm:CancelCommand"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ExperimentLogging",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogGroups",
+                "logs:DescribeLogStreams"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

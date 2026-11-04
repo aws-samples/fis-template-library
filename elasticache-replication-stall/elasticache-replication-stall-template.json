@@ -1,0 +1,41 @@
+{
+    "description": "Stall ElastiCache replication by pausing the replication stream on a replica node, to validate how the application behaves when a replica cannot keep up with its primary",
+    "targets": {
+        "InjectorInstances": {
+            "resourceType": "aws:ec2:instance",
+            "resourceTags": {
+                "FIS-Ready": "True",
+                "FIS-Role": "ElastiCacheInjector"
+            },
+            "selectionMode": "COUNT(1)"
+        }
+    },
+    "actions": {
+        "StallElastiCacheReplication": {
+            "actionId": "aws:ssm:send-command",
+            "description": "Run the replication stall SSM document on one injector instance inside the cache VPC",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ElastiCacheReplicationStall",
+                "documentParameters": "{\"ReplicationGroupId\": \"<YOUR REPLICATION GROUP ID>\", \"PauseMode\": \"WRITE\", \"PauseMilliseconds\": \"30000\", \"DurationSeconds\": \"60\", \"DutyCyclePercent\": \"0\", \"CyclePeriodMilliseconds\": \"1000\", \"UseTls\": \"false\", \"TargetShardId\": \"\", \"ReplicaScope\": \"ONE_PER_SHARD\"}",
+                "duration": "PT3M"
+            },
+            "targets": {
+                "Instances": "InjectorInstances"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "tags": {
+        "Name": "ElastiCacheReplicationStall",
+        "Purpose": "resilience-testing"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "fail"
+    }
+}
