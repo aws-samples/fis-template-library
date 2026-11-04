@@ -1,58 +1,126 @@
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkAcl",
-        "ec2:CreateNetworkAclEntry",
-        "ec2:CreateTags",
-        "ec2:DeleteNetworkAcl",
-        "ec2:DescribeNetworkAcls",
-        "ec2:DescribeSubnets",
-        "ec2:DescribeVpcs",
-        "ec2:ReplaceNetworkAclAssociation"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkAclEntry"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "ec2:ResourceTag/managedByFIS": "true"
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCreateNetworkAclTaggedForFIS",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateNetworkAcl"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestTag/managedByFIS": "true"
+                }
+            }
+        },
+        {
+            "Sid": "AllowCreateNetworkAclInVpc",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateNetworkAcl"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*"
+        },
+        {
+            "Sid": "AllowTagNetworkAclOnCreate",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateTags"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+            "Condition": {
+                "StringEquals": {
+                    "ec2:CreateAction": "CreateNetworkAcl",
+                    "aws:RequestTag/managedByFIS": "true"
+                }
+            }
+        },
+        {
+            "Sid": "AllowChangeOnlyFISNetworkAcls",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:CreateNetworkAclEntry",
+                "ec2:DeleteNetworkAcl"
+            ],
+            "Resource": [
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "ec2:ResourceTag/managedByFIS": "true"
+                }
+            }
+        },
+        {
+            "Sid": "AllowReplaceNetworkAclAssociationAnyNetworkAcl",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:ReplaceNetworkAclAssociation"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
+        },
+        {
+            "Sid": "AllowReplaceNetworkAclAssociationOnFISReadySubnets",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:ReplaceNetworkAclAssociation"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowDescribeNetwork",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeManagedPrefixLists",
+                "ec2:DescribeNetworkAcls",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeVpcs"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowGetManagedPrefixListEntries",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:GetManagedPrefixListEntries"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:*:prefix-list/*"
+        },
+        {
+            "Sid": "AllowReadTableAndStreamPolicies",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:DescribeTable",
+                "dynamodb:GetResourcePolicy"
+            ],
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
+        },
+        {
+            "Sid": "AllowChangeTableAndStreamPoliciesNoTagConditionLockoutCheck",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:PutResourcePolicy",
+                "dynamodb:DeleteResourcePolicy"
+            ],
+            "Resource": [
+                "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*",
+                "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*/stream/*"
+            ]
+        },
+        {
+            "Sid": "AllowTargetResolution",
+            "Effect": "Allow",
+            "Action": [
+                "tag:GetResources"
+            ],
+            "Resource": "*"
         }
-      }
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DeleteNetworkAcl"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "ec2:ResourceTag/managedByFIS": "true"
-        }
-      }
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "dynamodb:PauseReplication",
-        "dynamodb:ResumeReplication",
-        "dynamodb:PutResourcePolicy",
-        "dynamodb:DeleteResourcePolicy",
-        "dynamodb:GetResourcePolicy",
-        "dynamodb:DescribeTable",
-        "dynamodb:ListTagsOfResource",
-        "dynamodb:ListTables",
-        "tag:GetResources"
-      ],
-      "Resource": "*"
-    }
-  ]
+    ]
 }
