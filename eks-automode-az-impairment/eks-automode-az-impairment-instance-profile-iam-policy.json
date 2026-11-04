@@ -21,6 +21,26 @@
       "Effect": "Allow",
       "Action": "ec2:DescribeSubnets",
       "Resource": "*"
+    },
+    {
+      "Sid": "WriteRunCommandOutputToCloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": [
+        "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/ssm/eks-automode-az-impairment",
+        "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/ssm/eks-automode-az-impairment:*"
+      ]
+    },
+    {
+      "Sid": "DescribeLogGroups",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "*"
     }
   ]
 }

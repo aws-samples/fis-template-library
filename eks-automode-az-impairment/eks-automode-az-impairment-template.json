@@ -1,26 +1,81 @@
 {
-    "description": "EKS Auto Mode AZ Impairment - Simulates availability zone failure with pod deletion, network disruption, and node pool AZ exclusion",
+    "description": "EKS Auto Mode AZ Impairment - Simulates an availability zone failure with a network disruption and launch failures in the target AZ, then an ARC zonal shift as the operator recovery action, together with node cordon, NodePool AZ exclusion and pod deletion",
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
     "actions": {
+        "cordon-and-exclude-az": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Launch a client instance in the VPC, cordon the target-AZ nodes, patch the custom NodePool to exclude the AZ, delete pods, wait, then restore and clean up.",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/eks-automode-az-impairment-automation",
+                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\",\"ClusterName\":\"<YOUR EKS CLUSTER>\",\"TargetAZ\":\"<YOUR TARGET AZ>\",\"NodePoolName\":\"<YOUR NODEPOOL NAME>\",\"Duration\":\"PT20M\",\"ImpairNodePoolWeight\":\"100\",\"SubnetId\":\"<YOUR CLIENT SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"ClusterSecurityGroupId\":\"\",\"InstanceProfileName\":\"<YOUR INSTANCE PROFILE NAME>\",\"InstanceType\":\"t3.small\"}",
+                "maxDuration": "PT35M"
+            }
+        },
+        "insufficient-capacity-in-az": {
+            "actionId": "aws:ec2:api-insufficient-instance-capacity-error",
+            "description": "Fail EC2 launches in the target AZ made by the node launch roles, so no NodePool (including the built-in ones) can add nodes there.",
+            "parameters": {
+                "availabilityZoneIdentifiers": "<YOUR TARGET AZ>",
+                "duration": "PT20M",
+                "percentage": "100"
+            },
+            "targets": {
+                "Roles": "node-launch-roles"
+            }
+        },
+        "insufficient-capacity-in-az-node-groups": {
+            "actionId": "aws:ec2:asg-insufficient-instance-capacity-error",
+            "description": "Fail launches in the target AZ for the cluster's managed node group Auto Scaling groups. Skipped if the cluster has none.",
+            "parameters": {
+                "availabilityZoneIdentifiers": "<YOUR TARGET AZ>",
+                "duration": "PT20M",
+                "percentage": "100"
+            },
+            "targets": {
+                "AutoScalingGroups": "managed-node-group-asgs"
+            }
+        },
+        "wait-for-client": {
+            "actionId": "aws:fis:wait",
+            "description": "Give the automation time to launch the client and apply the Kubernetes changes while the API server is still reachable from the target AZ.",
+            "parameters": {
+                "duration": "PT5M"
+            }
+        },
         "disrupt-az-network": {
             "actionId": "aws:network:disrupt-connectivity",
-            "description": "Block all network traffic on target AZ subnet via NACLs, simulating full AZ network failure.",
+            "description": "Block all network traffic on the target AZ subnets via NACLs, simulating a full AZ network failure.",
             "parameters": {
                 "duration": "PT15M",
                 "scope": "all"
             },
             "targets": {
                 "Subnets": "subnets-in-target-az"
+            },
+            "startAfter": [
+                "wait-for-client"
+            ]
+        },
+        "wait-for-recovery-action": {
+            "actionId": "aws:fis:wait",
+            "description": "Time the cluster runs on its own before the operator recovery action starts. Counted from the start of the experiment, so it is the client delay plus the detection time you want to measure.",
+            "parameters": {
+                "duration": "PT8M"
             }
         },
-        "cordon-and-exclude-az": {
-            "actionId": "aws:ssm:start-automation-execution",
-            "description": "Cordon nodes, patch NodePool to exclude target AZ, delete pods in target AZ, wait for impairment duration, then restore. The SSM automation launches an ephemeral EC2 instance inside the VPC (SubnetId) and runs all Kubernetes API operations from there via runCommand, so it works with a private EKS endpoint without opening public access.",
+        "shift-away-from-az": {
+            "actionId": "aws:arc:start-zonal-autoshift",
+            "description": "Operator recovery action: start an ARC zonal shift for the cluster away from the target AZ. While it is active, EKS Auto Mode stops launching nodes in that AZ for every NodePool, including the built-in ones. Remove this action and its target if the cluster does not have zonal shift enabled.",
             "parameters": {
-                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/eks-automode-az-impairment-automation",
-                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\",\"ClusterName\":\"<YOUR EKS CLUSTER>\",\"TargetAZ\":\"<YOUR TARGET AZ>\",\"NodePoolName\":\"<YOUR NODEPOOL NAME>\",\"Duration\":\"PT15M\",\"SubnetId\":\"<YOUR CLIENT SUBNET ID (NOT in the target AZ)>\",\"VpcId\":\"<YOUR VPC ID>\",\"InstanceProfileName\":\"<YOUR INSTANCE PROFILE NAME>\",\"InstanceType\":\"t3.small\"}",
-                "maxDuration": "PT45M"
-            }
+                "availabilityZoneIdentifier": "<YOUR TARGET AZ>",
+                "duration": "PT12M"
+            },
+            "targets": {
+                "ManagedResources": "eks-cluster-for-zonal-shift"
+            },
+            "startAfter": [
+                "wait-for-recovery-action"
+            ]
         }
     },
     "stopConditions": [
@@ -36,6 +91,31 @@
             },
             "parameters": {
                 "availabilityZoneIdentifier": "<YOUR TARGET AZ>"
+            },
+            "selectionMode": "ALL"
+        },
+        "node-launch-roles": {
+            "resourceType": "aws:iam:role",
+            "resourceArns": [
+                "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR EKS CLUSTER ROLE NAME>"
+            ],
+            "selectionMode": "ALL"
+        },
+        "managed-node-group-asgs": {
+            "resourceType": "aws:ec2:autoscaling-group",
+            "resourceTags": {
+                "k8s.io/cluster-autoscaler/<YOUR EKS CLUSTER>": "owned"
+            },
+            "selectionMode": "ALL"
+        },
+        "eks-cluster-for-zonal-shift": {
+            "resourceType": "aws:arc:zonal-shift-managed-resource",
+            "resourceTags": {
+                "FIS-Ready": "True"
+            },
+            "parameters": {
+                "managedResourceTypes": "EKS",
+                "zonalAutoshiftStatus": "ANY"
             },
             "selectionMode": "ALL"
         }
