@@ -19,14 +19,21 @@
     "actions": {
         "RunLoadTest": {
             "actionId": "aws:ssm:send-command",
-            "description": "Run MySQL high CPU load test until target CPU utilization is reached",
+            "description": "Run the MySQL load test for the whole experiment. The action's duration is longer than the document's Duration, so the action is still running if the experiment is stopped, and FIS then cancels the load",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/MySQL-LoadTest-Document",
-                "documentParameters": "{\"Duration\":\"600\",\"Concurrency\":\"25\",\"TargetCPU\":\"80\"}",
-                "duration": "PT15M"
+                "documentParameters": "{\"DBHost\":\"<YOUR DB ENDPOINT>\",\"DBSecretId\":\"mysql-rds-password\",\"Duration\":\"600\",\"Concurrency\":\"25\",\"TargetCPU\":\"80\"}",
+                "duration": "PT11M"
             },
             "targets": {
                 "Instances": "LoadTestInstances"
+            }
+        },
+        "WaitBeforeFailover": {
+            "actionId": "aws:fis:wait",
+            "description": "Let the load build up for 5 minutes before the failover. Runs at the same time as RunLoadTest",
+            "parameters": {
+                "duration": "PT5M"
             }
         },
         "ForceFailover": {
@@ -38,11 +45,11 @@
             "targets": {
                 "DBInstances": "MySQLInstances"
             },
-            "startAfter": ["RunLoadTest"]
+            "startAfter": ["WaitBeforeFailover"]
         },
         "StopLoadTest": {
             "actionId": "aws:ssm:send-command",
-            "description": "Stop the load test after failover completes",
+            "description": "Stop any load test worker still running when RunLoadTest ends, for example if Duration was set longer than RunLoadTest's duration",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>::document/AWS-RunShellScript",
                 "documentParameters": "{\"commands\":[\"pkill -f 'mysql_load_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
@@ -51,8 +58,7 @@
             "targets": {
                 "Instances": "LoadTestInstances"
             },
-            "startAfter": ["ForceFailover"],
-            "startAfterDelay": "PT5M"
+            "startAfter": ["RunLoadTest"]
         }
     },
     "stopConditions": [
