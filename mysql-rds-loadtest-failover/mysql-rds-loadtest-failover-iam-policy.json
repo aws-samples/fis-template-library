@@ -29,7 +29,7 @@
                 "ssm:SendCommand"
             ],
             "Resource": [
-                "arn:aws:ssm:*:*:document/*"
+                "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/MySQL-LoadTest-Document"
             ]
         },
         {

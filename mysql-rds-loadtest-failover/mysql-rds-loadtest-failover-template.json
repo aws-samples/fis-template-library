@@ -19,11 +19,11 @@
     "actions": {
         "RunLoadTest": {
             "actionId": "aws:ssm:send-command",
-            "description": "Run the MySQL load test for the whole experiment. The action's duration is longer than the document's Duration, so the action is still running if the experiment is stopped, and FIS then cancels the load",
+            "description": "Run the MySQL load test. The action's duration is longer than the document can run (its install and load steps time out after 120 and 1020 seconds), so the document ends while the action runs and a stop at any point cancels it",
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/MySQL-LoadTest-Document",
                 "documentParameters": "{\"DBHost\":\"<YOUR DB ENDPOINT>\",\"DBSecretId\":\"mysql-rds-password\",\"Duration\":\"600\",\"Concurrency\":\"25\",\"TargetCPU\":\"80\"}",
-                "duration": "PT11M"
+                "duration": "PT25M"
             },
             "targets": {
                 "Instances": "LoadTestInstances"
@@ -31,7 +31,7 @@
         },
         "WaitBeforeFailover": {
             "actionId": "aws:fis:wait",
-            "description": "Let the load build up for 5 minutes before the failover. Runs at the same time as RunLoadTest",
+            "description": "Wait 5 minutes before the failover. Starts at the same time as RunLoadTest, whose load starts after the install and setup",
             "parameters": {
                 "duration": "PT5M"
             }
@@ -46,19 +46,6 @@
                 "DBInstances": "MySQLInstances"
             },
             "startAfter": ["WaitBeforeFailover"]
-        },
-        "StopLoadTest": {
-            "actionId": "aws:ssm:send-command",
-            "description": "Stop any load test worker still running when RunLoadTest ends, for example if Duration was set longer than RunLoadTest's duration",
-            "parameters": {
-                "documentArn": "arn:aws:ssm:<YOUR REGION>::document/AWS-RunShellScript",
-                "documentParameters": "{\"commands\":[\"pkill -f 'mysql_load_worker'\",\"echo \\\"Load test stopped\\\"\"]}",
-                "duration": "PT1M"
-            },
-            "targets": {
-                "Instances": "LoadTestInstances"
-            },
-            "startAfter": ["RunLoadTest"]
         }
     },
     "stopConditions": [
