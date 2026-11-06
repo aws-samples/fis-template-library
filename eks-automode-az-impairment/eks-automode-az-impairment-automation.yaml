@@ -35,9 +35,9 @@ parameters:
     type: String
     description: >-
       How long the NodePool exclusion and cordons stay in place, in ISO 8601
-      format. Set it to the FIS client delay plus the network disruption
-      duration, so restore runs after the network returns.
-    default: 'PT20M'
+      format. Set it so restore runs after the network disruption ends: with
+      the template defaults, the zonal shift duration.
+    default: 'PT14M'
     allowedPattern: '^PT(\d+H)?(\d+M)?(\d+S)?$'
   ImpairNodePoolWeight:
     type: String

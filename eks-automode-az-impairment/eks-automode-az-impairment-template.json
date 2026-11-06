@@ -1,14 +1,16 @@
 {
-    "description": "EKS Auto Mode AZ Impairment - Simulates an availability zone failure with a network disruption and launch failures in the target AZ, then an ARC zonal shift as the operator recovery action, together with node cordon, NodePool AZ exclusion and pod deletion",
+    "description": "EKS Auto Mode AZ Impairment - Disrupts the network and blocks new capacity in the target AZ, starts an ARC zonal shift as a fast follow, then cordons the AZ's nodes, excludes the AZ from the custom NodePool and deletes its pods",
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR FIS ROLE NAME>",
     "actions": {
-        "cordon-and-exclude-az": {
-            "actionId": "aws:ssm:start-automation-execution",
-            "description": "Launch a client instance in the VPC, cordon the target-AZ nodes, patch the custom NodePool to exclude the AZ, delete pods, wait, then restore and clean up.",
+        "disrupt-az-network": {
+            "actionId": "aws:network:disrupt-connectivity",
+            "description": "Block all network traffic on the target AZ subnets via NACLs, simulating a full AZ network failure.",
             "parameters": {
-                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/eks-automode-az-impairment-automation",
-                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\",\"ClusterName\":\"<YOUR EKS CLUSTER>\",\"TargetAZ\":\"<YOUR TARGET AZ>\",\"NodePoolName\":\"<YOUR NODEPOOL NAME>\",\"Duration\":\"PT20M\",\"ImpairNodePoolWeight\":\"100\",\"SubnetId\":\"<YOUR CLIENT SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"ClusterSecurityGroupId\":\"\",\"InstanceProfileName\":\"<YOUR INSTANCE PROFILE NAME>\",\"InstanceType\":\"t3.small\"}",
-                "maxDuration": "PT35M"
+                "duration": "PT15M",
+                "scope": "all"
+            },
+            "targets": {
+                "Subnets": "subnets-in-target-az"
             }
         },
         "insufficient-capacity-in-az": {
@@ -16,7 +18,7 @@
             "description": "Fail EC2 launches in the target AZ made by the node launch roles, so no NodePool (including the built-in ones) can add nodes there.",
             "parameters": {
                 "availabilityZoneIdentifiers": "<YOUR TARGET AZ>",
-                "duration": "PT20M",
+                "duration": "PT15M",
                 "percentage": "100"
             },
             "targets": {
@@ -28,39 +30,18 @@
             "description": "Fail launches in the target AZ for the cluster's managed node group Auto Scaling groups. Skipped if the cluster has none.",
             "parameters": {
                 "availabilityZoneIdentifiers": "<YOUR TARGET AZ>",
-                "duration": "PT20M",
+                "duration": "PT15M",
                 "percentage": "100"
             },
             "targets": {
                 "AutoScalingGroups": "managed-node-group-asgs"
             }
         },
-        "wait-for-client": {
-            "actionId": "aws:fis:wait",
-            "description": "Give the automation time to launch the client and apply the Kubernetes changes while the API server is still reachable from the target AZ.",
-            "parameters": {
-                "duration": "PT5M"
-            }
-        },
-        "disrupt-az-network": {
-            "actionId": "aws:network:disrupt-connectivity",
-            "description": "Block all network traffic on the target AZ subnets via NACLs, simulating a full AZ network failure.",
-            "parameters": {
-                "duration": "PT15M",
-                "scope": "all"
-            },
-            "targets": {
-                "Subnets": "subnets-in-target-az"
-            },
-            "startAfter": [
-                "wait-for-client"
-            ]
-        },
         "wait-for-recovery-action": {
             "actionId": "aws:fis:wait",
-            "description": "Time the cluster runs on its own before the operator recovery action starts. Counted from the start of the experiment, so it is the client delay plus the detection time you want to measure.",
+            "description": "Detection time before the operator recovery action. The zonal shift and the SSM automation both start when it ends.",
             "parameters": {
-                "duration": "PT8M"
+                "duration": "PT1M"
             }
         },
         "shift-away-from-az": {
@@ -68,10 +49,22 @@
             "description": "Operator recovery action: start an ARC zonal shift for the cluster away from the target AZ. While it is active, EKS Auto Mode stops launching nodes in that AZ for every NodePool, including the built-in ones. Remove this action and its target if the cluster does not have zonal shift enabled.",
             "parameters": {
                 "availabilityZoneIdentifier": "<YOUR TARGET AZ>",
-                "duration": "PT12M"
+                "duration": "PT14M"
             },
             "targets": {
                 "ManagedResources": "eks-cluster-for-zonal-shift"
+            },
+            "startAfter": [
+                "wait-for-recovery-action"
+            ]
+        },
+        "cordon-and-exclude-az": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "After the zonal shift has started, launch a client instance in the VPC, cordon the target-AZ nodes, patch the custom NodePool to exclude the AZ, delete pods, wait, then restore and clean up.",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/eks-automode-az-impairment-automation",
+                "documentParameters": "{\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\",\"ClusterName\":\"<YOUR EKS CLUSTER>\",\"TargetAZ\":\"<YOUR TARGET AZ>\",\"NodePoolName\":\"<YOUR NODEPOOL NAME>\",\"Duration\":\"PT14M\",\"ImpairNodePoolWeight\":\"100\",\"SubnetId\":\"<YOUR CLIENT SUBNET ID>\",\"VpcId\":\"<YOUR VPC ID>\",\"ClusterSecurityGroupId\":\"\",\"InstanceProfileName\":\"<YOUR INSTANCE PROFILE NAME>\",\"InstanceType\":\"t3.small\"}",
+                "maxDuration": "PT30M"
             },
             "startAfter": [
                 "wait-for-recovery-action"

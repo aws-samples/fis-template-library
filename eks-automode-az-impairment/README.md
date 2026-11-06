@@ -27,11 +27,11 @@ This experiment combines five faults and actions:
 
 1. **Network disruption**: block all traffic on the target AZ's subnets with network ACLs. Nodes and pods already in the AZ become unreachable.
 2. **Insufficient capacity in the AZ**: make EC2 launches in the target AZ fail with `InsufficientInstanceCapacity`, for the IAM roles that launch your nodes (the EKS cluster role for Auto Mode, plus the Auto Scaling groups of any managed node groups).
-3. **Kubernetes-side impairment** (SSM automation): cordon the nodes in the target AZ, exclude the AZ from a custom NodePool and raise that NodePool's weight, and delete the pods in the AZ so Kubernetes reschedules them.
-4. **Zonal shift as the operator recovery action**: after a delay that represents detection time, start an Amazon Application Recovery Controller (ARC) zonal shift for the cluster away from the target AZ. While it is active, EKS Auto Mode does not launch nodes in that AZ for any NodePool, including the built-in ones.
+3. **Zonal shift as the operator recovery action**: after a short delay that represents detection time, start an Amazon Application Recovery Controller (ARC) zonal shift for the cluster away from the target AZ. While it is active, EKS Auto Mode does not launch nodes in that AZ for any NodePool, including the built-in ones.
+4. **Kubernetes-side impairment** (SSM automation, starts with the zonal shift): cordon the nodes in the target AZ, exclude the AZ from a custom NodePool and raise that NodePool's weight, and delete the pods in the AZ, simulating the sudden loss of the AZ's workloads.
 5. **Restore and cleanup** (SSM automation): put back only what the run changed and remove everything it created.
 
-The first two start with the experiment, so the cluster first faces the failure with no operator action. The zonal shift starts later, so the experiment shows both how the cluster behaves unaided and whether the documented recovery action works.
+The failure comes first, as in a real event. The pods are deleted only after the zonal shift has taken effect, so their replacements are placed in the surviving AZs and stay there.
 
 ### What each mechanism covers
 
@@ -249,35 +249,39 @@ This is realistic production behavior: after an AZ recovers, workloads drift fro
 
 ## How It Works
 
-The experiment starts the SSM automation, the capacity faults and a wait together. The network disruption starts after the client delay, and the zonal shift starts after the detection time. Both end at the same time as the network disruption.
+The network disruption and the capacity faults start with the experiment. After the detection delay, the zonal shift and the SSM automation start together. The shift, the network disruption and the capacity faults end at the same time.
 
 ### Experiment Flow
 
 ```text
-t=0       FIS starts together:
-            - cordon-and-exclude-az  (SSM automation)
-            - insufficient-capacity-in-az, insufficient-capacity-in-az-node-groups (20 min)
-            - wait-for-client (5 min), wait-for-recovery-action (8 min)
+t=0       disrupt-az-network (15 min): all traffic in the AZ's subnets is denied
+          insufficient-capacity-in-az, insufficient-capacity-in-az-node-groups (15 min)
+          wait-for-recovery-action (1 min)
 
-SSM automation (client delay):
-t=0       ValidateInputs, CreateSecurityGroup, AuthorizeEKSAccess
-t=~0.5m   LaunchClientInstance, WaitForSSMAgent, BootstrapClient
-t=~3m     ValidateEKSAccess (read-only preflight)
+t=1m      wait-for-recovery-action ends, and together:
+            - shift-away-from-az (14 min): within about a minute, Auto Mode
+              stops launching in the AZ for every NodePool and cordons the
+              AZ's nodes
+            - cordon-and-exclude-az (SSM automation) starts
+
+SSM automation:
+t=1m      ValidateInputs, CreateSecurityGroup, AuthorizeEKSAccess
+t=~1.5m   LaunchClientInstance, WaitForSSMAgent, BootstrapClient
+t=~4m     ValidateEKSAccess (read-only preflight)
 t=~4m     SnapshotAndImpair: record the original state, cordon the AZ's nodes,
           patch the custom NodePool (exclude the AZ, raise the weight),
-          delete the pods on those nodes. Kubernetes reschedules them into
-          the healthy AZs.
+          delete the pods on those nodes. The shift has applied, so their
+          replacements go to the surviving AZs.
 
-t=5m      wait-for-client ends   -> disrupt-az-network starts (15 min):
-                                    all traffic in the AZ's subnets is denied
-t=8m      wait-for-recovery-action ends -> shift-away-from-az starts (12 min):
-                                    Auto Mode stops launching in the AZ for
-                                    every NodePool and cordons the AZ's nodes
-t=20m     network disruption, zonal shift and capacity faults end together
-t=~24m    SSM WaitForDuration ends -> RestoreNodePool, CleanupResources
+t=15m     network disruption, zonal shift and capacity faults end together
+t=~18m    SSM WaitForDuration ends -> RestoreNodePool, CleanupResources
 ```
 
-**Why the Kubernetes changes come before the network disruption:** the client needs to reach the API server, and the network disruption also affects the API server's network interface in the target AZ. Making the Kubernetes changes first means they complete while the API is still reachable. The delay between the changes and the outage is the `wait-for-client` duration. A real outage starts with the network failing and the response follows, so this ordering is a simplification. The zonal shift, the step an operator takes in a real event, starts later and measures whether the documented recovery action works.
+**Why the pods are deleted after the zonal shift starts:** EKS applies a zonal shift by polling, so it takes up to about a minute to take effect. In testing, Auto Mode still launched nodes in the target AZ for pods that appeared up to 52 seconds after the shift started. Starting the automation with the shift means its client setup (about three minutes) passes before any pod is deleted. The replacement pods are then placed in the surviving AZs, and none of them is given a new node in the impaired AZ. If pods were deleted before the shift applied, a replacement with no zone constraint could get a new node in the impaired AZ from a launch request that lists several AZs, which the capacity fault does not block.
+
+**Why the automation deletes pods at all:** the network disruption allows traffic within the subnet, so nodes in the target AZ can still reach the API server's network interface in the same subnet. They may stay `Ready`, and Kubernetes would then not evict their pods on its own. The automation deletes them to simulate the sudden loss of the AZ's workloads.
+
+**Kubernetes calls during the outage:** the automation now makes its Kubernetes changes while the network is disrupted. The private endpoint also resolves to the API server's network interface in the target AZ, and connections to that address time out. The client retries failed connections against the other addresses, so the changes complete. In testing, the impair step finished normally during the outage.
 
 **Why pods are deleted only after the NodePool is patched:** cordoning marks the existing nodes in the AZ unschedulable and the NodePool patch stops the custom NodePool launching there. Only then are pods deleted, so Kubernetes has no placement option left in the impaired AZ. The cordon, patch and delete run as one program on the in-VPC instance, so the ordering holds within a single process.
 
@@ -285,13 +289,12 @@ t=~24m    SSM WaitForDuration ends -> RestoreNodePool, CleanupResources
 
 | Action | Action ID | Description | Starts |
 |--------|-----------|-------------|--------|
-| `cordon-and-exclude-az` | `aws:ssm:start-automation-execution` | Launches an in-VPC client, validates access, snapshots and impairs the Kubernetes side, waits, restores and cleans up | t=0 |
+| `disrupt-az-network` | `aws:network:disrupt-connectivity` | Denies all traffic on the target AZ's subnets with network ACLs | t=0 |
 | `insufficient-capacity-in-az` | `aws:ec2:api-insufficient-instance-capacity-error` | Fails EC2 launches in the target AZ made by the roles in the `node-launch-roles` target | t=0 |
 | `insufficient-capacity-in-az-node-groups` | `aws:ec2:asg-insufficient-instance-capacity-error` | Fails launches in the target AZ for the managed node group Auto Scaling groups | t=0 |
-| `wait-for-client` | `aws:fis:wait` | Gives the automation time to make the Kubernetes changes while the API is reachable | t=0 |
-| `disrupt-az-network` | `aws:network:disrupt-connectivity` | Denies all traffic on the target AZ's subnets with network ACLs | after `wait-for-client` |
-| `wait-for-recovery-action` | `aws:fis:wait` | The time the cluster runs unaided before the operator recovery action | t=0 |
+| `wait-for-recovery-action` | `aws:fis:wait` | Detection time before the operator recovery action | t=0 |
 | `shift-away-from-az` | `aws:arc:start-zonal-autoshift` | Starts a zonal shift for the cluster away from the target AZ. FIS renews it every minute while the action runs and cancels it when the action ends or the experiment is stopped | after `wait-for-recovery-action` |
+| `cordon-and-exclude-az` | `aws:ssm:start-automation-execution` | Launches an in-VPC client, validates access, snapshots and impairs the Kubernetes side, waits, restores and cleans up | after `wait-for-recovery-action` |
 
 ### SSM Automation Document
 
@@ -393,15 +396,14 @@ The `ClusterSecurityGroupId` document parameter is empty by default, which uses 
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `wait-for-client` | `PT5M` | Delay before the network disruption. It must be longer than the time `SnapshotAndImpair` needs (client launch, bootstrap, preflight and impair). Check the step finished before the network disruption began, and raise the delay if it did not |
 | `disrupt-az-network` `duration` | `PT15M` | Length of the network disruption |
-| `wait-for-recovery-action` | `PT8M` | Time from the start of the experiment to the start of the zonal shift: `wait-for-client` plus the detection time you want to test |
-| `shift-away-from-az` `duration` | `PT12M` | Network `duration` minus the detection time, so the shift ends with the network disruption |
-| Capacity actions `duration` | `PT20M` | `wait-for-client` plus the network `duration` |
-| SSM `Duration` | `PT20M` | `wait-for-client` plus the network `duration`, so restore runs after the network returns |
-| SSM action `maxDuration` | `PT35M` | `Duration` plus 15 minutes for setup, restore and cleanup |
+| Capacity actions `duration` | `PT15M` | The network `duration` |
+| `wait-for-recovery-action` | `PT1M` | Detection time before the zonal shift and the automation start |
+| `shift-away-from-az` `duration` | `PT14M` | Network `duration` minus the detection time, so the shift ends with the network disruption |
+| SSM `Duration` | `PT14M` | The shift `duration`. The automation impairs about three minutes after it starts, so restore runs about three minutes after the network returns |
+| SSM action `maxDuration` | `PT30M` | `Duration` plus 15 minutes for setup, restore and cleanup |
 
-With the defaults the network is down from t=5 minutes to t=20 minutes and the zonal shift runs from t=8 minutes to t=20 minutes.
+With the defaults the network is down from t=0 to t=15 minutes, the zonal shift runs from t=1 to t=15 minutes, and pods are deleted at about t=4 minutes. You can raise `wait-for-recovery-action` to test a longer detection time; the pods are still deleted only after the shift starts. Keep the shift, capacity fault and network durations ending together, and keep SSM `Duration` long enough for restore to run after the network returns.
 
 ### Optional hardening
 
@@ -419,7 +421,7 @@ This means **all non-system pods on nodes in the target AZ are deleted**, across
 
 ## Stop Conditions
 
-The experiment does not include stop conditions by default. It will continue until all actions complete (approximately 25 minutes with the default timing).
+The experiment does not include stop conditions by default. It will continue until all actions complete (approximately 19 minutes with the default timing).
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or 
 business metric requiring an immediate end of the fault injection. This 
@@ -460,6 +462,7 @@ After the experiment completes:
 5. **Nodes**: `RestoreNodePool` uncordons only the nodes this run cordoned. It does not touch a node that was already cordoned when the run started, or a node that was replaced or no longer exists. The end of the zonal shift does uncordon a node an operator cordoned before the run; see [What the zonal shift changes](#what-the-zonal-shift-changes).
 6. **Temporary resources**: the cluster security group rule, the client instance and its security group are removed, and the step fails if any remains.
 7. **Pods**: behavior depends on your workload configuration, described in [Cluster configuration determines the outcome](#cluster-configuration-determines-the-outcome):
+   - The pods deleted from the target AZ are not recreated there. Their replacements run in the surviving AZs, and Kubernetes does not move a running pod back when the AZ recovers. The exception is a pod that can only run in the target AZ (a zone node selector, or an EBS volume in that AZ): it stays `Pending` during the test and starts in the AZ once it recovers. A later rollout restart or an Auto Mode consolidation can also reschedule pods into any AZ.
    - With `ScheduleAnyway`, pods that failed over stay in the surviving AZs. The spread is a preference, so a running pod is never moved to satisfy it.
    - With `DoNotSchedule` (2 AZs), pods left `Pending` schedule into the restored AZ as soon as the NodePool is restored and Auto Mode provisions a node there.
    - With `DoNotSchedule` (3 AZs), pods already rescheduled into the surviving AZs stay in their 0/3/3 distribution, because topology spread constraints are evaluated only at scheduling time.
@@ -495,7 +498,7 @@ As you adapt this scenario to your needs, we recommend:
 3. Creating an Amazon CloudWatch metric and Amazon CloudWatch alarm to monitor the impact of the AZ impairment, and an alarm on the SSM automation execution failing.
 4. Adding a stop condition tied to the alarm to halt the experiment if critical thresholds are breached.
 5. Checking that every component that launches your nodes (managed node groups, self-managed Karpenter) is a target of the capacity faults.
-6. Setting `wait-for-recovery-action` to the detection time you want to test, and checking that `SnapshotAndImpair` finishes before `wait-for-client` ends.
+6. Setting `wait-for-recovery-action` to the detection time you want to test, and adjusting the shift and SSM durations to match.
 7. Narrowing the blast radius if needed. By default the automation deletes all non-system pods on nodes in the target AZ, across every namespace. Add a namespace or label filter in the pod-deletion logic of `SnapshotAndImpair`.
 8. **Testing in a non-production environment first** to validate automation behavior and timing.
 9. Documenting expected versus actual behavior to build an AZ failure runbook.
