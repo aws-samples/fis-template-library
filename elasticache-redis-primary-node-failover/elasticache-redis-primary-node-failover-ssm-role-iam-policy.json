@@ -7,10 +7,25 @@
       "Action": [
         "elasticache:DescribeReplicationGroups",
         "elasticache:DescribeCacheClusters",
-        "elasticache:DescribeEvents",
-        "elasticache:ListTagsForResource"
+        "elasticache:DescribeEvents"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AllowFindTaggedReplicationGroups",
+      "Effect": "Allow",
+      "Action": [
+        "tag:GetResources"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowReadOwnAutomationExecution",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetAutomationExecution"
+      ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
     },
     {
       "Sid": "AllowTestFailoverOnTaggedReplicationGroups",
@@ -22,6 +37,10 @@
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/FIS-Ready": "True"
+        },
+        "BoolIfExists": {
+          "elasticache:ClusterModeEnabled": "false",
+          "elasticache:MultiAZEnabled": "true"
         }
       }
     }

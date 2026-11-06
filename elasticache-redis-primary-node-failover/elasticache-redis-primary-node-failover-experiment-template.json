@@ -1,12 +1,12 @@
 {
-  "description": "Force ElastiCache Redis primary node failover to test automatic failover mechanisms",
+  "description": "Fail over the primary node of every ElastiCache (Redis OSS) replication group, cluster mode disabled, tagged FIS-Ready=True, and wait until the former primary has recovered as a replica",
   "targets": {},
   "actions": {
     "triggerPrimaryFailover": {
       "actionId": "aws:ssm:start-automation-execution",
-      "description": "Force Redis primary node failover and monitor completion",
+      "description": "Run the SSM Automation document that calls TestFailover on each tagged replication group and waits for the failover and the former primary's recovery",
       "parameters": {
-        "maxDuration": "PT30M",
+        "maxDuration": "PT35M",
         "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/ElastiCache-Redis-Primary-Node-Failover",
         "documentParameters": "{\"AutomationAssumeRole\": \"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>\", \"tagKey\": \"FIS-Ready\", \"tagValue\": \"True\"}"
       },
@@ -25,6 +25,6 @@
   },
   "experimentOptions": {
     "accountTargeting": "single-account",
-    "emptyTargetResolutionMode": "skip"
+    "emptyTargetResolutionMode": "fail"
   }
 }
