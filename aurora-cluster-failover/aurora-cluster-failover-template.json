@@ -1,5 +1,5 @@
 {
-        "description": "aurora-cluster-failover",
+        "description": "Fail over every Aurora DB cluster tagged FIS-Ready=True to one of its reader instances",
         "targets": {
                 "Clusters-Target-1": {
                         "resourceType": "aws:rds:cluster",
@@ -25,7 +25,9 @@
                 }
         ],
         "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
-        "tags": {},
+        "tags": {
+                "Name": "AuroraClusterFailover"
+        },
         "experimentOptions": {
                 "accountTargeting": "single-account",
                 "emptyTargetResolutionMode": "fail"

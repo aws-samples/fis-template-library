@@ -8,13 +8,20 @@
                 "rds:DescribeDBClusters"
             ],
             "Resource": [
-                "arn:aws:rds:*:*:cluster:*"
+                "arn:aws:rds:<YOUR REGION>:<YOUR AWS ACCOUNT>:cluster:*"
             ],
             "Condition": {
                 "StringEquals": {
                     "aws:ResourceTag/FIS-Ready": "True"
                 }
             }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "tag:GetResources"
+            ],
+            "Resource": "*"
         },
         {
             "Effect": "Allow",
