@@ -138,7 +138,7 @@ The automation checks the path itself before it changes anything: the `ValidateE
 - A **connection timeout** at `ValidateEKSAccess` means packets from the client subnet never reached the API server. Check that private endpoint access is enabled, that `SubnetId` can route to it, and that the cluster security group accepts the temporary tcp/443 rule (`ClusterSecurityGroupId`).
 - A `403` means the network path works but the **instance profile role** lacks Kubernetes access. Fix its EKS access entry, or the subject in `eks-automode-az-impairment-rbac.yaml`.
 - If `WaitForSSMAgent` times out, the instance could not reach the SSM service endpoints. Add a NAT path or the `ssm`, `ssmmessages` and `ec2messages` interface VPC endpoints to `SubnetId`.
-- The network disruption is not the cause of an API timeout, provided `SubnetId` is in a surviving AZ.
+- The automation runs while the network disruption is active. Connections to the API server's network interface in the target AZ time out, and the client retries them against the other addresses. A timeout that persists across all retries is not caused by the disruption, provided `SubnetId` is in a surviving AZ. To validate the path on its own, run the SSM automation directly, without the FIS experiment.
 
 **Check the cluster's endpoint access mode:**
 
