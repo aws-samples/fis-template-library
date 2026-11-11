@@ -147,10 +147,14 @@ mainSteps:
                 networkConfiguration={'awsvpcConfiguration': new_network_config}
             )
 
+            deployments = response['service'].get('deployments', [])
+            primary = next((d for d in deployments if d.get('status') == 'PRIMARY'), None)
+
             return json.dumps({
                 'Status': 'SUBNET_REMOVED',
                 'ServiceArn': response['service']['serviceArn'],
-                'RemainingSubnets': new_network_config['subnets']
+                'RemainingSubnets': new_network_config['subnets'],
+                'NewDeploymentId': primary['id'] if primary else None
             })
       InputPayload:
         ClusterName: '{{ ClusterName }}'
@@ -179,32 +183,44 @@ mainSteps:
             ecs_client = boto3.client('ecs')
             cluster_name = events['ClusterName']
             service_name = events['ServiceName']
+            new_deployment_id = json.loads(events['RemoveResult']).get('NewDeploymentId')
+            if new_deployment_id is None:
+                raise RuntimeError('could not determine the evacuation deployment id from the service update response; aborting so the subnet is restored')
 
-            max_wait_time = 600
+            max_wait_time = 540  # stay under the aws:executeScript 600 second platform cap
             check_interval = 15
-            elapsed_time = 0
+            start_time = time.monotonic()
 
-            while elapsed_time < max_wait_time:
+            while time.monotonic() - start_time < max_wait_time:
                 response = ecs_client.describe_services(cluster=cluster_name, services=[service_name])
                 service = response['services'][0]
                 deployments = service['deployments']
+                primary = next((d for d in deployments if d.get('status') == 'PRIMARY'), None)
 
-                all_stable = all(
-                    deployment['status'] in ['PRIMARY', 'ACTIVE'] and
-                    deployment['runningCount'] == deployment['desiredCount']
-                    for deployment in deployments
+                # Removing the subnet starts a new ECS deployment. Wait for THAT
+                # deployment to finish rolling out and all older deployments to
+                # drain, rather than returning on the pre-update deployment that
+                # is still momentarily reported as stable.
+                converged = (
+                    primary is not None
+                    and primary.get('id') == new_deployment_id
+                    and len(deployments) == 1
+                    and primary['runningCount'] == primary['desiredCount']
+                    and primary.get('rolloutState', 'COMPLETED') == 'COMPLETED'
                 )
 
-                if all_stable:
-                    return json.dumps({'Status': 'STABLE', 'ElapsedTime': elapsed_time})
+                if converged:
+                    return json.dumps({'Status': 'STABLE',
+                                       'ElapsedTime': round(time.monotonic() - start_time),
+                                       'DeploymentId': primary.get('id')})
 
                 time.sleep(check_interval)
-                elapsed_time += check_interval
 
-            raise RuntimeError(f'Service did not reach stable state within {max_wait_time} seconds')
+            raise RuntimeError(f'Service did not reach a stable evacuated state within {max_wait_time} seconds')
       InputPayload:
         ClusterName: '{{ ClusterName }}'
         ServiceName: '{{ ServiceName }}'
+        RemoveResult: '{{ RemoveSubnetFromService.RemoveResult }}'
     outputs:
       - Name: StabilityResult
         Selector: $.Payload

@@ -37,8 +37,9 @@ Before running this experiment, ensure that:
 5. Your ECS Fargate service is configured with multiple subnets across at least 2 different Availability Zones (minimum 2 subnets required — the automation cannot remove the last subnet).
 6. The SSM automation document (`ecs-fargate-az-evacuation-subnet-automation`) has been deployed to your account.
 7. Your service has sufficient capacity in remaining AZs to absorb the full-service redeploy, not just the tasks from the impaired AZ, during the ~30-minute worst-case experiment duration (see Actions Detail below for the timing breakdown).
-8. **Task definition requirements for `inject-network-packet-loss`**: see the [`ecs-fargate-az-impairment` prerequisites](../ecs-fargate-az-impairment/README.md#prerequisites) for the SSM sidecar, task role, and managed-instance role setup — identical requirements apply here.
-9. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
+8. A full redeploy of your service finishes well within 9 minutes. The SSM automation waits at most 9 minutes for the redeploy that the subnet removal starts. If the redeploy takes longer, the automation restores the subnet and the experiment fails (see the note under SSM Automation Document).
+9. **Task definition requirements for `inject-network-packet-loss`**: see the [`ecs-fargate-az-impairment` prerequisites](../ecs-fargate-az-impairment/README.md#prerequisites) for the SSM sidecar, task role, and managed-instance role setup — identical requirements apply here.
+10. You have updated all placeholder values (`<YOUR ...>`) in the experiment template with your actual resource identifiers.
 
 ## How It Works
 
@@ -78,8 +79,8 @@ T+5m                      ▼
         SLO alarms?
                           │
 T+20m                     ▼  Packet loss and connectivity disruption end
-T+~5m to T+~15m           ▼  Automation waits for service stability after
-                             subnet removal (up to 10 minutes)
+T+~5m to T+~15m           ▼  Automation waits for the redeploy started by
+                             the subnet removal to finish (up to 9 minutes)
 T+~15m to T+~30m          ▼  Evacuation hold: subnet stays removed for the
                              configured duration (default 15 minutes)
 T+~30m                    ▼  Evacuation window ends, SSM automation restores
@@ -88,11 +89,16 @@ T+~30m                    ▼  Evacuation window ends, SSM automation restores
 ```
 
 Worst case, `evacuate-subnet-in-az` alone can take up to ~25 minutes from
-T+5m (10 min stability wait + 15 min evacuation hold), i.e. up to **T+~30m**
+T+5m (9 min redeploy wait + 15 min evacuation hold + under a minute for the
+other steps), i.e. up to **T+~30m**
 for full completion — which is why the action's `maxDuration` is set to 40
 minutes with headroom. The fault-injection actions (`disrupt-az-connectivity`,
 `inject-network-packet-loss`) end independently at T+20m regardless of how
-long the evacuation automation takes.
+long the evacuation automation takes, unless the automation fails first. The
+evacuation hold starts only when the automation's redeploy wait ends, so the
+subnet stays removed after T+20m for about as long as that wait took. In our
+two completed test runs of this version of the automation, the subnet was
+restored about 3 minutes 40 seconds after the faults ended.
 
 ### Actions Detail
 
@@ -103,7 +109,7 @@ long the evacuation automation takes.
 | `wait-before-stop` | `aws:fis:wait` | Delay to let the fault take effect before hard stop | T+0 | 1 minute |
 | `stop-tasks-in-az` | `aws:ecs:stop-task` | Stops all ECS Fargate tasks running in the target AZ | T+1m | Immediate |
 | `wait-for-detection` | `aws:fis:wait` | Simulated detection/decision delay before evacuation begins | T+1m | 4 minutes (default — tune to your SLA) |
-| `evacuate-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes the subnet at T+5m, forcing evacuation; restores it after the evacuation window. Handles cleanup on cancel/failure. | T+5m | Up to ~25 min (10 min stability wait + 15 min evacuation hold); `maxDuration` 40 min |
+| `evacuate-subnet-in-az` | `aws:ssm:start-automation-execution` | Removes the subnet at T+5m, forcing evacuation; restores it after the evacuation window. Handles cleanup on cancel/failure. | T+5m | Up to ~25 min (9 min redeploy wait + 15 min evacuation hold + under a minute for the other steps); `maxDuration` 40 min |
 
 ### SSM Automation Document
 
@@ -113,11 +119,38 @@ The experiment uses a single SSM Automation document (`ecs-fargate-az-evacuation
 2. Retrieves current ECS service network configuration
 3. Validates the subnet exists and is not the last one in the configuration
 4. **Removes the subnet** from the ECS service network configuration — this is the evacuation trigger
-5. Waits for service stability (up to 10 minutes) — this is where the full-service redeploy plays out
+5. Waits for the full-service redeploy that the subnet removal starts to finish: that deployment must be the service's only deployment, with all its tasks running and its rollout completed. If this has not happened after 9 minutes, or the step cannot identify that deployment, the step fails and the subnet is restored.
 6. **Waits for the evacuation duration** (configurable, default 15 minutes)
 7. **Restores the subnet** to the ECS service configuration
 
 Steps 4–6 have `onFailure` and `onCancel` routing to the restore step, ensuring the subnet is always restored even if the experiment is cancelled or encounters an error. The restore step is self-contained and idempotent — it re-discovers the current service configuration and skips the update if the subnet is already present.
+
+> **The 9-minute redeploy limit.** An `aws:executeScript` step can run for at
+> most 10 minutes ([aws:executeScript](https://docs.aws.amazon.com/systems-manager/latest/userguide/automation-action-executeScript.html)),
+> so step 5 stops waiting after 9 minutes (540 seconds). The automation then
+> restores the subnet and ends as failed. FIS fails the experiment and stops
+> the network disruption and packet loss early. In our test of this case, with
+> a redeploy that could not finish, the experiment ended about 15 minutes after
+> it started, with the subnet restored and no FIS network ACL left behind. ECS
+> was still deploying the service when the experiment ended, so let that
+> deployment finish before you run the experiment again.
+>
+> In our two completed test runs of this version of the automation, with three
+> tasks and no load balancer, step 5 took about 3 minutes 20 seconds. A service
+> behind a load balancer takes longer: new tasks must pass the target group's
+> health checks
+> (see [Optimize load balancer health check parameters for Amazon ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/load-balancer-healthcheck.html)),
+> and ECS waits for each old task's target to drain before it stops the task,
+> which can take the target group's full deregistration delay (300 seconds by
+> default, see [Optimize load balancer connection draining parameters for Amazon ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/load-balancer-connection-draining.html)).
+> Before you run the experiment, time a forced new deployment of your service
+> (`aws ecs update-service --cluster <cluster> --service <service> --force-new-deployment`),
+> which replaces every task as the evacuation does. Stop the clock when
+> `aws ecs describe-services` shows a single deployment whose `rolloutState` is
+> `COMPLETED` and whose `runningCount` equals its `desiredCount`, which is what
+> step 5 waits for. If that comes close to 9 minutes, shorten the
+> deregistration delay where your requests allow it, or expect the experiment
+> to end early with the subnet restored.
 
 ## Targets
 
@@ -170,7 +203,7 @@ Before running the experiment, update these placeholder values:
 
 ## Stop Conditions
 
-The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 30 minutes total in the worst case — see the Experiment Flow timing breakdown above; `evacuate-subnet-in-az`'s `maxDuration` of 40 minutes provides headroom above this).
+The experiment does not have any specific stop conditions defined by default. It will continue to run until manually stopped or until all actions complete successfully (approximately 30 minutes total in the worst case — see the Experiment Flow timing breakdown above; `evacuate-subnet-in-az`'s `maxDuration` of 40 minutes provides headroom above this). If the redeploy does not finish within 9 minutes, the experiment ends early as failed, with the subnet restored (see the note under SSM Automation Document).
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
