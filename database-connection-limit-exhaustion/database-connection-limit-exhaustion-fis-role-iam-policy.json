@@ -19,7 +19,7 @@
             "Sid": "AllowPassRoleToSSM",
             "Effect": "Allow",
             "Action": "iam:PassRole",
-            "Resource": "arn:aws:iam::*:role/ConnectionLimitExhaustion-SSM-Automation-Role",
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/ConnectionLimitExhaustion-SSM-Automation-Role",
             "Condition": {
                 "StringEquals": {
                     "iam:PassedToService": "ssm.amazonaws.com"
