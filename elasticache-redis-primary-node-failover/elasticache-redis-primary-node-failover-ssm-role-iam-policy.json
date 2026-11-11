@@ -2,20 +2,47 @@
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowElastiCacheDiscoveryAndMonitoring",
       "Effect": "Allow",
       "Action": [
         "elasticache:DescribeReplicationGroups",
-        "elasticache:ListTagsForResource",
-        "elasticache:ModifyReplicationGroup"
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeEvents"
       ],
       "Resource": "*"
     },
     {
+      "Sid": "AllowFindTaggedReplicationGroups",
       "Effect": "Allow",
       "Action": [
-        "sts:GetCallerIdentity"
+        "tag:GetResources"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "AllowReadOwnAutomationExecution",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetAutomationExecution"
+      ],
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+    },
+    {
+      "Sid": "AllowTestFailoverOnTaggedReplicationGroups",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:TestFailover"
+      ],
+      "Resource": "arn:aws:elasticache:<YOUR REGION>:<YOUR AWS ACCOUNT>:replicationgroup:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        },
+        "BoolIfExists": {
+          "elasticache:ClusterModeEnabled": "false",
+          "elasticache:MultiAZEnabled": "true"
+        }
+      }
     }
   ]
 }
