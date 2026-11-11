@@ -1,5 +1,5 @@
 {
-  "description": "Aurora cluster CPU overload and failover experiment",
+  "description": "Run a database load test on an Aurora PostgreSQL cluster, then fail over the cluster while the load runs",
   "targets": {
     "AuroraCluster": {
       "resourceType": "aws:rds:cluster",
@@ -51,14 +51,18 @@
       "source": "none"
     }
   ],
-  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/FISExperimentRole",
+  "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
   "tags": {
     "Name": "Aurora-Cluster-CPU-Overload-Failover"
   },
   "logConfiguration": {
     "logSchemaVersion": 2,
     "cloudWatchLogsConfiguration": {
-      "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:FISExperimentLogs"
+      "logGroupArn": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:FISExperimentLogs:*"
     }
+  },
+  "experimentOptions": {
+    "accountTargeting": "single-account",
+    "emptyTargetResolutionMode": "fail"
   }
 }

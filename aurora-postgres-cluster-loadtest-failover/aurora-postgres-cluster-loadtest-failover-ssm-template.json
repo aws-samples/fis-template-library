@@ -5,7 +5,7 @@
     "DBHost": {
       "type": "String",
       "description": "Database host endpoint",
-      "default": "{{resolve:ssm:/aurora-cluster/endpoint}}"
+      "default": "{{ssm:/aurora-cluster/endpoint}}"
     },
     "DBPort": {
       "type": "String",
@@ -25,7 +25,7 @@
     "DBPassword": {
       "type": "String",
       "description": "Database password",
-      "default": "{{resolve:secretsmanager:aurora-cluster-password:SecretString:password}}"
+      "default": ""
     },
     "NumRecords": {
       "type": "String",
@@ -85,6 +85,9 @@
           "DB_NAME=\"{{ DBName }}\"",
           "DB_USER=\"{{ DBUser }}\"",
           "DB_PASSWORD=\"{{ DBPassword }}\"",
+          "if [ -z \"$DB_PASSWORD\" ]; then",
+          "  DB_PASSWORD=$(aws secretsmanager get-secret-value --region \"$AWS_SSM_REGION_NAME\" --secret-id aurora-cluster-password --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"password\"])')",
+          "fi",
           "NUM_RECORDS=\"{{ NumRecords }}\"",
           "CONCURRENCY=\"{{ Concurrency }}\"",
           "DURATION=\"{{ Duration }}\"",
