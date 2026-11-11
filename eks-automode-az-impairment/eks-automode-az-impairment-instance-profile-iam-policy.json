@@ -21,6 +21,26 @@
       "Effect": "Allow",
       "Action": "ec2:DescribeSubnets",
       "Resource": "*"
+    },
+    {
+      "Sid": "RunCommandOutputToCloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:DescribeLogStreams",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/ssm/AWS-RunShellScript",
+        "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:/aws/ssm/AWS-RunShellScript:*"
+      ]
+    },
+    {
+      "Sid": "RunCommandOutputDescribeLogGroups",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "arn:aws:logs:<YOUR REGION>:<YOUR AWS ACCOUNT>:log-group:*"
     }
   ]
 }
