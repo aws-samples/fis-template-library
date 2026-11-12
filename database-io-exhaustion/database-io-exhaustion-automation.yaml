@@ -15,35 +15,42 @@ parameters:
 
   DatabaseEndpoint:
     type: String
+    allowedPattern: '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'
     description: 'Database endpoint hostname'
 
   DatabasePort:
     type: String
+    allowedPattern: '^[0-9]{1,5}$'
     description: 'Database port number'
     default: '5432'
 
   DatabaseName:
     type: String
+    allowedPattern: '^[A-Za-z0-9_.-]{1,128}$'
     description: 'Database name to connect to (postgres: postgres, mysql: mysql, sqlserver: master, oracle: ORCL)'
     default: 'postgres'
 
   DatabaseUser:
     type: String
+    allowedPattern: '^[A-Za-z0-9_.@-]{1,128}$'
     description: 'Database username'
     default: 'postgres'
 
   DatabasePasswordSecretArn:
     type: String
+    allowedPattern: '^arn:aws(-[a-z]+)*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@!-]+$'
     description: 'ARN of Secrets Manager secret containing database password. Retrieved on the EC2 load generator using its instance profile role - see database-io-exhaustion-ec2-instance-role-iam-policy.json'
 
   WorkerThreads:
     type: String
-    description: 'Number of concurrent worker threads generating I/O load'
+    allowedPattern: '^[1-9][0-9]{0,2}$'
+    description: 'Number of concurrent worker threads generating I/O load (1-999). Each opens one database connection.'
     default: '50'
 
   ExperimentDuration:
     type: String
-    description: 'Total experiment duration in ISO8601 format (e.g., PT10M for 10 minutes, PT1H for 1 hour)'
+    allowedPattern: '^PT([0-9]+H)?([0-9]+M)?([0-9]+S)?$'
+    description: 'Duration of the timed I/O phase in ISO8601 format, from PT1S to PT110M (e.g., PT10M for 10 minutes, PT1H for 1 hour). The load script refuses longer values before it starts any load.'
     default: 'PT10M'
 
   IOPattern:
@@ -57,28 +64,34 @@ parameters:
 
   SeedRowCount:
     type: String
+    allowedPattern: '^[0-9]{1,6}$'
     description: 'Rows seeded into each worker table before the timed I/O phase begins, so read and mixed patterns have data to scan/update instead of querying an empty table'
     default: '500'
 
   MinActiveWorkerPercentage:
     type: String
+    allowedPattern: '^(100|[0-9]{1,2})$'
     description: 'Minimum percentage of worker threads that must successfully record I/O operations for the experiment to be considered a successful fault injection. If this threshold is not met, ExhaustDatabaseIO fails and the automation exits non-zero.'
     default: '50'
 
   SubnetId:
     type: String
+    allowedPattern: '^subnet-[0-9a-f]{8,17}$'
     description: 'Subnet ID for load generator instance. Must route to the database, and to SSM/SSM Messages, Secrets Manager, and package repository endpoints - see README Prerequisites'
 
   VpcId:
     type: String
+    allowedPattern: '^vpc-[0-9a-f]{8,17}$'
     description: 'VPC ID where the load generator will be launched'
 
   DatabaseSecurityGroupId:
     type: String
+    allowedPattern: '^sg-[0-9a-f]{8,17}$'
     description: 'Security group ID of the target database (automation will add a temporary ingress rule). Must be tagged FIS-Ready=True'
 
   InstanceType:
     type: String
+    allowedPattern: '^[a-z0-9-]+\.[a-z0-9]+$'
     description: 'EC2 instance type (use t3.medium or larger for high thread counts)'
     default: 't3.medium'
 
@@ -90,8 +103,10 @@ parameters:
 mainSteps:
   - name: CreateSecurityGroup
     action: 'aws:executeAwsApi'
-    onFailure: 'Abort'
-    onCancel: 'Abort'
+    timeoutSeconds: 60
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
     inputs:
       Service: ec2
       Api: CreateSecurityGroup
@@ -116,8 +131,10 @@ mainSteps:
 
   - name: ConfigureSecurityGroupEgress
     action: 'aws:executeScript'
-    onFailure: 'step:CleanupSecurityGroup'
-    onCancel: 'step:CleanupSecurityGroup'
+    timeoutSeconds: 60
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
     inputs:
       Runtime: python3.11
       Handler: configure_egress
@@ -132,10 +149,7 @@ mainSteps:
             database_sg_id = events['DatabaseSecurityGroupId']
             port = int(events['DatabasePort'])
 
-            # A newly created VPC security group starts with an allow-all outbound
-            # rule. Remove it so the load generator's egress is limited to the
-            # database port plus the HTTPS traffic it needs for SSM and package
-            # installation, rather than unrestricted outbound access.
+            # Replace the new group's allow-all egress with the database port and HTTPS only.
             try:
                 ec2.revoke_security_group_egress(
                     GroupId=security_group_id,
@@ -182,8 +196,10 @@ mainSteps:
 
   - name: AuthorizeInboundFromLoadGenerator
     action: 'aws:executeScript'
-    onFailure: 'step:RevokeInboundFromLoadGenerator'
-    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    timeoutSeconds: 60
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
     inputs:
       Runtime: python3.11
       Handler: authorize_ingress
@@ -218,13 +234,20 @@ mainSteps:
 
   - name: LaunchLoadGenerator
     action: 'aws:runInstances'
-    onFailure: 'step:RevokeInboundFromLoadGenerator'
-    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    timeoutSeconds: 300
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
     inputs:
       ImageId: '{{ LatestAmiId }}'
       InstanceType: '{{ InstanceType }}'
       MinInstanceCount: 1
       MaxInstanceCount: 1
+      # Cleanup finds the instance by this token, which only the launch call can set.
+      ClientToken: '{{ automation:EXECUTION_ID }}'
+      InstanceInitiatedShutdownBehavior: 'terminate'
+      # Expiry from first boot: '#!/bin/bash' then 'shutdown -h +200' (200 minutes, after maxDuration).
+      UserData: 'IyEvYmluL2Jhc2gKc2h1dGRvd24gLWggKzIwMAo='
       SubnetId: '{{ SubnetId }}'
       SecurityGroupIds:
         - '{{ CreateSecurityGroup.SecurityGroupId }}'
@@ -251,8 +274,9 @@ mainSteps:
   - name: WaitForSSMAgent
     action: 'aws:waitForAwsResourceProperty'
     timeoutSeconds: 300
-    onFailure: 'step:TerminateInstance'
-    onCancel: 'step:TerminateInstance'
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
     inputs:
       Service: ssm
       Api: DescribeInstanceInformation
@@ -266,701 +290,1084 @@ mainSteps:
 
   - name: InstallDatabaseClient
     action: 'aws:runCommand'
-    onFailure: 'step:TerminateInstance'
-    onCancel: 'step:TerminateInstance'
+    timeoutSeconds: 900
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
         - '{{ LaunchLoadGenerator.InstanceId }}'
-      TimeoutSeconds: 600
+      TimeoutSeconds: 120
       Parameters:
+        executionTimeout: '840'
         commands:
-          - |
-            #!/bin/bash
-            set -e
+        - |
+          #!/bin/bash
+          set -eo pipefail
 
-            ENGINE="{{ DatabaseEngine }}"
+          # Expiry again, in case the user data didn't run: the instance terminates itself in 200 minutes.
+          shutdown -h +200
 
-            echo "Installing database client for engine: $ENGINE"
+          ENGINE="{{ DatabaseEngine }}"
 
-            if [ "$ENGINE" = "postgres" ]; then
-                dnf install -y postgresql15 python3-pip
-                pip3 install psycopg2-binary
-                echo "PostgreSQL client installed"
+          echo "Installing database client for engine: $ENGINE"
 
-            elif [ "$ENGINE" = "mysql" ]; then
-                dnf install -y mariadb105 python3-pip
-                pip3 install mysql-connector-python
-                echo "MySQL client installed"
+          if [ "$ENGINE" = "postgres" ]; then
+              dnf install -y postgresql15 python3-pip
+              pip3 install psycopg2-binary
+              echo "PostgreSQL client installed"
 
-            elif [ "$ENGINE" = "sqlserver" ]; then
-                curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
-                ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
-                pip3 install pyodbc
-                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
-                source ~/.bashrc
-                echo "SQL Server tools installed"
+          elif [ "$ENGINE" = "mysql" ]; then
+              dnf install -y mariadb105 python3-pip
+              pip3 install mysql-connector-python
+              echo "MySQL client installed"
 
-            elif [ "$ENGINE" = "oracle" ]; then
-                dnf install -y python3-pip libaio
-                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm
-                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm
-                pip3 install oracledb
-                echo "Oracle Instant Client and oracledb installed"
-            else
-                echo "Unsupported database engine: $ENGINE"
-                exit 1
-            fi
+          elif [ "$ENGINE" = "sqlserver" ]; then
+              curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
+              ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
+              pip3 install pyodbc
+              echo "SQL Server tools installed"
 
-            # Install AWS CLI and boto3 for Secrets Manager access
-            dnf install -y aws-cli
-            pip3 install boto3
+          elif [ "$ENGINE" = "oracle" ]; then
+              dnf install -y python3-pip libaio
+              dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm
+              dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm
+              pip3 install oracledb
+              echo "Oracle Instant Client and oracledb installed"
+          else
+              echo "Unsupported database engine: $ENGINE"
+              exit 1
+          fi
 
-            echo "Installation complete"
+          dnf install -y aws-cli
+          pip3 install boto3
+
+          echo "Installation complete"
 
   - name: ExhaustDatabaseIO
     action: 'aws:runCommand'
+    # Duration <= 6,600 s plus a 300 s join grace fits executionTimeout 7,320 s, inside the step timeout.
+    timeoutSeconds: 7500
+    isCritical: true
     onFailure: 'step:CleanupTables'
-    onCancel: 'step:CleanupTables'
+    onCancel: 'step:StopLoadAndDropTablesOnCancel'
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
         - '{{ LaunchLoadGenerator.InstanceId }}'
-      TimeoutSeconds: 7200
+      TimeoutSeconds: 120
       Parameters:
+        executionTimeout: '7320'
         commands:
-          - |
-            #!/bin/bash
-            set -e
-
-            cat > /tmp/exhaust_io.py << 'PYTHON_EOF'
-            import re
-            import sys
-            import time
-            import json
-            import threading
-            import random
-            import string
-            import boto3
-            from datetime import datetime
-
-            def parse_iso8601_duration(duration):
-                seconds = 0
-                duration = duration.replace('PT', '')
-
-                if 'H' in duration:
-                    hours, duration = duration.split('H')
-                    seconds += int(hours) * 3600
-
-                if 'M' in duration:
-                    minutes, duration = duration.split('M')
-                    seconds += int(minutes) * 60
-
-                if 'S' in duration:
-                    secs = duration.replace('S', '')
-                    if secs:
-                        seconds += int(secs)
-
-                return seconds
-
-            def generate_random_data(size_bytes=1024):
-                return ''.join(random.choices(string.ascii_letters + string.digits, k=size_bytes))
-
-            def generate_seed_rows(seed_rows):
-                return [
-                    (generate_random_data(4096), bytes(random.getrandbits(8) for _ in range(8192)))
-                    for _ in range(seed_rows)
-                ]
-
-            def io_worker_postgres(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
-                import psycopg2
-                ops_count = 0
-                error_count = 0
-                conn = None
-                try:
-                    conn = psycopg2.connect(
-                        host=endpoint, port=port, database=dbname,
-                        user=user, password=password, connect_timeout=10
-                    )
-                    conn.autocommit = True
-                    cursor = conn.cursor()
-
-                    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id SERIAL PRIMARY KEY, data TEXT, padding BYTEA, created_at TIMESTAMP DEFAULT NOW())")
-                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", generate_seed_rows(seed_rows))
-
-                    try:
-                        while time.time() < end_time:
-                            try:
-                                if io_pattern in ('write', 'mixed'):
-                                    data = generate_random_data(4096)
-                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
-                                    ops_count += 1
-
-                                if io_pattern in ('read', 'mixed'):
-                                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY random() LIMIT 100")
-                                    cursor.fetchall()
-                                    cursor.execute(f"SELECT COUNT(*), pg_size_pretty(pg_total_relation_size('{table_name}')) FROM {table_name}")
-                                    cursor.fetchone()
-                                    ops_count += 1
-
-                                if io_pattern == 'mixed' and random.random() < 0.3:
-                                    data = generate_random_data(4096)
-                                    cursor.execute(f"UPDATE {table_name} SET data = %s WHERE id = (SELECT id FROM {table_name} ORDER BY random() LIMIT 1)", (data,))
-                                    ops_count += 1
-
-                            except Exception:
-                                error_count += 1
-                                time.sleep(0.1)
-                    finally:
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                        except Exception:
-                            pass
-                        cursor.close()
-
-                    return {'ops': ops_count, 'errors': error_count}
-
-                except Exception as e:
-                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return {'ops': ops_count, 'errors': error_count + 1}
-                finally:
-                    if conn:
-                        conn.close()
-
-            def io_worker_mysql(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
-                import mysql.connector
-                ops_count = 0
-                error_count = 0
-                conn = None
-                try:
-                    conn = mysql.connector.connect(
-                        host=endpoint, port=port, database=dbname,
-                        user=user, password=password, connection_timeout=10
-                    )
-                    conn.autocommit = True
-                    cursor = conn.cursor()
-
-                    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id INT AUTO_INCREMENT PRIMARY KEY, data TEXT, padding LONGBLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", generate_seed_rows(seed_rows))
-
-                    try:
-                        while time.time() < end_time:
-                            try:
-                                if io_pattern in ('write', 'mixed'):
-                                    data = generate_random_data(4096)
-                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (%s, %s)", (data, padding))
-                                    ops_count += 1
-
-                                if io_pattern in ('read', 'mixed'):
-                                    cursor.execute(f"SELECT * FROM {table_name} ORDER BY RAND() LIMIT 100")
-                                    cursor.fetchall()
-                                    ops_count += 1
-
-                                if io_pattern == 'mixed' and random.random() < 0.3:
-                                    data = generate_random_data(4096)
-                                    cursor.execute(f"UPDATE {table_name} SET data = %s ORDER BY RAND() LIMIT 1", (data,))
-                                    ops_count += 1
-
-                            except Exception:
-                                error_count += 1
-                                time.sleep(0.1)
-                    finally:
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                        except Exception:
-                            pass
-                        cursor.close()
-
-                    return {'ops': ops_count, 'errors': error_count}
-
-                except Exception as e:
-                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return {'ops': ops_count, 'errors': error_count + 1}
-                finally:
-                    if conn:
-                        conn.close()
-
-            def io_worker_sqlserver(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
-                import pyodbc
-                ops_count = 0
-                error_count = 0
-                conn = None
-                try:
-                    conn_str = f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes'
-                    conn = pyodbc.connect(conn_str, timeout=10)
-                    conn.autocommit = True
-                    cursor = conn.cursor()
-
-                    cursor.execute(f"""
-                        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
-                        CREATE TABLE {table_name} (id INT IDENTITY(1,1) PRIMARY KEY, data NVARCHAR(MAX), padding VARBINARY(MAX), created_at DATETIME DEFAULT GETDATE())
-                    """)
-                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", generate_seed_rows(seed_rows))
-
-                    try:
-                        while time.time() < end_time:
-                            try:
-                                if io_pattern in ('write', 'mixed'):
-                                    data = generate_random_data(4096)
-                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (?, ?)", (data, padding))
-                                    ops_count += 1
-
-                                if io_pattern in ('read', 'mixed'):
-                                    cursor.execute(f"SELECT TOP 100 * FROM {table_name} ORDER BY NEWID()")
-                                    cursor.fetchall()
-                                    ops_count += 1
-
-                                if io_pattern == 'mixed' and random.random() < 0.3:
-                                    data = generate_random_data(4096)
-                                    cursor.execute(f"UPDATE TOP(1) {table_name} SET data = ?", (data,))
-                                    ops_count += 1
-
-                            except Exception:
-                                error_count += 1
-                                time.sleep(0.1)
-                    finally:
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                        except Exception:
-                            pass
-                        cursor.close()
-
-                    return {'ops': ops_count, 'errors': error_count}
-
-                except Exception as e:
-                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return {'ops': ops_count, 'errors': error_count + 1}
-                finally:
-                    if conn:
-                        conn.close()
-
-            def io_worker_oracle(thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
-                import oracledb
-                ops_count = 0
-                error_count = 0
-                conn = None
-                try:
-                    oracledb.init_oracle_client()
-                    dsn = oracledb.makedsn(endpoint, port, service_name=dbname)
-                    conn = oracledb.connect(user=user, password=password, dsn=dsn)
-                    conn.autocommit = True
-                    cursor = conn.cursor()
-
-                    try:
-                        cursor.execute(f"""
-                            BEGIN
-                                EXECUTE IMMEDIATE 'CREATE TABLE {table_name} (id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, data CLOB, padding BLOB, created_at TIMESTAMP DEFAULT SYSTIMESTAMP)';
-                            EXCEPTION
-                                WHEN OTHERS THEN
-                                    IF SQLCODE != -955 THEN RAISE; END IF;
-                            END;
-                        """)
-                    except Exception:
-                        pass
-
-                    cursor.executemany(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", generate_seed_rows(seed_rows))
-
-                    try:
-                        while time.time() < end_time:
-                            try:
-                                if io_pattern in ('write', 'mixed'):
-                                    data = generate_random_data(4096)
-                                    padding = bytes(random.getrandbits(8) for _ in range(8192))
-                                    cursor.execute(f"INSERT INTO {table_name} (data, padding) VALUES (:1, :2)", [data, padding])
-                                    ops_count += 1
-
-                                if io_pattern in ('read', 'mixed'):
-                                    cursor.execute(f"SELECT * FROM {table_name} WHERE ROWNUM <= 100 ORDER BY DBMS_RANDOM.VALUE")
-                                    cursor.fetchall()
-                                    ops_count += 1
-
-                                if io_pattern == 'mixed' and random.random() < 0.3:
-                                    data = generate_random_data(4096)
-                                    cursor.execute(f"UPDATE {table_name} SET data = :1 WHERE ROWNUM = 1", [data])
-                                    ops_count += 1
-
-                            except Exception:
-                                error_count += 1
-                                time.sleep(0.1)
-                    finally:
-                        try:
-                            cursor.execute(f"DROP TABLE {table_name} PURGE")
-                        except Exception:
-                            pass
-                        cursor.close()
-
-                    return {'ops': ops_count, 'errors': error_count}
-
-                except Exception as e:
-                    print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
-                    return {'ops': ops_count, 'errors': error_count + 1}
-                finally:
-                    if conn:
-                        conn.close()
-
-            def _cleanup_connect(engine, endpoint, port, dbname, user, password):
-                # Mirrors each worker's own connect so the cleanup path cannot drift from the load path.
-                if engine == 'postgres':
-                    import psycopg2
-                    return psycopg2.connect(host=endpoint, port=port, database=dbname, user=user,
-                                            password=password, connect_timeout=10)
-                if engine == 'mysql':
-                    import mysql.connector
-                    return mysql.connector.connect(host=endpoint, port=port, database=dbname, user=user,
-                                                   password=password, connection_timeout=10)
-                if engine == 'sqlserver':
-                    import pyodbc
-                    cs = (f'DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={endpoint},{port};'
-                          f'DATABASE={dbname};UID={user};PWD={password};TrustServerCertificate=yes')
-                    return pyodbc.connect(cs, timeout=10)
-                if engine == 'oracle':
-                    import oracledb
-                    oracledb.init_oracle_client()
-                    return oracledb.connect(user=user, password=password,
-                                            dsn=oracledb.makedsn(endpoint, port, service_name=dbname))
-                raise ValueError('unknown engine ' + engine)
-
-            def _quote_ident(engine, name):
-                # Safely quote a catalog-sourced table identifier by doubling the engine's
-                # quote character, so a crafted table name cannot break out of the statement.
-                if engine == 'mysql':
-                    return '`' + name.replace('`', '``') + '`'
-                if engine == 'sqlserver':
-                    return '[' + name.replace(']', ']]') + ']'
-                return '"' + name.replace('"', '""') + '"'
-
-            def _set_cleanup_timeouts(engine, cur):
-                # Make a blocked DROP fail fast instead of waiting forever on a lock held by a
-                # not-yet-reaped orphaned backend, so cleanup cannot exhaust the cancellation
-                # budget and leave the instance running.
-                try:
-                    if engine == 'postgres':
-                        cur.execute("SET lock_timeout = '5s'")
-                        cur.execute("SET statement_timeout = '20s'")
-                    elif engine == 'mysql':
-                        cur.execute("SET SESSION lock_wait_timeout = 10")
-                        cur.execute("SET SESSION innodb_lock_wait_timeout = 5")
-                    elif engine == 'sqlserver':
-                        cur.execute("SET LOCK_TIMEOUT 10000")
-                    elif engine == 'oracle':
-                        cur.execute("ALTER SESSION SET DDL_LOCK_TIMEOUT = 10")
-                except Exception:
-                    pass
-
-            def cleanup_tables(engine, endpoint, port, dbname, user, password, exec_suffix):
-                """Drop every per-worker table this execution created (fis_io_<exec_suffix>_*). A normal completion
-                already dropped them in each worker, so this is then a no-op; after an early stop or failure, which
-                kills the load generator before its per-worker DROP runs, this removes them so they do not accumulate
-                in the database. Only ever touches this execution's own tables."""
-                conn = _cleanup_connect(engine, endpoint, port, dbname, user, password)
-                conn.autocommit = True
-                cur = conn.cursor()
-                _set_cleanup_timeouts(engine, cur)
-                try:
-                    if engine == 'postgres':
-                        from psycopg2 import sql
-                        cur.execute("SELECT tablename FROM pg_tables WHERE tablename ~ %s", ('^fis_io_' + exec_suffix + '_',))
-                        names = [r[0] for r in cur.fetchall()]
-                        for t in names:
-                            try:
-                                cur.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(sql.Identifier(t)))
-                            except Exception:
-                                pass
-                    elif engine == 'mysql':
-                        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = %s "
-                                    "AND table_name LIKE %s", (dbname, 'fis\\_io\\_' + exec_suffix + '\\_%'))
-                        names = [r[0] for r in cur.fetchall()]
-                        for t in names:
-                            try:
-                                cur.execute('DROP TABLE IF EXISTS ' + _quote_ident('mysql', t))
-                            except Exception:
-                                pass
-                    elif engine == 'sqlserver':
-                        cur.execute("SELECT name FROM sys.tables WHERE name LIKE ?", ('fis[_]io[_]' + exec_suffix + '[_]%',))
-                        names = [r[0] for r in cur.fetchall()]
-                        for t in names:
-                            try:
-                                cur.execute('DROP TABLE IF EXISTS ' + _quote_ident('sqlserver', t))
-                            except Exception:
-                                pass
-                    elif engine == 'oracle':
-                        cur.execute("SELECT table_name FROM user_tables WHERE table_name LIKE :1 ESCAPE '\\'",
-                                    ['FIS\\_IO\\_' + exec_suffix.upper() + '\\_%'])
-                        names = [r[0] for r in cur.fetchall()]
-                        for t in names:
-                            try:
-                                cur.execute('DROP TABLE ' + _quote_ident('oracle', t) + ' PURGE')
-                            except Exception:
-                                pass
-                    else:
-                        names = []
-                    return {"matched": len(names), "names": names}
-                finally:
-                    cur.close()
-                    conn.close()
-
-            def cleanup_entry(argv):
-                engine, endpoint, port, dbname, user, secret_arn, region, execution_id = (
-                    argv[0], argv[1], int(argv[2]), argv[3], argv[4], argv[5], argv[6], argv[7])
-                exec_suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
-                print("=== Database I/O Exhaustion Cleanup ===")
-                print(f"Engine: {engine}  Suffix: {exec_suffix}")
-                try:
-                    sm = boto3.client('secretsmanager', region_name=region)
-                    response = sm.get_secret_value(SecretId=secret_arn)
-                    secret = json.loads(response['SecretString'])
-                    password = secret.get('password', response['SecretString'])
-                except Exception as e:
-                    print(f"ERROR: Failed to retrieve password: {str(e)}")
-                    sys.exit(1)
-                out = cleanup_tables(engine, endpoint, port, dbname, user, password, exec_suffix)
-                print(json.dumps(out))
-                print(f"Removed {out['matched']} leftover table(s) matching fis_io_{exec_suffix}_*")
-
-            def main():
-                engine = sys.argv[1]
-                endpoint = sys.argv[2]
-                port = int(sys.argv[3])
-                dbname = sys.argv[4]
-                user = sys.argv[5]
-                secret_arn = sys.argv[6]
-                worker_threads = int(sys.argv[7])
-                experiment_duration_iso = sys.argv[8]
-                io_pattern = sys.argv[9]
-                region = sys.argv[10]
-                execution_id = sys.argv[11]
-                seed_rows = int(sys.argv[12])
-                min_active_percent = float(sys.argv[13])
-
-                experiment_duration = parse_iso8601_duration(experiment_duration_iso)
-
-                # Keep table names short and unique per execution so concurrent runs
-                # (or a stale table from a prior run) can never collide, and cleanup
-                # only ever drops objects this execution created. Kept short to stay
-                # under Oracle's 30-character unquoted identifier limit.
-                exec_suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
-
-                print("=== Database I/O Exhaustion Test ===")
-                print(f"Engine: {engine}")
-                print(f"Endpoint: {endpoint}:{port}")
-                print(f"Database: {dbname}")
-                print(f"User: {user}")
-                print(f"Worker Threads: {worker_threads}")
-                print(f"Experiment Duration: {experiment_duration}s")
-                print(f"I/O Pattern: {io_pattern}")
-                print(f"Seed Rows Per Table: {seed_rows}")
-                print(f"Execution Suffix: {exec_suffix}")
-                print("====================================")
-
-                print("Retrieving database password from Secrets Manager...")
-                try:
-                    sm = boto3.client('secretsmanager', region_name=region)
-                    response = sm.get_secret_value(SecretId=secret_arn)
-                    secret = json.loads(response['SecretString'])
-                    password = secret.get('password', response['SecretString'])
-                except Exception as e:
-                    print(f"ERROR: Failed to retrieve password: {str(e)}")
-                    sys.exit(1)
-
-                print("Password retrieved successfully")
-
-                end_time = time.time() + experiment_duration
-                threads = []
-                results = [None] * worker_threads
-
-                worker_func = {
-                    'postgres': io_worker_postgres,
-                    'mysql': io_worker_mysql,
-                    'sqlserver': io_worker_sqlserver,
-                    'oracle': io_worker_oracle
-                }[engine]
-
-                print(f"Launching {worker_threads} I/O worker threads...")
-
-                for i in range(worker_threads):
-                    table_name = f"fis_io_{exec_suffix}_{i + 1}"
-
-                    def run_worker(idx=i, tbl=table_name):
-                        results[idx] = worker_func(
-                            idx + 1, endpoint, port, dbname, user, password, io_pattern, end_time, tbl, seed_rows
-                        )
-
-                    thread = threading.Thread(target=run_worker)
-                    thread.start()
-                    threads.append(thread)
-                    time.sleep(0.1)
-
-                    if (i + 1) % 10 == 0:
-                        print(f"Progress: {i + 1}/{worker_threads} workers launched")
-
-                print(f"All {worker_threads} workers launched, generating I/O load...")
-                print(f"Experiment will run for {experiment_duration} seconds")
-
-                for thread in threads:
-                    thread.join()
-
-                total_ops = sum(r['ops'] for r in results if r)
-                total_errors = sum(r['errors'] for r in results if r)
-                active_workers = sum(1 for r in results if r and r['ops'] > 0)
-                active_percent = (active_workers / worker_threads * 100) if worker_threads else 0
-
-                print("=== I/O Exhaustion Test Complete ===")
-                print(f"Active workers: {active_workers}/{worker_threads} ({active_percent:.1f}%)")
-                print(f"Total I/O operations: {total_ops}")
-                print(f"Total operation errors: {total_errors}")
-                print(f"Avg ops/worker: {total_ops // max(active_workers, 1)}")
-                print("====================================")
-
-                fault_injected = total_ops > 0 and active_percent >= min_active_percent
-
-                result = {
-                    "ActiveWorkers": active_workers,
-                    "TotalWorkers": worker_threads,
-                    "TotalIOOperations": total_ops,
-                    "TotalOperationErrors": total_errors,
-                    "DurationSeconds": experiment_duration,
-                    "IOPattern": io_pattern,
-                    "FaultInjected": fault_injected
-                }
-                print(json.dumps(result))
-
-                if not fault_injected:
-                    print(f"ERROR: Fault was not reliably injected - {active_percent:.1f}% of workers were active "
-                          f"(minimum required: {min_active_percent}%) and {total_ops} I/O operations were recorded.")
-                    sys.exit(1)
-
-            if __name__ == '__main__':
-                if len(sys.argv) > 1 and sys.argv[1] == '--cleanup':
-                    cleanup_entry(sys.argv[2:])
-                else:
-                    main()
-            PYTHON_EOF
-
-            python3 /tmp/exhaust_io.py \
-              "{{ DatabaseEngine }}" \
-              "{{ DatabaseEndpoint }}" \
-              "{{ DatabasePort }}" \
-              "{{ DatabaseName }}" \
-              "{{ DatabaseUser }}" \
-              "{{ DatabasePasswordSecretArn }}" \
-              "{{ WorkerThreads }}" \
-              "{{ ExperimentDuration }}" \
-              "{{ IOPattern }}" \
-              "{{ global:REGION }}" \
-              "{{ automation:EXECUTION_ID }}" \
-              "{{ SeedRowCount }}" \
-              "{{ MinActiveWorkerPercentage }}"
+        - |
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+
+          # Per-run state, in a directory only root can write, named by the execution ID.
+          BASE=/var/lib/fis-database-io-exhaustion
+          RUN_DIR="$BASE/{{ automation:EXECUTION_ID }}"
+          if [ ! -e "$BASE" ]; then
+              mkdir -m 0700 "$BASE"
+          fi
+          if [ -L "$BASE" ] || [ ! -d "$BASE" ] || [ "$(stat -c '%u %a' "$BASE")" != "0 700" ]; then
+              echo "ERROR: $BASE must be a directory owned by root with mode 0700"
+              exit 1
+          fi
+          mkdir -m 0700 "$RUN_DIR"
+
+          # Written before the load script: no cleanup.sh means the load never started.
+          cat > "$RUN_DIR/cleanup.sh" << 'CLEANUP_EOF'
+          # Stops this run's load (by recorded PID and start time, or argv[1] = this run's script path), then
+          # drops this run's tables, failing and naming any that remain. Safe to run twice.
+          set -uo pipefail
+          # Arguments: seconds to wait after SIGTERM, table-drop deadline, hard timeout.
+          TERM_WAIT=$1
+          DEADLINE=$2
+          PY_TIMEOUT=$3
+          BASE=/var/lib/fis-database-io-exhaustion
+          RUN_DIR="$BASE/{{ automation:EXECUTION_ID }}"
+          SCRIPT="$RUN_DIR/exhaust_io.py"
+
+          start_time() { awk '{sub(/.*\) /, ""); print $20}' "/proc/$1/stat" 2>/dev/null; }
+          load_pids() {
+              {
+                  if [ -f "$RUN_DIR/load.pid" ]; then
+                      read -r rec_pid rec_start < "$RUN_DIR/load.pid" || true
+                      if [ -n "${rec_pid:-}" ] && [ -n "${rec_start:-}" ] && [ "$(start_time "$rec_pid")" = "$rec_start" ]; then
+                          echo "$rec_pid"
+                      fi
+                  fi
+                  for p in /proc/[0-9]*; do
+                      ARGS=()
+                      mapfile -d '' -t ARGS 2>/dev/null < "$p/cmdline" || continue
+                      if [ "${#ARGS[@]}" -ge 2 ] && [ "${ARGS[1]}" = "$SCRIPT" ] && [ "${ARGS[2]:-}" != "--cleanup" ]; then
+                          echo "${p#/proc/}"
+                      fi
+                  done
+              } | sort -u
+          }
+
+          KILL_FAILED=0
+          PIDS=$(load_pids)
+          if [ -n "$PIDS" ]; then
+              echo "Stopping this run's load process: $PIDS"
+              kill -TERM $PIDS || echo "Some of these processes had already exited."
+              for _ in $(seq 1 "$TERM_WAIT"); do
+                  [ -z "$(load_pids)" ] && break
+                  sleep 1
+              done
+              PIDS=$(load_pids)
+              if [ -n "$PIDS" ]; then
+                  kill -KILL $PIDS || echo "Some of these processes had already exited."
+                  sleep 1
+              fi
+              if [ -n "$(load_pids)" ]; then
+                  echo "ERROR: this run's load process is still running after SIGKILL: $(load_pids)"
+                  KILL_FAILED=1
+              fi
+          else
+              echo "No load process of this run is running."
+          fi
+
+          if [ ! -f "$SCRIPT" ]; then
+              echo "No load script in $RUN_DIR: the load never started, so there are no tables to drop."
+              exit "$KILL_FAILED"
+          fi
+          timeout "$PY_TIMEOUT" python3 "$SCRIPT" --cleanup \
+            "{{ DatabaseEngine }}" \
+            "{{ DatabaseEndpoint }}" \
+            "{{ DatabasePort }}" \
+            "{{ DatabaseName }}" \
+            "{{ DatabaseUser }}" \
+            "{{ DatabasePasswordSecretArn }}" \
+            "{{ global:REGION }}" \
+            "{{ automation:EXECUTION_ID }}" \
+            "$DEADLINE"
+          RC=$?
+          if [ "$RC" -eq 124 ]; then
+              echo "ERROR: table cleanup did not finish within ${PY_TIMEOUT}s; this run's fis_io_ tables may remain."
+          fi
+          if [ "$RC" -ne 0 ]; then
+              exit "$RC"
+          fi
+          exit "$KILL_FAILED"
+          CLEANUP_EOF
+
+          # Renamed when complete, so a cleanup that finds exhaust_io.py knows it is whole.
+          cat > "$RUN_DIR/exhaust_io.py.tmp" << 'PYTHON_EOF'
+          import re
+          import sys
+          import time
+          import json
+          import threading
+          import random
+          import string
+          import boto3
+          from datetime import datetime
+          from botocore.config import Config
+
+          # Longest timed phase the timeouts allow (PT110M); how long to wait for workers after it.
+          MAX_DURATION_SECONDS = 6600
+          JOIN_GRACE_SECONDS = 300
+          # Single braces: Systems Manager reads double braces as document parameters.
+          ODBC_DRIVER = '{ODBC Driver 18 for SQL Server}'
+          # PostgreSQL application_name of this run's workers, so cleanup can end only those sessions.
+          RUN_APP_NAME = None
+
+          def ora_dsn(host, port, service):
+              # Oracle Net's own connect timeout (10 s).
+              return ('(DESCRIPTION=(TRANSPORT_CONNECT_TIMEOUT=10)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))'
+                      '(CONNECT_DATA=(SERVICE_NAME=%s)))' % (host, port, service))
+
+          def parse_iso8601_duration(duration):
+              seconds = 0
+              duration = duration.replace('PT', '')
+
+              if 'H' in duration:
+                  hours, duration = duration.split('H')
+                  seconds += int(hours) * 3600
+
+              if 'M' in duration:
+                  minutes, duration = duration.split('M')
+                  seconds += int(minutes) * 60
+
+              if 'S' in duration:
+                  secs = duration.replace('S', '')
+                  if secs:
+                      seconds += int(secs)
+
+              return seconds
+
+          def generate_random_data(size_bytes=1024):
+              return ''.join(random.choices(string.ascii_letters + string.digits, k=size_bytes))
+
+          def generate_seed_rows(seed_rows):
+              return [
+                  (generate_random_data(4096), bytes(random.getrandbits(8) for _ in range(8192)))
+                  for _ in range(seed_rows)
+              ]
+
+          # Per engine: create, insert, reads, update and drop of a worker's table {t}.
+          WORKER_SQL = {
+              'postgres': (
+                  "CREATE TABLE IF NOT EXISTS {t} (id SERIAL PRIMARY KEY, data TEXT, padding BYTEA, created_at TIMESTAMP DEFAULT NOW())",
+                  "INSERT INTO {t} (data, padding) VALUES (%s, %s)",
+                  ("SELECT * FROM {t} ORDER BY random() LIMIT 100",
+                   "SELECT COUNT(*), pg_size_pretty(pg_total_relation_size('{t}')) FROM {t}"),
+                  "UPDATE {t} SET data = %s WHERE id = (SELECT id FROM {t} ORDER BY random() LIMIT 1)",
+                  "DROP TABLE IF EXISTS {t}"),
+              'mysql': (
+                  "CREATE TABLE IF NOT EXISTS {t} (id INT AUTO_INCREMENT PRIMARY KEY, data TEXT, padding LONGBLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+                  "INSERT INTO {t} (data, padding) VALUES (%s, %s)",
+                  ("SELECT * FROM {t} ORDER BY RAND() LIMIT 100",),
+                  "UPDATE {t} SET data = %s ORDER BY RAND() LIMIT 1",
+                  "DROP TABLE IF EXISTS {t}"),
+              'sqlserver': (
+                  "IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{t}' AND xtype='U') CREATE TABLE {t} (id INT IDENTITY(1,1) PRIMARY KEY, data NVARCHAR(MAX), padding VARBINARY(MAX), created_at DATETIME DEFAULT GETDATE())",
+                  "INSERT INTO {t} (data, padding) VALUES (?, ?)",
+                  ("SELECT TOP 100 * FROM {t} ORDER BY NEWID()",),
+                  "UPDATE TOP(1) {t} SET data = ?",
+                  "DROP TABLE IF EXISTS {t}"),
+              'oracle': (
+                  "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE {t} (id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, data CLOB, padding BLOB, created_at TIMESTAMP DEFAULT SYSTIMESTAMP)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
+                  "INSERT INTO {t} (data, padding) VALUES (:1, :2)",
+                  ("SELECT * FROM {t} WHERE ROWNUM <= 100 ORDER BY DBMS_RANDOM.VALUE",),
+                  "UPDATE {t} SET data = :1 WHERE ROWNUM = 1",
+                  "DROP TABLE {t} PURGE"),
+          }
+
+          def io_worker(engine, thread_id, endpoint, port, dbname, user, password, io_pattern, end_time, table_name, seed_rows):
+              create, insert, reads, update, drop = [
+                  tuple(q.format(t=table_name) for q in s) if isinstance(s, tuple) else s.format(t=table_name)
+                  for s in WORKER_SQL[engine]]
+              ops_count = 0
+              error_count = 0
+              conn = None
+              try:
+                  conn = _connect(engine, endpoint, port, dbname, user, password, RUN_APP_NAME)
+                  conn.autocommit = True
+                  cursor = conn.cursor()
+
+                  try:
+                      cursor.execute(create)
+                  except Exception:
+                      # Oracle's create was always best-effort; on the other engines a failed create fails the worker.
+                      if engine != 'oracle':
+                          raise
+                  cursor.executemany(insert, generate_seed_rows(seed_rows))
+
+                  try:
+                      while time.time() < end_time:
+                          try:
+                              if io_pattern in ('write', 'mixed'):
+                                  data = generate_random_data(4096)
+                                  padding = bytes(random.getrandbits(8) for _ in range(8192))
+                                  cursor.execute(insert, (data, padding))
+                                  ops_count += 1
+
+                              if io_pattern in ('read', 'mixed'):
+                                  for q in reads:
+                                      cursor.execute(q)
+                                      cursor.fetchall()
+                                  ops_count += 1
+
+                              if io_pattern == 'mixed' and random.random() < 0.3:
+                                  data = generate_random_data(4096)
+                                  cursor.execute(update, (data,))
+                                  ops_count += 1
+
+                          except Exception:
+                              error_count += 1
+                              time.sleep(0.1)
+                  finally:
+                      try:
+                          cursor.execute(drop)
+                      except Exception:
+                          pass
+                      cursor.close()
+
+                  return {'ops': ops_count, 'errors': error_count}
+
+              except Exception as e:
+                  print(f"Thread {thread_id} failed: {str(e)}", file=sys.stderr)
+                  return {'ops': ops_count, 'errors': error_count + 1}
+              finally:
+                  if conn:
+                      conn.close()
+
+          def exec_suffix_for(execution_id):
+              # 8 characters keeps table names under Oracle's 30-character identifier limit.
+              return re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
+
+          def get_password(secret_arn, region):
+              sm = boto3.client('secretsmanager', region_name=region,
+                                config=Config(retries={'max_attempts': 5, 'mode': 'standard'}))
+              response = sm.get_secret_value(SecretId=secret_arn)
+              try:
+                  secret = json.loads(response['SecretString'])
+              except ValueError:
+                  return response['SecretString']
+              if isinstance(secret, dict) and 'password' in secret:
+                  return secret['password']
+              return response['SecretString']
+
+          def _connect(engine, endpoint, port, dbname, user, password, app_name):
+              # Used by the workers and the cleanup. app_name is PostgreSQL's application_name.
+              if engine == 'postgres':
+                  import psycopg2
+                  return psycopg2.connect(host=endpoint, port=port, database=dbname, user=user,
+                                          password=password, connect_timeout=10, application_name=app_name)
+              if engine == 'mysql':
+                  import mysql.connector
+                  return mysql.connector.connect(host=endpoint, port=port, database=dbname, user=user,
+                                                 password=password, connection_timeout=10)
+              if engine == 'sqlserver':
+                  import pyodbc
+                  cs = ('DRIVER=' + ODBC_DRIVER + ';SERVER=' + endpoint + ',' + str(port) + ';DATABASE=' + dbname +
+                        ';UID=' + user + ';PWD=' + password + ';TrustServerCertificate=yes')
+                  return pyodbc.connect(cs, timeout=10)
+              if engine == 'oracle':
+                  import oracledb
+                  oracledb.init_oracle_client()
+                  return oracledb.connect(user=user, password=password,
+                                          dsn=ora_dsn(endpoint, port, dbname))
+              raise ValueError('unknown engine ' + engine)
+
+          def _quote_ident(engine, name):
+              # Quote a catalog-sourced name by doubling the quote character.
+              if engine == 'mysql':
+                  return '`' + name.replace('`', '``') + '`'
+              if engine == 'sqlserver':
+                  return '[' + name.replace(']', ']]') + ']'
+              return '"' + name.replace('"', '""') + '"'
+
+          def _set_cleanup_timeouts(engine, cur):
+              # A DROP that can't get its lock fails in seconds. A failure to set this fails the cleanup.
+              if engine == 'postgres':
+                  cur.execute("SET lock_timeout = '3s'")
+                  cur.execute("SET statement_timeout = '8s'")
+              elif engine == 'mysql':
+                  cur.execute("SET SESSION lock_wait_timeout = 3")
+                  cur.execute("SET SESSION innodb_lock_wait_timeout = 3")
+              elif engine == 'sqlserver':
+                  cur.execute("SET LOCK_TIMEOUT 3000")
+              elif engine == 'oracle':
+                  cur.execute("ALTER SESSION SET DDL_LOCK_TIMEOUT = 3")
+
+          def _end_own_sessions(engine, cur, app_name):
+              # A killed client's statement can keep running, and keep its lock, until the server next writes to
+              # the socket. End this run's own sessions: on PostgreSQL by application_name; on MySQL and SQL
+              # Server, this user's sessions running a statement, other than a DROP, that names this run's tables.
+              if engine == 'postgres':
+                  cur.execute("SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                              "WHERE application_name = %s AND pid <> pg_backend_pid()) AS ended", (app_name,))
+                  return cur.fetchone()[0]
+              if engine == 'mysql':
+                  cur.execute("SELECT id FROM information_schema.processlist WHERE id <> CONNECTION_ID() AND user = "
+                              "SUBSTRING_INDEX(USER(), '@', 1) AND info LIKE %s AND info NOT LIKE 'DROP%%'",
+                              ('%' + app_name.replace('_', '\\_') + '\\_%',))
+              elif engine == 'sqlserver':
+                  # Without VIEW SERVER STATE, sys.dm_exec_requests shows only this session, so nothing would match.
+                  cur.execute("SELECT HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE')")
+                  if cur.fetchone()[0] != 1:
+                      raise RuntimeError('this user lacks VIEW SERVER STATE, so the sessions of this run were not ended')
+                  cur.execute("SELECT r.session_id FROM sys.dm_exec_requests r JOIN sys.dm_exec_sessions s ON "
+                              "s.session_id = r.session_id CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE "
+                              "r.session_id <> @@SPID AND s.login_name = SUSER_SNAME() AND t.text LIKE ? AND "
+                              "LTRIM(t.text) NOT LIKE 'DROP%'", ('%' + app_name.replace('_', '[_]') + '[_]%',))
+              else:
+                  return 0
+              ids = [int(r[0]) for r in cur.fetchall()]
+              for i in ids:
+                  cur.execute('KILL %d' % i)
+              return len(ids)
+
+          def _list_tables(engine, cur, dbname, exec_suffix):
+              if engine == 'postgres':
+                  cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename ~ %s",
+                              ('^fis_io_' + exec_suffix + '_',))
+              elif engine == 'mysql':
+                  cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = %s "
+                              "AND table_name LIKE %s", (dbname, 'fis\\_io\\_' + exec_suffix + '\\_%'))
+              elif engine == 'sqlserver':
+                  cur.execute("SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID() AND name LIKE ?",
+                              ('fis[_]io[_]' + exec_suffix + '[_]%',))
+              elif engine == 'oracle':
+                  cur.execute("SELECT table_name FROM user_tables WHERE table_name LIKE :1 ESCAPE '\\'",
+                              ['FIS\\_IO\\_' + exec_suffix.upper() + '\\_%'])
+              else:
+                  raise ValueError('unknown engine ' + engine)
+              return sorted(r[0] for r in cur.fetchall())
+
+          def _drop_table(engine, cur, name):
+              if engine == 'postgres':
+                  from psycopg2 import sql
+                  cur.execute(sql.SQL('DROP TABLE IF EXISTS {}').format(sql.Identifier(name)))
+              elif engine == 'oracle':
+                  cur.execute('DROP TABLE ' + _quote_ident('oracle', name) + ' PURGE')
+              else:
+                  cur.execute('DROP TABLE IF EXISTS ' + _quote_ident(engine, name))
+
+          def cleanup_tables(engine, endpoint, port, dbname, user, password, exec_suffix, deadline):
+              """Drop every table this execution created (fis_io_<exec_suffix>_*), retrying until the deadline, and
+              return how many drops succeeded and which tables are still there, from a final catalog query."""
+              conn = _connect(engine, endpoint, port, dbname, user, password, 'fis_io_cleanup_' + exec_suffix)
+              conn.autocommit = True
+              cur = conn.cursor()
+              dropped = 0
+              errors = {}
+              warned = None
+              try:
+                  _set_cleanup_timeouts(engine, cur)
+                  while True:
+                      try:
+                          ended = _end_own_sessions(engine, cur, 'fis_io_' + exec_suffix)
+                          if ended:
+                              print(f"Ended {ended} database session(s) of this run")
+                      except Exception as e:
+                          # Not fatal on its own: the final catalog query below decides the result.
+                          if str(e) != warned:
+                              warned = str(e)
+                              print(f"WARNING: could not end this run's database sessions: {e}")
+                      names = _list_tables(engine, cur, dbname, exec_suffix)
+                      if not names:
+                          break
+                      for name in names:
+                          if time.time() > deadline - 10:
+                              break
+                          try:
+                              _drop_table(engine, cur, name)
+                              dropped += 1
+                              errors.pop(name, None)
+                          except Exception as e:
+                              errors[name] = str(e).strip()[:200]
+                      if time.time() > deadline - 12:
+                          break
+                      if errors:
+                          time.sleep(2)
+                  remaining = _list_tables(engine, cur, dbname, exec_suffix)
+              finally:
+                  cur.close()
+                  conn.close()
+              return {'dropped': dropped, 'remaining': remaining,
+                      'errors': dict((k, v) for k, v in errors.items() if k in remaining)}
+
+          def cleanup_entry(argv):
+              engine, endpoint, port, dbname, user, secret_arn, region, execution_id, deadline_seconds = (
+                  argv[0], argv[1], int(argv[2]), argv[3], argv[4], argv[5], argv[6], argv[7], int(argv[8]))
+              deadline = time.time() + deadline_seconds
+              exec_suffix = exec_suffix_for(execution_id)
+              pattern = f"fis_io_{exec_suffix}_*"
+              print("=== Database I/O Exhaustion Table Cleanup ===")
+              print(f"Engine: {engine}  Database: {dbname}  Tables: {pattern}  Deadline: {deadline_seconds}s")
+              try:
+                  password = get_password(secret_arn, region)
+                  out = cleanup_tables(engine, endpoint, port, dbname, user, password, exec_suffix, deadline)
+              except Exception as e:
+                  print(f"ERROR: table cleanup failed before it could finish: {e}")
+                  print(f"Tables matching {pattern} may remain in database {dbname}. "
+                        "Drop them by hand as the README's Stop Conditions section describes.")
+                  sys.exit(1)
+              print(json.dumps(out))
+              print(f"Dropped {out['dropped']} table(s); {len(out['remaining'])} of this run's tables remain")
+              if out['remaining']:
+                  print("ERROR: these tables remain in database " + dbname + " and must be dropped by hand: " +
+                        ', '.join(out['remaining']))
+                  for name, err in out['errors'].items():
+                      print(f"  {name}: {err}")
+                  sys.exit(1)
+
+          def main():
+              global RUN_APP_NAME
+              engine = sys.argv[1]
+              endpoint = sys.argv[2]
+              port = int(sys.argv[3])
+              dbname = sys.argv[4]
+              user = sys.argv[5]
+              secret_arn = sys.argv[6]
+              worker_threads = int(sys.argv[7])
+              experiment_duration_iso = sys.argv[8]
+              io_pattern = sys.argv[9]
+              region = sys.argv[10]
+              execution_id = sys.argv[11]
+              seed_rows = int(sys.argv[12])
+              min_active_percent = float(sys.argv[13])
+
+              experiment_duration = parse_iso8601_duration(experiment_duration_iso)
+              if experiment_duration <= 0 or experiment_duration > MAX_DURATION_SECONDS:
+                  print(f"ERROR: ExperimentDuration {experiment_duration_iso} is {experiment_duration}s; it must be "
+                        f"between 1s and {MAX_DURATION_SECONDS}s (PT110M). No load was started.")
+                  sys.exit(2)
+
+              # Table names are unique per execution, so runs never collide and cleanup drops only its own.
+              exec_suffix = exec_suffix_for(execution_id)
+              RUN_APP_NAME = 'fis_io_' + exec_suffix
+
+              print("=== Database I/O Exhaustion Test ===")
+              print(f"Engine: {engine}")
+              print(f"Endpoint: {endpoint}:{port}")
+              print(f"Database: {dbname}")
+              print(f"User: {user}")
+              print(f"Worker Threads: {worker_threads}")
+              print(f"Experiment Duration: {experiment_duration}s")
+              print(f"I/O Pattern: {io_pattern}")
+              print(f"Seed Rows Per Table: {seed_rows}")
+              print(f"Execution Suffix: {exec_suffix}")
+              print("====================================")
+
+              print("Retrieving database password from Secrets Manager...")
+              try:
+                  password = get_password(secret_arn, region)
+              except Exception as e:
+                  print(f"ERROR: Failed to retrieve password: {str(e)}")
+                  sys.exit(1)
+
+              print("Password retrieved successfully")
+
+              end_time = time.time() + experiment_duration
+              threads = []
+              results = [None] * worker_threads
+
+              WORKER_SQL[engine]  # an unknown engine fails here, before any worker starts
+
+              print(f"Launching {worker_threads} I/O worker threads...")
+
+              for i in range(worker_threads):
+                  table_name = f"fis_io_{exec_suffix}_{i + 1}"
+
+                  def run_worker(idx=i, tbl=table_name):
+                      results[idx] = io_worker(
+                          engine, idx + 1, endpoint, port, dbname, user, password, io_pattern, end_time, tbl, seed_rows
+                      )
+
+                  thread = threading.Thread(target=run_worker, daemon=True)
+                  thread.start()
+                  threads.append(thread)
+                  time.sleep(0.1)
+
+                  if (i + 1) % 10 == 0:
+                      print(f"Progress: {i + 1}/{worker_threads} workers launched")
+
+              print(f"All {worker_threads} workers launched, generating I/O load...")
+              print(f"Experiment will run for {experiment_duration} seconds")
+
+              # Bounded wait: a hung worker fails the run instead of holding the step to its timeout.
+              join_deadline = end_time + JOIN_GRACE_SECONDS
+              for thread in threads:
+                  thread.join(timeout=max(0, join_deadline - time.time()))
+              hung_workers = sum(1 for t in threads if t.is_alive())
+
+              total_ops = sum(r['ops'] for r in results if r)
+              total_errors = sum(r['errors'] for r in results if r)
+              active_workers = sum(1 for r in results if r and r['ops'] > 0)
+              active_percent = (active_workers / worker_threads * 100) if worker_threads else 0
+
+              print("=== I/O Exhaustion Test Complete ===")
+              print(f"Active workers: {active_workers}/{worker_threads} ({active_percent:.1f}%)")
+              print(f"Total I/O operations: {total_ops}")
+              print(f"Total operation errors: {total_errors}")
+              print(f"Avg ops/worker: {total_ops // max(active_workers, 1)}")
+              print(f"Workers still running {JOIN_GRACE_SECONDS}s after the duration ended: {hung_workers}")
+              print("====================================")
+
+              fault_injected = total_ops > 0 and active_percent >= min_active_percent and hung_workers == 0
+
+              result = {
+                  "ActiveWorkers": active_workers,
+                  "TotalWorkers": worker_threads,
+                  "TotalIOOperations": total_ops,
+                  "TotalOperationErrors": total_errors,
+                  "DurationSeconds": experiment_duration,
+                  "IOPattern": io_pattern,
+                  "HungWorkers": hung_workers,
+                  "FaultInjected": fault_injected
+              }
+              print(json.dumps(result))
+
+              if hung_workers:
+                  print(f"ERROR: {hung_workers} worker(s) did not finish within {JOIN_GRACE_SECONDS}s of the end of "
+                        "the duration (a query or connection hung). Their tables are dropped by the cleanup step.")
+                  sys.exit(1)
+              if not fault_injected:
+                  print(f"ERROR: Fault was not reliably injected - {active_percent:.1f}% of workers were active "
+                        f"(minimum required: {min_active_percent}%) and {total_ops} I/O operations were recorded.")
+                  sys.exit(1)
+
+          if __name__ == '__main__':
+              if len(sys.argv) > 1 and sys.argv[1] == '--cleanup':
+                  cleanup_entry(sys.argv[2:])
+              else:
+                  main()
+          PYTHON_EOF
+          mv "$RUN_DIR/exhaust_io.py.tmp" "$RUN_DIR/exhaust_io.py"
+
+          # Record the load's PID and start time; cleanup signals the PID only while the start time matches.
+          python3 "$RUN_DIR/exhaust_io.py" \
+            "{{ DatabaseEngine }}" \
+            "{{ DatabaseEndpoint }}" \
+            "{{ DatabasePort }}" \
+            "{{ DatabaseName }}" \
+            "{{ DatabaseUser }}" \
+            "{{ DatabasePasswordSecretArn }}" \
+            "{{ WorkerThreads }}" \
+            "{{ ExperimentDuration }}" \
+            "{{ IOPattern }}" \
+            "{{ global:REGION }}" \
+            "{{ automation:EXECUTION_ID }}" \
+            "{{ SeedRowCount }}" \
+            "{{ MinActiveWorkerPercentage }}" &
+          LOAD_PID=$!
+          LOAD_START=$(awk '{sub(/.*\) /, ""); print $20}' "/proc/$LOAD_PID/stat" 2>/dev/null || true)
+          echo "$LOAD_PID $LOAD_START" > "$RUN_DIR/load.pid"
+          set +e
+          wait "$LOAD_PID"
+          exit $?
 
   - name: CleanupTables
+    # Normal and failure path: no cancel window applies, so the drop retries for up to 180 s.
     action: 'aws:runCommand'
-    onFailure: 'Continue'
-    onCancel: 'step:TerminateInstance'
+    timeoutSeconds: 300
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructure'
+    onCancel: 'step:StopLoadAndDropTablesOnCancel'
+    nextStep: CleanupInfrastructure
     inputs:
       DocumentName: 'AWS-RunShellScript'
       InstanceIds:
         - '{{ LaunchLoadGenerator.InstanceId }}'
-      TimeoutSeconds: 600
+      TimeoutSeconds: 60
       Parameters:
+        executionTimeout: '240'
         commands:
-          - |
-            #!/bin/bash
-            # Stop the load generator, then drop any per-worker tables this execution left behind. Stopping an FIS
-            # experiment cancels the run command at the automation level but does not kill the load generator process
-            # on the instance, which otherwise keeps creating and holding tables until the instance is terminated.
-            # Signal it here first: killing the process closes its database connections (the kernel resets the
-            # sockets while the instance network is still up), which releases any locks and stops new tables being
-            # created, so the drop below neither blocks nor races the load generator. On a normal completion the load
-            # generator has already exited and each worker dropped its own table, so both steps are a no-op. Only
-            # this execution's own tables (fis_io_<execution-suffix>_*) are ever removed. The pkill runs before the
-            # cleanup invocation below, so it does not match this script's own cleanup process.
-            pkill -TERM -f '/tmp/exhaust_io.py' 2>/dev/null || true
-            for i in $(seq 1 15); do pgrep -f '/tmp/exhaust_io.py' >/dev/null 2>&1 || break; sleep 1; done
-            pkill -KILL -f '/tmp/exhaust_io.py' 2>/dev/null || true
-            sleep 3
-            python3 /tmp/exhaust_io.py --cleanup \
-              "{{ DatabaseEngine }}" \
-              "{{ DatabaseEndpoint }}" \
-              "{{ DatabasePort }}" \
-              "{{ DatabaseName }}" \
-              "{{ DatabaseUser }}" \
-              "{{ DatabasePasswordSecretArn }}" \
-              "{{ global:REGION }}" \
-              "{{ automation:EXECUTION_ID }}"
+        - |
+          #!/bin/bash
+          # Run this run's own cleanup script, which ExhaustDatabaseIO wrote before it started the load.
+          BASE=/var/lib/fis-database-io-exhaustion
+          RUN_DIR="$BASE/{{ automation:EXECUTION_ID }}"
+          if [ ! -f "$RUN_DIR/cleanup.sh" ]; then
+              echo "No cleanup script in $RUN_DIR: the load never started on this instance, so there is nothing to stop or drop."
+              exit 0
+          fi
+          for f in "$BASE" "$RUN_DIR" "$RUN_DIR/cleanup.sh"; do
+              if [ -L "$f" ] || [ "$(stat -c '%u' "$f")" != "0" ] || [ $(( 0$(stat -c '%a' "$f") & 077 )) -ne 0 ]; then
+                  echo "ERROR: $f is not owned by root and private to it; not running it."
+                  exit 1
+              fi
+          done
+          exec bash "$RUN_DIR/cleanup.sh" 10 180 200
 
-  - name: TerminateInstance
-    action: 'aws:changeInstanceState'
-    onFailure: 'step:RevokeInboundFromLoadGenerator'
-    onCancel: 'step:RevokeInboundFromLoadGenerator'
-    inputs:
-      InstanceIds:
-        - '{{ LaunchLoadGenerator.InstanceId }}'
-      DesiredState: terminated
-
-  - name: WaitForInstanceTermination
-    action: 'aws:waitForAwsResourceProperty'
-    timeoutSeconds: 300
-    onFailure: 'Continue'
-    onCancel: 'step:RevokeInboundFromLoadGenerator'
-    inputs:
-      Service: ec2
-      Api: DescribeInstances
-      InstanceIds:
-        - '{{ LaunchLoadGenerator.InstanceId }}'
-      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
-      DesiredValues:
-        - terminated
-
-  - name: RevokeInboundFromLoadGenerator
+  - name: CleanupInfrastructure
+    # Normal and failure path. 480 s deadline: waits for termination, then deletes the security group.
     action: 'aws:executeScript'
-    onFailure: 'Continue'
-    onCancel: 'Abort'
+    timeoutSeconds: 540
+    isCritical: true
+    onFailure: 'Abort'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
+    isEnd: true
     inputs:
       Runtime: python3.11
-      Handler: revoke_ingress
+      Handler: cleanup_infrastructure
       Script: |
+        import re
+        import time
         import boto3
+        from botocore.config import Config
         from botocore.exceptions import ClientError
 
-        def revoke_ingress(events, context):
-            ec2 = boto3.client('ec2')
-
-            database_sg_id = events['DatabaseSecurityGroupId']
-            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+        def cleanup_infrastructure(events, context):
+            # Undo this run's instance (by client token), ingress rule and security group (by name); raise naming what's left.
+            xid = events['ExecutionId']
+            db_sg = events['DatabaseSecurityGroupId']
             port = int(events['DatabasePort'])
+            start = time.time()
+            deadline = start + int(events['DeadlineSeconds'])
+            tables = 'fis_io_' + (re.sub('[^0-9a-zA-Z]', '', xid)[-8:].lower() or 'default') + '_*'
+            # Each call gives up within about 48 s (3 attempts of 5 s connect and 10 s read, and backoff).
+            ec2 = boto3.client('ec2', config=Config(connect_timeout=5, read_timeout=10,
+                                                    retries={'total_max_attempts': 3, 'mode': 'standard'}))
+            sg_filter = [{'Name': 'vpc-id', 'Values': [events['VpcId']]},
+                         {'Name': 'group-name', 'Values': ['FIS-DatabaseIO-LoadGen-' + xid]}]
+            # One problem per kind: a later failure replaces it, a later success drops it.
+            problems, done, asked, listed, seen, deleted = {}, [], set(), [], set(), set()
 
-            try:
-                response = ec2.revoke_security_group_ingress(
-                    GroupId=database_sg_id,
-                    IpPermissions=[{
-                        'IpProtocol': 'tcp',
-                        'FromPort': port,
-                        'ToPort': port,
-                        'UserIdGroupPairs': [{
-                            'GroupId': load_gen_sg_id
-                        }]
-                    }]
-                )
-                return {'StatusCode': 200, 'Response': response}
-            except ClientError as e:
-                if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
-                    return {'StatusCode': 200, 'Response': 'Ingress rule already absent'}
-                return {'StatusCode': 500, 'Error': str(e)}
+            def code(e):
+                return e.response.get('Error', {}).get('Code', '') if isinstance(e, ClientError) else ''
+
+            def late(what):
+                # No call starts within 8 s of the deadline, so the step raises before its timeout.
+                if time.time() > deadline - 8:
+                    problems[what] = what + ': not done before the deadline'
+                    return True
+
+            def attempt(what, fn):
+                if late(what):
+                    return None
+                try:
+                    r = fn()
+                except Exception as e:
+                    problems[what] = what + ': ' + str(e)
+                    return None
+                problems.pop(what, None)
+                return r
+
+            def list_groups():
+                # listed keeps the last good listing; seen, every group any listing showed.
+                pages = ec2.get_paginator('describe_security_groups').paginate(Filters=sg_filter)
+                listed[:] = [g['GroupId'] for p in pages for g in p['SecurityGroups']]
+                seen.update(listed)
+                return list(listed)
+
+            def sweep():
+                # Terminate this run's instances; return those not terminated, or None if the listing failed.
+                if time.time() > deadline - 8:
+                    return None
+                try:
+                    pages = list(ec2.get_paginator('describe_instances').paginate(
+                        Filters=[{'Name': 'client-token', 'Values': [xid]}]))
+                except Exception as e:
+                    known['err'] = str(e)
+                    return None
+                found = [i['InstanceId'] for p in pages for r in p['Reservations'] for i in r['Instances']
+                         if i['State']['Name'] != 'terminated']
+                known.update(err=None, pending=found)
+                new = [i for i in found if i not in asked]
+                if new and time.time() <= deadline - 8:
+                    try:
+                        ec2.terminate_instances(InstanceIds=new)
+                        asked.update(new)
+                        known['term'] = None
+                        done.append('terminating ' + ', '.join(new))
+                    except Exception as e:
+                        known['term'] = 'terminating ' + ', '.join(new) + ': ' + str(e)
+                return found
+
+            known = {'err': 'not listed', 'pending': [], 'term': None}
+            pending = sweep()
+            groups = attempt('listing the security group', list_groups) or []
+
+            def referencing(gids):
+                sgs = ec2.describe_security_groups(GroupIds=[db_sg])['SecurityGroups']
+                return sorted(set(p.get('GroupId') for sg in sgs for perm in sg.get('IpPermissions', [])
+                                  for p in perm.get('UserIdGroupPairs', []) if p.get('GroupId') in gids))
+
+            def restore(gids):
+                # Revoke only rules naming this run's groups; a read that finds none drops earlier errors.
+                refs = attempt('reading ' + db_sg, lambda: referencing(gids))
+                for gid in refs or []:
+                    what = 'revoking ingress from ' + gid + ' on ' + db_sg
+                    if late(what):
+                        continue
+                    try:
+                        ec2.revoke_security_group_ingress(GroupId=db_sg, IpPermissions=[{'IpProtocol': 'tcp',
+                            'FromPort': port, 'ToPort': port, 'UserIdGroupPairs': [{'GroupId': gid}]}])
+                    except Exception as e:
+                        if code(e) != 'InvalidPermission.NotFound':
+                            problems[what] = what + ': ' + str(e)
+                if refs:
+                    refs = attempt('reading ' + db_sg, lambda: referencing(gids))
+                    if refs:
+                        problems['rule'] = db_sg + ' still allows ingress from ' + ', '.join(refs)
+                    elif refs is not None:
+                        done.append(db_sg + ' restored')
+                if refs == []:
+                    for k in [k for k in problems if k == 'rule' or k.startswith('revoking ingress from ')]:
+                        del problems[k]
+
+            # Restore the database's group before the wait.
+            if groups:
+                restore(groups)
+
+            # A failed listing is retried; the wait ends 15 s before the deadline.
+            while pending != [] and time.time() < deadline - 15:
+                time.sleep(5)
+                pending = sweep()
+
+            def delete(gid):
+                what = 'deleting ' + gid
+                while time.time() < deadline - 12:
+                    try:
+                        ec2.delete_security_group(GroupId=gid)
+                    except Exception as e:
+                        c = code(e)
+                        if c == 'InvalidGroup.NotFound':
+                            # Gone, or created so recently that EC2 doesn't know it yet: the last listing decides.
+                            problems.pop(what, None)
+                            return
+                        problems[what] = what + ': ' + str(e)
+                        if c not in ('', 'DependencyViolation', 'InvalidGroup.InUse', 'RequestLimitExceeded'):
+                            return
+                        # In use, throttled or unanswered (it may have worked): retry until the cutoff.
+                        sweep()
+                        restore([gid])
+                        time.sleep(max(0, min(3, deadline - 12 - time.time())))
+                        continue
+                    done.append('deleted ' + gid)
+                    problems.pop(what, None)
+                    deleted.add(gid)
+                    return
+
+            for gid in groups:
+                delete(gid)
+
+            # Lists are eventually consistent: from 20 s after the start, list again and remove what's still listed.
+            time.sleep(max(0, min(start + 20, deadline - 12) - time.time()))
+            left_instances = sweep()
+            if left_instances is None:
+                if known['err']:
+                    problems['instances'] = 'listing instances: ' + known['err']
+                left_instances = known['pending']
+            if left_instances:
+                problems['left'] = ('not yet terminated: ' + ', '.join(left_instances) +
+                                    ('; ' + known['term'] if known['term'] else ''))
+            left = attempt('listing the security group', list_groups)
+            if left:
+                restore(left)
+                for gid in left:
+                    delete(gid)
+                left = attempt('listing the security group', list_groups)
+            # A rule added just after a delete, or kept across a peering, still names the group: read once more.
+            if seen:
+                restore(sorted(seen))
+            if left is not None:
+                # A good last listing decides for a failed delete too.
+                for gid in seen - set(left):
+                    problems.pop('deleting ' + gid, None)
+            left = [g for g in (listed if left is None else left) if g not in deleted]
+            if left:
+                problems['groups'] = 'still present: ' + ', '.join(left)
+
+            done = list(dict.fromkeys(done))
+            print('; '.join(done) or 'Nothing of this run was found.')
+            if problems:
+                raise RuntimeError('Cleanup of execution ' + xid + ' is incomplete: ' + '; '.join(problems.values()) +
+                                   '. Tables ' + tables + ' may also remain if a table step failed.'
+                                   ' See the README Stop Conditions section for the manual restore.')
+            return {'Done': done, 'Tables': tables}
       InputPayload:
+        ExecutionId: '{{ automation:EXECUTION_ID }}'
+        VpcId: '{{ VpcId }}'
         DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
-        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
         DatabasePort: '{{ DatabasePort }}'
+        DeadlineSeconds: '480'
 
-  - name: CleanupSecurityGroup
-    action: 'aws:executeAwsApi'
-    onFailure: 'Continue'
-    onCancel: 'Abort'
+  - name: StopLoadAndDropTablesOnCancel
+    # Stop path. Automation runs the cancel workflow for at most two minutes, so this step is held
+    # to 45 s and CleanupInfrastructureOnCancel to 60 s.
+    action: 'aws:runCommand'
+    timeoutSeconds: 45
+    isCritical: true
+    onFailure: 'step:CleanupInfrastructureOnCancel'
+    onCancel: 'step:CleanupInfrastructureOnCancel'
+    nextStep: CleanupInfrastructureOnCancel
     inputs:
-      Service: ec2
-      Api: DeleteSecurityGroup
-      GroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 30
+      Parameters:
+        executionTimeout: '40'
+        commands:
+        - |
+          #!/bin/bash
+          # Run this run's own cleanup script, which ExhaustDatabaseIO wrote before it started the load.
+          BASE=/var/lib/fis-database-io-exhaustion
+          RUN_DIR="$BASE/{{ automation:EXECUTION_ID }}"
+          if [ ! -f "$RUN_DIR/cleanup.sh" ]; then
+              echo "No cleanup script in $RUN_DIR: the load never started on this instance, so there is nothing to stop or drop."
+              exit 0
+          fi
+          for f in "$BASE" "$RUN_DIR" "$RUN_DIR/cleanup.sh"; do
+              if [ -L "$f" ] || [ "$(stat -c '%u' "$f")" != "0" ] || [ $(( 0$(stat -c '%a' "$f") & 077 )) -ne 0 ]; then
+                  echo "ERROR: $f is not owned by root and private to it; not running it."
+                  exit 1
+              fi
+          done
+          exec bash "$RUN_DIR/cleanup.sh" 2 25 30
+
+  - name: CleanupInfrastructureOnCancel
+    # Stop path: the same cleanup, held to 60 s.
+    action: 'aws:executeScript'
+    timeoutSeconds: 60
+    isCritical: true
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: cleanup_infrastructure
+      Script: |
+        import re
+        import time
+        import boto3
+        from botocore.config import Config
+        from botocore.exceptions import ClientError
+
+        def cleanup_infrastructure(events, context):
+            # CleanupInfrastructure's script without its comments, with shorter EC2 bounds.
+            xid = events['ExecutionId']
+            db_sg = events['DatabaseSecurityGroupId']
+            port = int(events['DatabasePort'])
+            start = time.time()
+            deadline = start + int(events['DeadlineSeconds'])
+            tables = 'fis_io_' + (re.sub('[^0-9a-zA-Z]', '', xid)[-8:].lower() or 'default') + '_*'
+            # Each call gives up within about 11 s (2 attempts of 2 s connect and 3 s read, and backoff), so one
+            # started 8 s before the 50 s deadline still ends before the step's 60 s.
+            ec2 = boto3.client('ec2', config=Config(connect_timeout=2, read_timeout=3,
+                                                    retries={'total_max_attempts': 2, 'mode': 'standard'}))
+            sg_filter = [{'Name': 'vpc-id', 'Values': [events['VpcId']]},
+                         {'Name': 'group-name', 'Values': ['FIS-DatabaseIO-LoadGen-' + xid]}]
+            problems, done, asked, listed, seen, deleted = {}, [], set(), [], set(), set()
+
+            def code(e):
+                return e.response.get('Error', {}).get('Code', '') if isinstance(e, ClientError) else ''
+
+            def late(what):
+                if time.time() > deadline - 8:
+                    problems[what] = what + ': not done before the deadline'
+                    return True
+
+            def attempt(what, fn):
+                if late(what):
+                    return None
+                try:
+                    r = fn()
+                except Exception as e:
+                    problems[what] = what + ': ' + str(e)
+                    return None
+                problems.pop(what, None)
+                return r
+
+            def list_groups():
+                pages = ec2.get_paginator('describe_security_groups').paginate(Filters=sg_filter)
+                listed[:] = [g['GroupId'] for p in pages for g in p['SecurityGroups']]
+                seen.update(listed)
+                return list(listed)
+
+            def sweep():
+                if time.time() > deadline - 8:
+                    return None
+                try:
+                    pages = list(ec2.get_paginator('describe_instances').paginate(
+                        Filters=[{'Name': 'client-token', 'Values': [xid]}]))
+                except Exception as e:
+                    known['err'] = str(e)
+                    return None
+                found = [i['InstanceId'] for p in pages for r in p['Reservations'] for i in r['Instances']
+                         if i['State']['Name'] != 'terminated']
+                known.update(err=None, pending=found)
+                new = [i for i in found if i not in asked]
+                if new and time.time() <= deadline - 8:
+                    try:
+                        ec2.terminate_instances(InstanceIds=new)
+                        asked.update(new)
+                        known['term'] = None
+                        done.append('terminating ' + ', '.join(new))
+                    except Exception as e:
+                        known['term'] = 'terminating ' + ', '.join(new) + ': ' + str(e)
+                return found
+
+            known = {'err': 'not listed', 'pending': [], 'term': None}
+            pending = sweep()
+            groups = attempt('listing the security group', list_groups) or []
+
+            def referencing(gids):
+                sgs = ec2.describe_security_groups(GroupIds=[db_sg])['SecurityGroups']
+                return sorted(set(p.get('GroupId') for sg in sgs for perm in sg.get('IpPermissions', [])
+                                  for p in perm.get('UserIdGroupPairs', []) if p.get('GroupId') in gids))
+
+            def restore(gids):
+                refs = attempt('reading ' + db_sg, lambda: referencing(gids))
+                for gid in refs or []:
+                    what = 'revoking ingress from ' + gid + ' on ' + db_sg
+                    if late(what):
+                        continue
+                    try:
+                        ec2.revoke_security_group_ingress(GroupId=db_sg, IpPermissions=[{'IpProtocol': 'tcp',
+                            'FromPort': port, 'ToPort': port, 'UserIdGroupPairs': [{'GroupId': gid}]}])
+                    except Exception as e:
+                        if code(e) != 'InvalidPermission.NotFound':
+                            problems[what] = what + ': ' + str(e)
+                if refs:
+                    refs = attempt('reading ' + db_sg, lambda: referencing(gids))
+                    if refs:
+                        problems['rule'] = db_sg + ' still allows ingress from ' + ', '.join(refs)
+                    elif refs is not None:
+                        done.append(db_sg + ' restored')
+                if refs == []:
+                    for k in [k for k in problems if k == 'rule' or k.startswith('revoking ingress from ')]:
+                        del problems[k]
+
+            if groups:
+                restore(groups)
+
+            while pending != [] and time.time() < deadline - 15:
+                time.sleep(5)
+                pending = sweep()
+
+            def delete(gid):
+                what = 'deleting ' + gid
+                while time.time() < deadline - 12:
+                    try:
+                        ec2.delete_security_group(GroupId=gid)
+                    except Exception as e:
+                        c = code(e)
+                        if c == 'InvalidGroup.NotFound':
+                            problems.pop(what, None)
+                            return
+                        problems[what] = what + ': ' + str(e)
+                        if c not in ('', 'DependencyViolation', 'InvalidGroup.InUse', 'RequestLimitExceeded'):
+                            return
+                        sweep()
+                        restore([gid])
+                        time.sleep(max(0, min(3, deadline - 12 - time.time())))
+                        continue
+                    done.append('deleted ' + gid)
+                    problems.pop(what, None)
+                    deleted.add(gid)
+                    return
+
+            for gid in groups:
+                delete(gid)
+
+            time.sleep(max(0, min(start + 20, deadline - 12) - time.time()))
+            left_instances = sweep()
+            if left_instances is None:
+                if known['err']:
+                    problems['instances'] = 'listing instances: ' + known['err']
+                left_instances = known['pending']
+            if left_instances:
+                problems['left'] = ('not yet terminated: ' + ', '.join(left_instances) +
+                                    ('; ' + known['term'] if known['term'] else ''))
+            left = attempt('listing the security group', list_groups)
+            if left:
+                restore(left)
+                for gid in left:
+                    delete(gid)
+                left = attempt('listing the security group', list_groups)
+            if seen:
+                restore(sorted(seen))
+            if left is not None:
+                for gid in seen - set(left):
+                    problems.pop('deleting ' + gid, None)
+            left = [g for g in (listed if left is None else left) if g not in deleted]
+            if left:
+                problems['groups'] = 'still present: ' + ', '.join(left)
+
+            done = list(dict.fromkeys(done))
+            print('; '.join(done) or 'Nothing of this run was found.')
+            if problems:
+                raise RuntimeError('Cleanup of execution ' + xid + ' is incomplete: ' + '; '.join(problems.values()) +
+                                   '. Tables ' + tables + ' may also remain if a table step failed.'
+                                   ' See the README Stop Conditions section for the manual restore.')
+            return {'Done': done, 'Tables': tables}
+      InputPayload:
+        ExecutionId: '{{ automation:EXECUTION_ID }}'
+        VpcId: '{{ VpcId }}'
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+        DeadlineSeconds: '50'
 
 outputs:
   - LaunchLoadGenerator.InstanceId
