@@ -2,15 +2,31 @@
     "Version": "2012-10-17",
     "Statement": [
         {
-            "Sid": "AllowTablePolicyChanges",
+            "Sid": "AllowReadTable",
             "Effect": "Allow",
             "Action": [
                 "dynamodb:DescribeTable",
-                "dynamodb:GetResourcePolicy",
+                "dynamodb:ListTagsOfResource",
+                "dynamodb:GetResourcePolicy"
+            ],
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/<YOUR TABLE NAME>"
+        },
+        {
+            "Sid": "AllowTablePolicyChanges",
+            "Effect": "Allow",
+            "Action": [
                 "dynamodb:PutResourcePolicy",
                 "dynamodb:DeleteResourcePolicy"
             ],
             "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/<YOUR TABLE NAME>"
+        },
+        {
+            "Sid": "AllowReadOwnAutomationStatus",
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetAutomationExecution"
+            ],
+            "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
         }
     ]
 }

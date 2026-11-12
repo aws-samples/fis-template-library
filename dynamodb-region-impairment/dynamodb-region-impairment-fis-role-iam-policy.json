@@ -2,15 +2,25 @@
     "Version": "2012-10-17",
     "Statement": [
         {
-            "Sid": "AllowPauseReplicationPolicyChanges",
+            "Sid": "AllowReadTableAndStreamPolicies",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:DescribeTable",
+                "dynamodb:GetResourcePolicy"
+            ],
+            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
+        },
+        {
+            "Sid": "AllowPauseReplicationOnTargetTable",
             "Effect": "Allow",
             "Action": [
                 "dynamodb:PutResourcePolicy",
-                "dynamodb:DeleteResourcePolicy",
-                "dynamodb:GetResourcePolicy",
-                "dynamodb:DescribeTable"
+                "dynamodb:DeleteResourcePolicy"
             ],
-            "Resource": "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/*"
+            "Resource": [
+                "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/<YOUR TABLE NAME>",
+                "arn:aws:dynamodb:<YOUR REGION>:<YOUR AWS ACCOUNT>:table/<YOUR TABLE NAME>/stream/*"
+            ]
         },
         {
             "Sid": "AllowTargetResolution",
@@ -40,7 +50,12 @@
             "Action": [
                 "iam:PassRole"
             ],
-            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>"
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM AUTOMATION ROLE NAME>",
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": "ssm.amazonaws.com"
+                }
+            }
         }
     ]
 }
