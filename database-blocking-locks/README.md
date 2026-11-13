@@ -22,7 +22,7 @@ When the {service1} database is subjected to directed row-level blocking locks a
 #### Engine specific CloudWatch metrics:
 * Aurora MySQL / RDS MySQL: `db.Locks.innodb_row_lock_waits.avg` (cumulative count of row-lock waits — climbs while the experiment runs) and `db.Locks.innodb_lock_timeouts.avg` (count of `ERROR 1205` aborts — the "Waiters being killed" signal). Both alarmable via `DB_PERF_INSIGHTS('RDS', '<resource_id>', '<metric>')`. Supplement with application-side `1205 (HY000) Lock wait timeout exceeded` error rate. Aurora MySQL `BlockedTransactions` is bursty under default `innodb_lock_wait_timeout` (50 s) and not the right primary signal — see the MySQL-specific note in the Observability section.
 * RDS SQL Server: `db.General Statistics.Processes blocked.avg`, alarmable via `DB_PERF_INSIGHTS('RDS', '<resource_id>', 'db.General Statistics.Processes blocked.avg')`.
-* Aurora PostgreSQL and RDS PostgreSQL: the `Lock:Tuple` (and `Lock:transactionid`) wait events on the Performance Insights Database Insights / Database load / Sliced by Waits (visible in the Performance Insights UI but not exposed via `DB_PERF_INSIGHTS` in metric math). The CloudWatch-alarmable path is to enable `log_lock_waits=on` in the DB instance parameter group, ship the engine log to CloudWatch Logs, and put a metric filter for the string `still waiting for`.
+* Aurora PostgreSQL and RDS PostgreSQL: the `Lock:Tuple` (and `Lock:transactionid`) wait events on the Performance Insights Database Insights / Database load / Sliced by Waits (visible in the Performance Insights UI but not exposed via `DB_PERF_INSIGHTS` in metric math). The CloudWatch-alarmable path is to enable `log_lock_waits=on` in the DB instance parameter group, ship the engine log to CloudWatch Logs, and put a metric filter for the string `still waiting for`. **Caveat:** PostgreSQL logs `still waiting for` once per wait, when the wait passes `deadlock_timeout`, and doesn't repeat it while the wait goes on. So this metric filter counts wait *onsets*, not currently blocked sessions: it counts lines while the Waiters ramp in, then reports nothing more once they are all waiting, although they stay blocked for the full `ExperimentDuration`. Use it to detect the onset of contention; it is not a gauge of ongoing blocking.
 
 ### What does this enable me to verify?
 
@@ -74,15 +74,17 @@ SSM Automation Document
     ↓
 8. Blocker acquires row lock; Waiters ramp in and block
     ↓
-9. ExperimentDuration elapses; Blocker COMMITs; Waiters unblock
+9. ExperimentDuration elapses (or the experiment is stopped early); Blocker COMMITs or rolls back; Waiters unblock
     ↓
 10. Drop target table (if this run created it)
     ↓
-11. Terminate EC2 instance
+11. Stop the harness: if it is still running (an early stop, or a failure of the inject step), SIGTERM it so its connections close and the row lock releases; a no-op after a normal finish
     ↓
-12. Remove ingress rule from database SG
+12. Terminate EC2 instance
     ↓
-13. Delete temporary security group
+13. Remove ingress rule from database SG
+    ↓
+14. Delete temporary security group
 ```
 
 ## Prerequisites
@@ -99,7 +101,7 @@ Before running this experiment, ensure that:
    - You know the database endpoint, username, and port
    - **You have a user-created database the harness can create tables in, and you know its name.** Synthetic_Mode creates the `fis_blocking_locks_target` table on startup and drops it on shutdown, so the database identified by `DatabaseName` must allow `CREATE TABLE` / `INSERT` / `UPDATE` / `DROP TABLE` from the user identified by `DatabaseUser`. The default system databases shipped with each engine are **not** suitable targets.
    - You have stored the database password as an AWS Secrets Manager secret and know its ARN. The secret can be either a raw string or a JSON document with a `password` key (the shape used by the RDS-managed master password secret).
-   - **Instance class for Performance Insights-based monitoring**: if you intend to alarm via the `DB_PERF_INSIGHTS` metric math function on counters such as `db.Locks.innodb_row_lock_waits.avg` (Aurora MySQL / RDS MySQL) or `db.General Statistics.Processes blocked.avg` (RDS SQL Server), Performance Insights must be enabled on the instance, and Performance Insights does not support burstable classes (`db.t2.*`, `db.t3.*`, `db.t4g.*`). The experiment itself runs on any supported instance class — only the alarm path is constrained. On a burstable class you can still observe the engine's Database Insights graphs and use application-side error rates (for example a CloudWatch Logs metric filter on `Lock wait timeout exceeded`) for alerting.
+   - **Instance class for Performance Insights-based monitoring**: if you intend to alarm via the `DB_PERF_INSIGHTS` metric math function on counters such as `db.Locks.innodb_row_lock_waits.avg` (Aurora MySQL / RDS MySQL) or `db.General Statistics.Processes blocked.avg` (RDS SQL Server), Performance Insights must be enabled on the instance, and some burstable classes don't support it. Aurora MySQL doesn't support it on any `db.t2` or `db.t3` class, or on `db.t4g.micro` and `db.t4g.small` ([Aurora instance class support](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/USER_DatabaseInsights.Engines.html)). RDS for MySQL doesn't support it on `db.t2.micro`, `db.t2.small`, `db.t3.micro`, `db.t3.small`, `db.t4g.micro` and `db.t4g.small` ([RDS instance class support](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DatabaseInsights.Engines.html)). Those pages list no instance class restriction for RDS for SQL Server, RDS for PostgreSQL or Aurora PostgreSQL. The experiment itself runs on any supported instance class — only the alarm path is constrained. On an unsupported class, use application-side error rates (for example a CloudWatch Logs metric filter on `Lock wait timeout exceeded`) for alerting.
 
 ### Create Required Experiment Resources
 
@@ -139,7 +141,7 @@ The experiment requires the following parameters:
 - **DatabaseName**: User-created database the harness connects to. The harness creates the synthetic `fis_blocking_locks_target` table inside this database (Synthetic_Mode) or expects to find the user-supplied target table inside it (Real_Mode), so the database user identified by `DatabaseUser` needs CREATE / INSERT / UPDATE / SELECT / DROP on it.
 - **DatabaseUser**: Database username (default: `postgres`)
 - **DatabasePasswordSecretArn**: ARN of Secrets Manager secret containing password
-  - **Note** Since we don't know the ARN of your secret ahead of time, the sample SSM automation role ([database-blocking-locks-ssm-automation-role-iam-policy.json](database-blocking-locks-ssm-automation-role-iam-policy.json)) is given read access to all secrets, you should probably scope this down accordingly.
+  - **Note** The database password is read by the **EC2 instance profile** (`SSM-Managed-Instance-Profile`), not by the SSM automation role: the sample SSM automation role ([database-blocking-locks-ssm-automation-role-iam-policy.json](database-blocking-locks-ssm-automation-role-iam-policy.json)) is granted no Secrets Manager access at all. Grant the instance profile `secretsmanager:GetSecretValue` on this one secret ARN (scope it to the single secret rather than `*`).
 - **TargetTableName**: `String`. Default: `fis_blocking_locks_target`. Selects the table the harness operates against and, by extension, the experiment mode:
   - **WARNING**: Real_Mode causes **actual application impact**. Any application transaction that contends for the locked row will block for up to `ExperimentDuration`. Only set `TargetTableName` to a non-default value when you have intentionally opted into targeting a real application table and have understood the blast radius for your engine (see the Engine-Specific Blast Radius section).
   - **SQL Server** accepts schema-qualified (`dbo.orders`) or unqualified (`orders`, defaulting to `dbo`) names.
@@ -198,14 +200,14 @@ Real_Mode never executes `INSERT`, `UPDATE`, `DELETE`, or DDL (`CREATE`, `ALTER`
 ### Phase 3: Blocker Acquires Row Lock
 8. The harness retrieves the database password from Secrets Manager (the secret can be a raw string or a JSON document with a `password` key).
 9. The harness opens a short-lived control connection. The behaviour from this point depends on the value of `TargetTableName`:
-   - **Synthetic_Mode** (`TargetTableName == fis_blocking_locks_target`, the default): if the table does not already exist, the harness creates it with an `id INT PRIMARY KEY` column and a `counter INT` column and seeds row `id = 1`. The harness records whether this run created the table so cleanup only drops the table if this run created it.
+   - **Synthetic_Mode** (`TargetTableName == fis_blocking_locks_target`, the default): if the table does not already exist, the harness creates it with a single `id INT PRIMARY KEY` column and seeds row `id = 1`. The harness records whether this run created the table so cleanup only drops the table if this run created it.
    - **Real_Mode** (any other value): the harness validates that the user-supplied table exists and is non-empty, introspects its primary key via engine-native metadata views (`information_schema.table_constraints` + `information_schema.key_column_usage` for PostgreSQL/MySQL, or `sys.indexes` + `sys.index_columns` + `sys.columns` for SQL Server), and selects the primary-key values of the first row ordered by primary key ascending. The harness performs no DDL or DML writes against the user-supplied table.
 10. The harness opens exactly one Blocker session, begins a transaction, and acquires the row lock using the engine-native idiom:
     - PostgreSQL and MySQL: `SELECT <pk_cols> FROM <table> WHERE <pk_clause> FOR UPDATE`
     - SQL Server: `SELECT <pk_cols> FROM <qualified_table> WITH (UPDLOCK, HOLDLOCK) WHERE <pk_clause>`
 
     In Synthetic_Mode `<pk_cols>` is `id`, `<table>` is `fis_blocking_locks_target` (or `dbo.fis_blocking_locks_target`), and `<pk_clause>` is `id = 1`. In Real_Mode `<pk_cols>`, `<table>`, and `<pk_clause>` are derived from the target table's primary key discovered at pre-flight time, with the primary-key values bound as driver parameters.
-11. The Blocker holds its transaction open for `ExperimentDuration` using a Python **in-process sleep**, not a database-side sleep function such as `pg_sleep`, `SLEEP`, or `WAITFOR DELAY`. This keeps the lock-hold period from being subject to database statement-level timeouts, and lets cancellation take effect immediately when the EC2 instance is terminated.
+11. The Blocker holds its transaction open for `ExperimentDuration` using a Python **in-process sleep** (waking every 15 seconds to run a `SELECT 1` liveness query), not a database-side sleep function such as `pg_sleep`, `SLEEP`, or `WAITFOR DELAY`. This keeps the lock-hold period from being subject to database statement-level timeouts. When the experiment is stopped early, the `StopHarness` automation step sends the harness `SIGTERM`; the harness exits through its cleanup path — it closes the Blocker connection (releasing the row lock), drops the synthetic table if this run created it, and the Waiter connections close as they unblock or when the process exits — all before the EC2 instance is terminated. (Without this step, terminating the instance strands the open connections until the database's TCP keepalive closes them, which took about 6 minutes in a test on Aurora PostgreSQL.)
 
 ### Phase 4: Waiter Ramp (Duration: RampTime)
 12. While the Blocker is holding the row lock, the harness computes the Waiter ramp schedule:
@@ -221,11 +223,11 @@ Real_Mode never executes `INSERT`, `UPDATE`, `DELETE`, or DDL (`CREATE`, `ALTER`
 14. Example: `WaiterCount=50`, `RampTime=PT1M`, `RampSteps=10` produces 10 steps of 5 Waiters each, roughly 6 seconds apart, so the engine-specific blocked-waiter metric climbs in ten 5-unit increments.
 
 ### Phase 5: Cleanup
-15. When `ExperimentDuration` elapses, the Blocker COMMITs and closes its connection.
+15. When `ExperimentDuration` elapses, the Blocker COMMITs and closes its connection. (On an early stop, the `SIGTERM` cleanup instead closes the Blocker connection without a COMMIT, which rolls the transaction back and releases the row lock. The harness then drops the table if this run created it and exits without joining the Waiter threads; any Waiter connection still open closes when the process exits.)
 16. Every Waiter's blocked locking `SELECT` returns, the Waiter COMMITs, and the Waiter closes its connection.
 17. The harness joins all Waiter threads.
 18. If this run created the `fis_blocking_locks_target` table, the harness drops it. If a pre-existing matching table was reused, the harness leaves it in place.
-19. The automation terminates the EC2 instance, waits for termination to complete, revokes the ingress rule from the database security group, and deletes the ephemeral security group.
+19. The automation runs the `StopHarness` step. If the harness is still running, the step sends it `SIGTERM` and waits up to 15 seconds for it to exit (then `SIGKILL`), so the Blocker and Waiter connections close and the row lock releases even on an early stop. The automation then terminates the EC2 instance, waits for termination to complete, revokes the ingress rule from the database security group, and deletes the ephemeral security group. (If the harness has to be `SIGKILL`ed, its cleanup does not run, so a synthetic table this run created may be left behind — see the Leftover Table Side Effect section.)
 
 ## Engine-Specific Blast Radius
 
@@ -275,9 +277,9 @@ The experiment template does not have any specific stop conditions defined by de
 - Manually stopped via FIS console/API
 - A custom CloudWatch alarm triggers (if configured)
 
-## Observability and Stop Conditions
-
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
+
+Whether the experiment ends normally or is stopped early (manually or by a stop condition), the automation runs the same `StopHarness` cleanup, so the Blocker and Waiters are released within seconds of the stop instead of staying until the database's TCP keepalive closes their connections (about 6 minutes in a test on Aurora PostgreSQL).
 
 #### MySQL-specific note: why the signal is bursty, not flat
 
@@ -294,8 +296,8 @@ The harness creates each Waiter once and does not replenish it after the engine 
 
 The most common reason the Blocker's lock is released before `ExperimentDuration` elapses is a DBA-configured idle-transaction timeout which is a useful guardrail against the conditions being generated in this experiment.
 
-- **Aurora PostgreSQL and RDS PostgreSQL**: `idle_in_transaction_session_timeout`, if set to a value shorter than `ExperimentDuration`, will cause the target database to terminate the Blocker's idle transaction early. This rolls back the lock and releases all Waiters before the planned duration elapses.
-- **Aurora MySQL and RDS MySQL**: `max_execution_time` only applies to individual `SELECT` statements under READ COMMITTED. Under the in-process-sleep approach used by this harness, no long-running statement runs while the lock is held, so `max_execution_time` is **not** expected to affect the Blocker. This is noted for completeness so that operators are not surprised if they see the parameter in their DB parameter group.
+- **Aurora PostgreSQL and RDS PostgreSQL**: `idle_in_transaction_session_timeout` ends the Blocker's transaction early only if it is set *shorter than the harness's liveness interval*. The Blocker is not left idle: it runs a `SELECT 1` on its connection every 15 seconds for the whole hold, which resets the idle-in-transaction timer each time. So only a value below roughly 15 seconds (15000 ms) terminates the Blocker early; a larger value — even one well under `ExperimentDuration`, such as a 60-second timeout on a 10-minute run — does not. If the timeout does fire, the harness detects the closed connection and logs `Blocker tx killed by server after Ns ... idle-in-tx kill`.
+- **Aurora MySQL and RDS MySQL**: `max_execution_time` only applies to individual `SELECT` statements. Under the in-process-sleep approach used by this harness, no long-running statement runs while the lock is held, so `max_execution_time` is **not** expected to affect the Blocker. This is noted for completeness so that operators are not surprised if they see the parameter in their DB parameter group.
 - **RDS SQL Server**: has no parameter analogous to `idle_in_transaction_session_timeout`; open transactions are not subject to idle timeouts by default.
 
 ## Leftover Table Side Effect
@@ -328,7 +330,7 @@ As you adapt this scenario to your needs, we recommend:
    SHOW VARIABLES LIKE 'max_execution_time';
    ```
 
-   For PostgreSQL, a value of `0` means "no timeout"; any non-zero value less than `ExperimentDuration` (in milliseconds) will cause the Blocker's idle transaction to be terminated early. RDS SQL Server has no equivalent setting. See the "DBA Guardrails and Pre-flight Check" section above for the full per-engine details.
+   For PostgreSQL, a value of `0` means "no timeout". Because the Blocker runs a `SELECT 1` every 15 seconds, only a non-zero value below roughly 15 seconds (15000 ms) terminates the Blocker's transaction early; larger values do not, even when they are less than `ExperimentDuration`. RDS SQL Server has no equivalent setting. See the "DBA Guardrails and Pre-flight Check" section above for the full per-engine details.
 6. **Monitor Cleanup**: Verify that the EC2 instance is terminated, the ephemeral security group is deleted, and the `fis_blocking_locks_target` table is gone (if this run created it) after the experiment.
 
 ## Import Experiment

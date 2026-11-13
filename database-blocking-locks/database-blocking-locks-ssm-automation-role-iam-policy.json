@@ -20,30 +20,54 @@
         {
             "Sid": "AllowEC2CreateSecurityGroup",
             "Effect": "Allow",
-            "Action": [
-                "ec2:CreateSecurityGroup",
-                "ec2:CreateTags"
-            ],
+            "Action": "ec2:CreateSecurityGroup",
             "Resource": "*"
+        },
+        {
+            "Sid": "AllowEC2TagOnCreate",
+            "Effect": "Allow",
+            "Action": "ec2:CreateTags",
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "ec2:CreateAction": [
+                        "RunInstances",
+                        "CreateSecurityGroup"
+                    ]
+                }
+            }
         },
         {
             "Sid": "AllowEC2InstanceManagementByTag",
             "Effect": "Allow",
-            "Action": [
-                "ec2:TerminateInstances",
-                "ec2:StopInstances"
-            ],
-            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*"
+            "Action": "ec2:TerminateInstances",
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Experiment": "DatabaseBlockingLocks"
+                }
+            }
         },
         {
             "Sid": "AllowEC2SecurityGroupManagementByTag",
             "Effect": "Allow",
             "Action": [
                 "ec2:DeleteSecurityGroup",
-                "ec2:AuthorizeSecurityGroupEgress",
+                "ec2:AuthorizeSecurityGroupEgress"
+            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Experiment": "DatabaseBlockingLocks"
+                }
+            }
+        },
+        {
+            "Sid": "AllowDatabaseSecurityGroupIngress",
+            "Effect": "Allow",
+            "Action": [
                 "ec2:AuthorizeSecurityGroupIngress",
-                "ec2:RevokeSecurityGroupIngress",
-                "ec2:RevokeSecurityGroupEgress"
+                "ec2:RevokeSecurityGroupIngress"
             ],
             "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*"
         },
@@ -61,10 +85,18 @@
             "Sid": "AllowSSMSendCommandToTaggedInstances",
             "Effect": "Allow",
             "Action": "ssm:SendCommand",
-            "Resource": [
-                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
-                "arn:aws:ssm:*:*:document/AWS-RunShellScript"
-            ]
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Experiment": "DatabaseBlockingLocks"
+                }
+            }
+        },
+        {
+            "Sid": "AllowSSMSendCommandDocument",
+            "Effect": "Allow",
+            "Action": "ssm:SendCommand",
+            "Resource": "arn:aws:ssm:<YOUR REGION>::document/AWS-RunShellScript"
         },
         {
             "Sid": "AllowSSMGetCommandInvocation",
@@ -79,13 +111,13 @@
                 "ssm:GetDocument",
                 "ssm:DescribeDocument"
             ],
-            "Resource": "arn:aws:ssm:*:*:document/AWS-RunShellScript"
+            "Resource": "arn:aws:ssm:<YOUR REGION>::document/AWS-RunShellScript"
         },
         {
             "Sid": "AllowPassRoleToEC2",
             "Effect": "Allow",
             "Action": "iam:PassRole",
-            "Resource": "arn:aws:iam::*:role/SSM-Managed-Instance-Profile",
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/SSM-Managed-Instance-Profile",
             "Condition": {
                 "StringEquals": {
                     "iam:PassedToService": "ec2.amazonaws.com"
@@ -99,7 +131,7 @@
                 "ssm:GetParameter",
                 "ssm:GetParameters"
             ],
-            "Resource": "arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*"
+            "Resource": "arn:aws:ssm:<YOUR REGION>::parameter/aws/service/ami-amazon-linux-latest/*"
         }
     ]
 }
