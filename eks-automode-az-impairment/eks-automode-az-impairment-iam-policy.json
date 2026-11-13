@@ -29,6 +29,48 @@
       "Resource": "*"
     },
     {
+      "Sid": "AllowInsufficientCapacityForNodeLaunchRoles",
+      "Effect": "Allow",
+      "Action": "ec2:InjectApiError",
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "ec2:FisActionId": [
+            "aws:ec2:api-insufficient-instance-capacity-error"
+          ]
+        },
+        "ForAllValues:StringLike": {
+          "ec2:FisTargetArns": [
+            "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR EKS CLUSTER ROLE NAME>"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "AllowInsufficientCapacityForNodeGroupASGs",
+      "Effect": "Allow",
+      "Action": "ec2:InjectApiError",
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "ec2:FisActionId": [
+            "aws:ec2:asg-insufficient-instance-capacity-error"
+          ]
+        },
+        "ForAllValues:StringLike": {
+          "ec2:FisTargetArns": [
+            "arn:aws:autoscaling:<YOUR REGION>:<YOUR AWS ACCOUNT>:autoScalingGroup:*:autoScalingGroupName/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "AllowDescribeNodeGroupASGs",
+      "Effect": "Allow",
+      "Action": "autoscaling:DescribeAutoScalingGroups",
+      "Resource": "*"
+    },
+    {
       "Sid": "AllowEKSDescribe",
       "Effect": "Allow",
       "Action": "eks:DescribeCluster",
@@ -63,6 +105,19 @@
       "Sid": "AllowTargetResolutionByTags",
       "Effect": "Allow",
       "Action": "tag:GetResources",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowZonalShift",
+      "Effect": "Allow",
+      "Action": [
+        "arc-zonal-shift:StartZonalShift",
+        "arc-zonal-shift:UpdateZonalShift",
+        "arc-zonal-shift:CancelZonalShift",
+        "arc-zonal-shift:GetManagedResource",
+        "arc-zonal-shift:ListManagedResources",
+        "autoscaling:DescribeTags"
+      ],
       "Resource": "*"
     }
   ]
