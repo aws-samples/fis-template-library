@@ -1,25 +1,27 @@
 {
-    "description": "ECS Fargate AZ Impairment (fault only) - Simulates availability zone network failure with task stop, network packet loss, and AZ connectivity disruption. No control-plane changes are made to the service.",
+    "description": "ECS Fargate AZ Impairment (fault only) - Injects 100% egress packet loss into the FIS-Ready tasks running in the target AZ for the first minute, then stops those tasks and denies intra-VPC traffic between the target AZ's FIS-Ready subnets and the other AZs for 15 minutes. Makes no change to the ECS service's configuration.",
     "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
     "actions": {
         "disrupt-az-connectivity": {
             "actionId": "aws:network:disrupt-connectivity",
-            "description": "Deny intra-VPC traffic between the target subnet and subnets in other Availability Zones, simulating an AZ network partition",
+            "description": "From 1 minute after the start, deny intra-VPC traffic between the target subnets and subnets in other Availability Zones for 15 minutes, simulating an AZ network partition",
             "parameters": {
                 "scope": "availability-zone",
                 "duration": "PT15M"
             },
             "targets": {
                 "Subnets": "subnet-in-az"
-            }
+            },
+            "startAfter": ["wait-before-stop"]
         },
         "inject-network-packet-loss": {
             "actionId": "aws:ecs:task-network-packet-loss",
-            "description": "Injects 100% packet loss for tasks in the target availability zone",
+            "description": "Injects 100% egress packet loss into the FIS-Ready tasks running in the target AZ at experiment start, for 1 minute, before the network fault starts. The AWS document keeps the ECS agent endpoint and the Region's SSM endpoints reachable. Doesn't install dependencies: the sidecar image must already have them",
             "parameters": {
-                "duration": "PT15M",
+                "duration": "PT1M",
                 "lossPercent": "100",
                 "sources": "0.0.0.0/0",
+                "installDependencies": "false",
                 "useEcsFaultInjectionEndpoints": "true"
             },
             "targets": {
@@ -28,14 +30,14 @@
         },
         "wait-before-stop": {
             "actionId": "aws:fis:wait",
-            "description": "Wait 1 minute for packet loss and connectivity disruption to take effect before stopping tasks",
+            "description": "Wait 1 minute, while packet loss is active, before stopping the tasks and starting the network fault",
             "parameters": {
                 "duration": "PT1M"
             }
         },
         "stop-tasks-in-az": {
             "actionId": "aws:ecs:stop-task",
-            "description": "Stop all ECS Fargate tasks running in the target availability zone",
+            "description": "Stop the FIS-Ready tasks that were running in the target AZ at experiment start",
             "targets": {
                 "Tasks": "ecs-tasks-for-stop"
             },
@@ -103,6 +105,6 @@
     },
     "experimentOptions": {
         "accountTargeting": "single-account",
-        "emptyTargetResolutionMode": "skip"
+        "emptyTargetResolutionMode": "fail"
     }
 }

@@ -2,24 +2,21 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowFISExperimentLogging",
+      "Sid": "AllowECSDescribeTasks",
       "Effect": "Allow",
-      "Action": [
-        "logs:CreateLogDelivery",
-        "logs:PutResourcePolicy",
-        "logs:DescribeResourcePolicies",
-        "logs:DescribeLogGroups"
-      ],
-      "Resource": "*"
+      "Action": "ecs:DescribeTasks",
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/*/*"
     },
     {
-      "Sid": "AllowECSTaskActions",
+      "Sid": "AllowECSStopFisReadyTasks",
       "Effect": "Allow",
-      "Action": [
-        "ecs:DescribeTasks",
-        "ecs:StopTask"
-      ],
-      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/*/*"
+      "Action": "ecs:StopTask",
+      "Resource": "arn:aws:ecs:<YOUR REGION>:<YOUR AWS ACCOUNT>:task/*/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
     },
     {
       "Sid": "AllowECSDescribeContainerInstances",
@@ -47,14 +44,21 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowSSMSendCommand",
+      "Sid": "AllowSSMSendPacketLossDocument",
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
-      "Resource": [
-        "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:managed-instance/*",
-        "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-ECS",
-        "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-Sources"
-      ]
+      "Resource": "arn:aws:ssm:<YOUR REGION>::document/AWSFIS-Run-Network-Packet-Loss-ECS"
+    },
+    {
+      "Sid": "AllowSSMSendCommandToFaultInjectionSidecars",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:managed-instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FAULT_INJECTION_SIDECAR": "true"
+        }
+      }
     },
     {
       "Sid": "AllowSSMCommandStatus",
@@ -72,24 +76,40 @@
       "Resource": "*"
     },
     {
-      "Sid": "AllowNetworkDisruptConnectivity",
+      "Sid": "AllowCreateNetworkAclInVpc",
       "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkAcl",
-        "ec2:CreateTags"
-      ],
-      "Resource": [
-        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*",
-        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
-      ]
+      "Action": "ec2:CreateNetworkAcl",
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*"
+    },
+    {
+      "Sid": "AllowCreateManagedNetworkAcl",
+      "Effect": "Allow",
+      "Action": "ec2:CreateNetworkAcl",
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/managedByFIS": "true"
+        }
+      }
+    },
+    {
+      "Sid": "AllowTagNetworkAclOnCreate",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": "CreateNetworkAcl",
+          "aws:RequestTag/managedByFIS": "true"
+        }
+      }
     },
     {
       "Sid": "AllowNetworkDisruptConnectivityOnManagedAcl",
       "Effect": "Allow",
       "Action": [
         "ec2:CreateNetworkAclEntry",
-        "ec2:DeleteNetworkAcl",
-        "ec2:ReplaceNetworkAclAssociation"
+        "ec2:DeleteNetworkAcl"
       ],
       "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
       "Condition": {
@@ -97,6 +117,23 @@
           "aws:ResourceTag/managedByFIS": "true"
         }
       }
+    },
+    {
+      "Sid": "AllowReplaceNetworkAclAssociationOnFisReadySubnets",
+      "Effect": "Allow",
+      "Action": "ec2:ReplaceNetworkAclAssociation",
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/FIS-Ready": "True"
+        }
+      }
+    },
+    {
+      "Sid": "AllowReplaceNetworkAclAssociationOnNetworkAcls",
+      "Effect": "Allow",
+      "Action": "ec2:ReplaceNetworkAclAssociation",
+      "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*"
     }
   ]
 }
