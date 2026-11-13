@@ -9,6 +9,7 @@ Browse the experiment directories to find templates for various fault injection 
 - **EC2 Instance Management**: `ec2-instances-terminate/`, `ec2-spot-interruption/`, `ec2-windows-stop-iis/`
 - **Database Resilience**: `aurora-cluster-failover/`, `sap-ebs-pause-database-data/`, `database-blocking-locks`, `database-connection-limit-exhaustion`
 - **SAP Systems**: `sap-ec2-instance-stop-ascs/`, `sap-ec2-instance-stop-database/`
+- **Amazon ElastiCache**: `elasticache-az-power-interruption/`, `elasticache-redis-connection-failure/`, `elasticache-redis-primary-node-failover/`, `elasticache-redis-primary-node-reboot/`, `elasticache-replication-stall/`
 - **Simple Queue Service (SQS)**: `sqs-queue-impairment/`
 - **AI Agents (Amazon Bedrock AgentCore)**: `agentcore-strands-agent-faults/`
 
