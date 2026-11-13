@@ -25,6 +25,6 @@
     },
     "experimentOptions": {
         "accountTargeting": "single-account",
-        "emptyTargetResolutionMode": "skip"
+        "emptyTargetResolutionMode": "fail"
     }
 }

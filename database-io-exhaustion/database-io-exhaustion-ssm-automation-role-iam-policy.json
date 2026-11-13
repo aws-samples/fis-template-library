@@ -20,19 +20,30 @@
         {
             "Sid": "AllowEC2CreateSecurityGroup",
             "Effect": "Allow",
-            "Action": [
-                "ec2:CreateSecurityGroup",
-                "ec2:CreateTags"
-            ],
+            "Action": "ec2:CreateSecurityGroup",
             "Resource": "*"
         },
         {
-            "Sid": "AllowEC2InstanceManagementByTag",
+            "Sid": "AllowEC2CreateTagsAtCreationOnly",
             "Effect": "Allow",
-            "Action": [
-                "ec2:TerminateInstances",
-                "ec2:StopInstances"
+            "Action": "ec2:CreateTags",
+            "Resource": [
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*"
             ],
+            "Condition": {
+                "StringEquals": {
+                    "ec2:CreateAction": [
+                        "RunInstances",
+                        "CreateSecurityGroup"
+                    ]
+                }
+            }
+        },
+        {
+            "Sid": "AllowEC2InstanceTerminationByTag",
+            "Effect": "Allow",
+            "Action": "ec2:TerminateInstances",
             "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
             "Condition": {
                 "StringEquals": {
@@ -82,13 +93,22 @@
             "Resource": "*"
         },
         {
-            "Sid": "AllowSSMSendCommandToTaggedInstances",
+            "Sid": "AllowSSMSendCommandToLoadGenerator",
             "Effect": "Allow",
             "Action": "ssm:SendCommand",
-            "Resource": [
-                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
-                "arn:aws:ssm:*:*:document/AWS-RunShellScript"
-            ]
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/ManagedBy": "FIS-SSM-Automation",
+                    "aws:ResourceTag/FIS-Experiment": "DatabaseIOExhaustion"
+                }
+            }
+        },
+        {
+            "Sid": "AllowSSMSendCommandDocument",
+            "Effect": "Allow",
+            "Action": "ssm:SendCommand",
+            "Resource": "arn:aws:ssm:*:*:document/AWS-RunShellScript"
         },
         {
             "Sid": "AllowSSMGetCommandInvocation",
@@ -109,7 +129,7 @@
             "Sid": "AllowPassRoleToEC2",
             "Effect": "Allow",
             "Action": "iam:PassRole",
-            "Resource": "arn:aws:iam::*:role/SSM-Managed-Instance-Profile-Role",
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/SSM-Managed-Instance-Profile-Role",
             "Condition": {
                 "StringEquals": {
                     "iam:PassedToService": "ec2.amazonaws.com"
