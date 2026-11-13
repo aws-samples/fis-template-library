@@ -25,17 +25,6 @@
                     "iam:PassedToService": "ssm.amazonaws.com"
                 }
             }
-        },
-        {
-            "Sid": "AllowCloudWatchLogs",
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogDelivery",
-                "logs:PutResourcePolicy",
-                "logs:DescribeResourcePolicies",
-                "logs:DescribeLogGroups"
-            ],
-            "Resource": "*"
         }
     ]
 }

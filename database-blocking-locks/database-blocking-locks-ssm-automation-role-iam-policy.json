@@ -12,16 +12,56 @@
             "Resource": "*"
         },
         {
-            "Sid": "AllowEC2RunInstances",
+            "Sid": "AllowRDSDescribeActions",
             "Effect": "Allow",
-            "Action": "ec2:RunInstances",
+            "Action": [
+                "rds:DescribeDBInstances",
+                "rds:DescribeDBClusters"
+            ],
             "Resource": "*"
         },
         {
-            "Sid": "AllowEC2CreateSecurityGroup",
+            "Sid": "AllowEC2RunInstancesTaggedInstance",
+            "Effect": "Allow",
+            "Action": "ec2:RunInstances",
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestTag/FIS-Experiment": "DatabaseBlockingLocks"
+                },
+                "ArnEquals": {
+                    "ec2:InstanceProfile": "arn:aws:iam::<YOUR AWS ACCOUNT>:instance-profile/DatabaseBlockingLocks-Instance-Profile"
+                }
+            }
+        },
+        {
+            "Sid": "AllowEC2RunInstancesOtherResources",
+            "Effect": "Allow",
+            "Action": "ec2:RunInstances",
+            "Resource": [
+                "arn:aws:ec2:<YOUR REGION>::image/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-interface/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:volume/*"
+            ]
+        },
+        {
+            "Sid": "AllowEC2CreateTaggedSecurityGroup",
             "Effect": "Allow",
             "Action": "ec2:CreateSecurityGroup",
-            "Resource": "*"
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestTag/FIS-Experiment": "DatabaseBlockingLocks"
+                }
+            }
+        },
+        {
+            "Sid": "AllowEC2CreateSecurityGroupInVpc",
+            "Effect": "Allow",
+            "Action": "ec2:CreateSecurityGroup",
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc/*"
         },
         {
             "Sid": "AllowEC2TagOnCreate",
@@ -51,10 +91,7 @@
         {
             "Sid": "AllowEC2SecurityGroupManagementByTag",
             "Effect": "Allow",
-            "Action": [
-                "ec2:DeleteSecurityGroup",
-                "ec2:AuthorizeSecurityGroupEgress"
-            ],
+            "Action": "ec2:DeleteSecurityGroup",
             "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
             "Condition": {
                 "StringEquals": {
@@ -69,7 +106,12 @@
                 "ec2:AuthorizeSecurityGroupIngress",
                 "ec2:RevokeSecurityGroupIngress"
             ],
-            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*"
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
         },
         {
             "Sid": "AllowSSMDescribeActions",
@@ -102,7 +144,7 @@
             "Sid": "AllowSSMGetCommandInvocation",
             "Effect": "Allow",
             "Action": "ssm:GetCommandInvocation",
-            "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:*"
+            "Resource": "*"
         },
         {
             "Sid": "AllowSSMDocumentAccess",
@@ -117,7 +159,7 @@
             "Sid": "AllowPassRoleToEC2",
             "Effect": "Allow",
             "Action": "iam:PassRole",
-            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/SSM-Managed-Instance-Profile",
+            "Resource": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/DatabaseBlockingLocks-Instance-Profile",
             "Condition": {
                 "StringEquals": {
                     "iam:PassedToService": "ec2.amazonaws.com"
@@ -132,6 +174,12 @@
                 "ssm:GetParameters"
             ],
             "Resource": "arn:aws:ssm:<YOUR REGION>::parameter/aws/service/ami-amazon-linux-latest/*"
+        },
+        {
+            "Sid": "AllowReadAutomationExecutionsForLeftoverGroups",
+            "Effect": "Allow",
+            "Action": "ssm:GetAutomationExecution",
+            "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
         }
     ]
 }

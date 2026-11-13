@@ -6,7 +6,15 @@
             "Principal": {
                 "Service": "fis.amazonaws.com"
             },
-            "Action": "sts:AssumeRole"
+            "Action": "sts:AssumeRole",
+            "Condition": {
+                "StringEquals": {
+                    "aws:SourceAccount": "<YOUR AWS ACCOUNT>"
+                },
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:fis:<YOUR REGION>:<YOUR AWS ACCOUNT>:experiment/*"
+                }
+            }
         }
     ]
 }
