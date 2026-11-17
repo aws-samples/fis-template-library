@@ -1,5 +1,5 @@
 {
-    "description": "Database Blocking Locks - Injects row-level blocking locks (single blocker, N waiters) into an RDS or Aurora database to rehearse detection, diagnosis, and recovery of blocking-lock incidents",
+    "description": "Database Blocking Locks - Holds a row-level lock (one Blocker, N Waiters) on a table in an RDS or Aurora database tagged FIS-Ready=True, to rehearse detection, diagnosis and recovery of blocking-lock incidents",
     "targets": {},
     "actions": {
         "InjectBlockingLocks": {
@@ -8,7 +8,7 @@
             "parameters": {
                 "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/DatabaseBlockingLocks-Automation",
                 "documentParameters": "{\"DatabaseEngine\":\"postgres\",\"DatabaseEndpoint\":\"<YOUR DATABASE ENDPOINT>\",\"DatabasePort\":\"5432\",\"DatabaseName\":\"postgres\",\"DatabaseUser\":\"postgres\",\"DatabasePasswordSecretArn\":\"<YOUR SECRET ARN>\",\"WaiterCount\":\"50\",\"ExperimentDuration\":\"PT10M\",\"RampTime\":\"PT1M\",\"RampSteps\":\"10\",\"VpcId\":\"<YOUR VPC ID>\",\"SubnetId\":\"<YOUR SUBNET ID>\",\"DatabaseSecurityGroupId\":\"<YOUR DATABASE SECURITY GROUP ID>\",\"InstanceType\":\"t3.small\",\"TargetTableName\":\"fis_blocking_locks_target\"}",
-                "maxDuration": "PT180M"
+                "maxDuration": "PT200M"
             }
         }
     },
@@ -24,6 +24,6 @@
     },
     "experimentOptions": {
         "accountTargeting": "single-account",
-        "emptyTargetResolutionMode": "skip"
+        "emptyTargetResolutionMode": "fail"
     }
 }
