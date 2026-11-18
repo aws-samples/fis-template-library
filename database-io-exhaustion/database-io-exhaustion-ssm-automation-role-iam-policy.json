@@ -6,8 +6,7 @@
             "Effect": "Allow",
             "Action": [
                 "ec2:DescribeInstances",
-                "ec2:DescribeInstanceStatus",
-                "ec2:DescribeSecurityGroups"
+                "ec2:DescribeInstanceStatus"
             ],
             "Resource": "*"
         },
@@ -15,28 +14,33 @@
             "Sid": "AllowEC2RunInstances",
             "Effect": "Allow",
             "Action": "ec2:RunInstances",
-            "Resource": "*"
+            "Resource": [
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:volume/*",
+                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-interface/*",
+                "arn:aws:ec2:<YOUR REGION>:*:subnet/*",
+                "arn:aws:ec2:<YOUR REGION>::image/*"
+            ]
         },
         {
-            "Sid": "AllowEC2CreateSecurityGroup",
+            "Sid": "AllowEC2RunInstancesInTaggedLoadGeneratorSecurityGroup",
             "Effect": "Allow",
-            "Action": "ec2:CreateSecurityGroup",
-            "Resource": "*"
+            "Action": "ec2:RunInstances",
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Experiment": "DatabaseIOExhaustion"
+                }
+            }
         },
         {
             "Sid": "AllowEC2CreateTagsAtCreationOnly",
             "Effect": "Allow",
             "Action": "ec2:CreateTags",
-            "Resource": [
-                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
-                "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*"
-            ],
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:instance/*",
             "Condition": {
                 "StringEquals": {
-                    "ec2:CreateAction": [
-                        "RunInstances",
-                        "CreateSecurityGroup"
-                    ]
+                    "ec2:CreateAction": "RunInstances"
                 }
             }
         },
@@ -49,36 +53,6 @@
                 "StringEquals": {
                     "aws:ResourceTag/ManagedBy": "FIS-SSM-Automation",
                     "aws:ResourceTag/FIS-Experiment": "DatabaseIOExhaustion"
-                }
-            }
-        },
-        {
-            "Sid": "AllowLoadGeneratorSecurityGroupManagementByTag",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:DeleteSecurityGroup",
-                "ec2:AuthorizeSecurityGroupEgress",
-                "ec2:RevokeSecurityGroupEgress"
-            ],
-            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
-            "Condition": {
-                "StringEquals": {
-                    "aws:ResourceTag/ManagedBy": "FIS-SSM-Automation",
-                    "aws:ResourceTag/FIS-Experiment": "DatabaseIOExhaustion"
-                }
-            }
-        },
-        {
-            "Sid": "AllowDatabaseSecurityGroupIngressManagement",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:AuthorizeSecurityGroupIngress",
-                "ec2:RevokeSecurityGroupIngress"
-            ],
-            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:security-group/*",
-            "Condition": {
-                "StringEquals": {
-                    "aws:ResourceTag/FIS-Ready": "True"
                 }
             }
         },

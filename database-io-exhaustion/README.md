@@ -7,6 +7,15 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTIO
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+## What this experiment does in your account
+
+- **You set up once:** a security group for the load generator, tagged `FIS-Experiment=DatabaseIOExhaustion`, and a rule on your database's security group that lets it in on the database port (see Prerequisites). The experiment never creates, changes or deletes a security group.
+- **Each run creates:** one EC2 instance in your subnet (the load generator) and tables named `fis_io_<suffix>_<n>` in your database.
+- **When a run ends or is stopped,** it drops those tables and terminates the instance. If it can't, its cleanup step fails and names what is left.
+- **A stop at one exact moment can leave the instance running, and nothing reports it.** If the stop arrives in the fraction of a second as a command step finishes, Systems Manager can skip the cleanup. This was seen at the end of the table step. The instance is set to shut itself down about 200 minutes after it launched (see Known limitations).
+- **After every stop,** check that the instance is gone, and in some cases the tables. The commands are under Stop Conditions.
+- **The load also affects** every other client of the database. On RDS with storage autoscaling it can also raise the allocated storage, which can't be reduced afterwards (see What else is affected).
+
 ## Hypothesis
 
 When {service1} database I/O utilisation is approaching saturation, users of {workload} should be able to complete the {service1} user journey within the SLA of 2 seconds and other critical user journeys relating to {workload}; {service2} and {service3} should continue unaffected. The steady state of {n} transactions per second should be maintained. A leading alarm should be raised and the DevOps team notified within {y} minutes. The database performance insights report should provide the DevOps team with insight into I/O bottlenecks.
@@ -29,7 +38,7 @@ This experiment tests your application's resilience to database I/O exhaustion b
 2. **Bootstrapping** the instance with the appropriate database client (PostgreSQL, MySQL, SQL Server, or Oracle)
 3. **Seeding** each worker's table with baseline rows so read and mixed workloads have real data to scan/update, then **generating heavy I/O load** with concurrent worker threads performing read, write, or mixed operations
 4. **Verifying** the fault was actually injected (a minimum percentage of workers recorded I/O operations) and failing the experiment if it was not
-5. **Cleaning up** the run's test tables, the load generator instance, its security group and the temporary rule on your database's security group, and failing the run, naming what is left, if any of these can't be removed
+5. **Cleaning up** the run's test tables and the load generator instance, and failing, naming what is left, if either can't be removed. A stop at one rare moment can skip this cleanup (see Known limitations)
 
 The experiment is **parameterized by database engine**, targeting these engines in RDS: Aurora PostgreSQL, RDS PostgreSQL, RDS Oracle, Aurora MySQL, RDS MySQL and RDS SQL Server. Aurora PostgreSQL, RDS MySQL, RDS Oracle and RDS SQL Server (Express) have recorded runs of this version (see **Tested with** under Prerequisites); RDS PostgreSQL and Aurora MySQL have not.
 
@@ -42,33 +51,27 @@ FIS Experiment
     ↓
 SSM Automation Document
     ↓
-1. Create temporary security group FIS-DatabaseIO-LoadGen-<execution-id>
+1. Launch EC2 instance (Amazon Linux 2023) into the load generator security
+   group you created, client token = execution ID; its user data schedules
+   its own shutdown in 200 minutes
     ↓
-2. Replace its default allow-all egress with: database port → database SG,
-   and HTTPS (443) for SSM, Secrets Manager and package repositories
+2. Wait for SSM Agent to be online
     ↓
-3. Add ingress rule: Database SG ← load generator SG (database SG must be
-   tagged FIS-Ready=True)
+3. Schedule the shutdown again in 200 minutes; install database client
     ↓
-4. Launch EC2 instance (Amazon Linux 2023), client token = execution ID;
-   its user data schedules its own shutdown in 200 minutes
-    ↓
-5. Wait for SSM Agent to be online
-    ↓
-6. Schedule the shutdown again in 200 minutes; install database client
-    ↓
-7. Run the I/O load with N worker threads for ExperimentDuration; fail if
+4. Run the I/O load with N worker threads for ExperimentDuration; fail if
    too few workers recorded I/O or any worker hung
     ↓
-8. CleanupTables: stop this run's load process if it is still running, drop
+5. CleanupTables: stop this run's load process if it is still running, drop
    this run's tables, fail naming any that remain
     ↓
-9. CleanupInfrastructure: terminate the instance, revoke the ingress rule,
-   delete the security group, fail naming anything left
+6. CleanupInfrastructure: terminate the instance, fail naming it if it
+   isn't shutting down
 
-On a stop: steps 8 and 9 run as StopLoadAndDropTablesOnCancel and
-CleanupInfrastructureOnCancel, each bounded to fit the 2-minute cancel window
-(a stop during step 4 waits first for the launch to finish; see Stop Conditions)
+On a stop: CleanupTables and CleanupInfrastructure run as
+StopLoadAndDropTablesOnCancel and CleanupInfrastructureOnCancel, each bounded
+to fit the 2-minute cancel window (a stop during the launch waits first for
+the launch to finish; see Stop Conditions)
 ```
 
 ## Prerequisites
@@ -77,27 +80,56 @@ Before running this experiment, ensure that:
 
 1. **VPC Configuration**:
    - You have a VPC with at least one subnet that can reach your database
-   - You know the VPC ID and subnet ID
-   - You know the security group ID attached to your database
+   - You know the subnet ID, the VPC it is in, and the security group ID attached to your database
    - The subnet's route table and any VPC endpoints/NAT provide the load generator with outbound HTTPS (443) connectivity to:
      - Amazon SSM and SSM Messages endpoints (required for the SSM Agent and Run Command)
      - AWS Secrets Manager (to retrieve the database password)
      - Amazon Linux package repositories (`dnf`) and PyPI (for `pip3` installs)
      - `packages.microsoft.com` (SQL Server engine only - mssql-tools repo)
      - `download.oracle.com` (Oracle engine only - Instant Client RPMs)
-   - The temporary security group's egress is restricted to the database port and HTTPS (443) only - see "How It Works" Phase 1 below
 
-2. **Database Configuration**:
+2. **Load generator security group**: create it once, in the subnet's VPC, and use it for every run. If your database's security group is managed by CloudFormation, the CDK or Terraform, add the group and the rule there instead, so a later deploy doesn't remove the rule or report it as drift.
+   1. Create the group with the tag that the automation role's IAM policy requires. The command prints the new group's ID:
+      ```
+      aws ec2 create-security-group \
+        --group-name FIS-DatabaseIO-LoadGenerator \
+        --description "Load generator for the FIS database I/O exhaustion experiment" \
+        --vpc-id <VPC ID> \
+        --tag-specifications 'ResourceType=security-group,Tags=[{Key=FIS-Experiment,Value=DatabaseIOExhaustion}]'
+      ```
+   2. Allow it into your database's security group on the database port:
+      ```
+      aws ec2 authorize-security-group-ingress \
+        --group-id <database security group ID> \
+        --ip-permissions 'IpProtocol=tcp,FromPort=<port>,ToPort=<port>,UserIdGroupPairs=[{GroupId=<load generator security group ID>}]'
+      ```
+   3. Replace the group's allow-all outbound rule with two rules, the database port to your database's security group and HTTPS (443). Without this step, the load generator can send traffic anywhere:
+      ```
+      aws ec2 revoke-security-group-egress \
+        --group-id <load generator security group ID> \
+        --ip-permissions 'IpProtocol=-1,IpRanges=[{CidrIp=0.0.0.0/0}]'
+      aws ec2 authorize-security-group-egress \
+        --group-id <load generator security group ID> \
+        --ip-permissions 'IpProtocol=tcp,FromPort=<port>,ToPort=<port>,UserIdGroupPairs=[{GroupId=<database security group ID>}]'
+      aws ec2 authorize-security-group-egress \
+        --group-id <load generator security group ID> \
+        --ip-permissions 'IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}]'
+      ```
+   4. Check the outbound rules: `aws ec2 describe-security-group-rules --filters Name=group-id,Values=<load generator security group ID> --query "SecurityGroupRules[?IsEgress].[SecurityGroupRuleId,IpProtocol,FromPort,CidrIpv4,CidrIpv6,ReferencedGroupInfo.GroupId]"`. It should list only the two rules you added. If it also lists a rule to `::/0`, remove it with `aws ec2 revoke-security-group-egress --group-id <load generator security group ID> --security-group-rule-ids <rule ID>`
+
+   Outside a run the group has no members, so the rule on your database's security group lets nothing in. Use the group only for this experiment: anything else in it can reach the database too.
+
+3. **Database Configuration**:
    - A supported database is running (see Description above)
    - You know the database endpoint and username, and the password is in a Secrets Manager secret (a JSON secret with a `password` key, or a plain-text secret)
    - The database user has permissions to CREATE and DROP tables. On PostgreSQL the cleanup also ends this run's own sessions with `pg_terminate_backend`, which a user may do for its own sessions. On MySQL it ends, with `KILL`, this user's sessions still running a statement on this run's tables, which a user may do for its own threads. On SQL Server it does the same if the user has `VIEW SERVER STATE` and `ALTER ANY CONNECTION`: it checks for `VIEW SERVER STATE` first, and without either permission it logs a warning and goes on. On Oracle it doesn't end sessions. Where no session is ended, a statement the killed load started can keep a table locked until the drop's deadline; the table step then fails naming the table
-   - The database security group (`DatabaseSecurityGroupId`) is tagged `FIS-Ready=True` - the SSM automation role's IAM policy only permits ingress changes on security groups carrying this tag. The experiment doesn't check the database itself for the tag: it puts load on whatever database `DatabaseEndpoint` names, so name only a database you mean to fault
+   - The experiment puts load on whatever database `DatabaseEndpoint` names, as long as the load generator can reach it and sign in with your secret. That includes every database that uses your database's security group and, if you kept the allow-all outbound rule, any database whose security group allows your subnet's addresses. It doesn't check which database it is, so name only a database you mean to fault
 
-3. **Load generator**:
+4. **Load generator**:
    - The default AMI is the latest Amazon Linux 2023 image, which includes the SSM Agent, cloud-init (which runs the launch's user data), `python3`, `bash` 5, coreutils `timeout` and systemd `shutdown`, all of which the scripts use. If you pass another `LatestAmiId`, it must provide the same
    - The instance keeps its per-run files in `/var/lib/fis-database-io-exhaustion/<execution-id>`, readable only by root
 
-4. **Tested with**: Aurora PostgreSQL 17.9, one `db.t4g.medium` writer, in `eu-central-1`, with the default parameters. Three completion runs each ran 50 of 50 workers with no errors and did 105,281, 96,157 and 93,151 operations. In the first, the writer's WriteIOPS (a per-second rate, averaged over each minute) rose from 12 to 23 up to between 3,720 and 12,351, and the load was limited by CPU (72 to 95%) more than by storage: ReadIOPS stayed at 0 to 2, because reads came from the buffer cache, and DiskQueueDepth was mostly 0, with single minutes at 9 and 41. RDS MySQL 8.0 (`db.t3.small`, 20 GB gp3, `eu-west-1`): 50 of 50 workers, 52,240 operations, WriteIOPS from 0 to 3 up to 177 to 661 and ReadIOPS up to 702, CPU 89%; the completion run dropped all 50 tables, and a stop at peak and a stop with a lock held on one table both dropped every table and ended the run's sessions. RDS Oracle (`oracle-se2` 19c, `db.t3.small`, 20 GB, `us-east-2`): 50 of 50 workers, 338,772 operations, WriteIOPS from about 2 to between 1,210 and 1,547; the completion run and a stop at peak dropped all 50 tables, and with a lock held on one table the drop returned ORA-00054, so the step named that table to drop by hand while the infrastructure cleanup still succeeded. RDS SQL Server Express (`db.t3.small`, 20 GB, `eu-north-1`): 50 of 50 workers, 15,955 operations, ReadIOPS from 0 to 2 up to between 1,132 and 2,484; the completion run and a stop at peak dropped all 50 tables, and with a login lacking `VIEW SERVER STATE` the cleanup logged the documented warning and still dropped them. RDS PostgreSQL, Aurora MySQL, other instance classes and other Regions haven't been tested
+5. **Tested with**: Aurora PostgreSQL 17.9, one `db.t4g.medium` writer, in `ca-central-1`, with the default parameters: 50 of 50 workers, 154,168 operations, no errors. The writer's WriteIOPS (a per-second rate, averaged over each minute) rose from 16 to 21 up to between 3,749 and 12,736, and the load was limited by CPU (85 to 92%) more than by storage: ReadIOPS stayed at 0 to 3, because reads came from the buffer cache, and DiskQueueDepth was 0 except for one minute at 7. RDS MySQL 8.0 (`db.t3.small`, 20 GB gp3, `eu-west-1`): 50 of 50 workers, 53,833 operations, WriteIOPS from under 1 up to between 210 and 751, ReadIOPS up to 661, CPU up to 91%; a stop at peak dropped all 50 tables, and with a lock held on one table the cleanup ended the session holding it and dropped every table. RDS Oracle (`oracle-se2` 19c, `db.t3.small`, 20 GB, `us-east-2`): 50 of 50 workers, 318,382 operations, WriteIOPS from about 2 up to between 1,041 and 1,759; a stop at peak dropped all 50 tables, and with a lock held on one table the drop returned ORA-00054, so the step named that table to drop by hand while the instance was still terminated. RDS SQL Server 2022 Express (`db.t3.small`, 20 GB, `eu-north-1`): 50 of 50 workers, 22,528 operations, ReadIOPS from 0 to 1 up to between 2,910 and 2,937; a stop at peak dropped all 50 tables, and with a login lacking `VIEW SERVER STATE` the cleanup logged the documented warning and still dropped them. RDS PostgreSQL, Aurora MySQL, other instance classes and other Regions haven't been tested
 
 ### Create Required Experiment Resources
 
@@ -110,14 +142,21 @@ Before running this experiment, ensure that:
    - EC2 instance role (`SSM-Managed-Instance-Profile-Role`, attached via instance profile `SSM-Managed-Instance-Profile`) with the `AmazonSSMManagedInstanceCore` managed policy **and** `database-io-exhaustion-ec2-instance-role-iam-policy.json`, and trust policy `ec2-iam-trust-relationship.json`
      - **Important**: the load generator retrieves the database password via `boto3.get_secret_value()` inside the `AWS-RunShellScript` command, which runs under this EC2 instance role - not the SSM automation role. Secrets Manager (and KMS, if the secret uses a customer-managed key) permissions belong here, scoped to your specific secret ARN. Any other instance that uses the same instance profile also gets read access to that secret
    - **Note**: this template hardcodes the role/document names above (the automation document's `assumeRole` and the FIS action's `documentArn`/`roleArn` reference them directly). Create the roles with these exact names, or update `database-io-exhaustion-automation.yaml` and `database-io-exhaustion-experiment-template.json` consistently if you rename them.
-   - The SSM automation role can run commands only on instances tagged `ManagedBy=FIS-SSM-Automation` and `FIS-Experiment=DatabaseIOExhaustion`, terminate only such instances, change only security groups with those tags or `FIS-Ready=True`, and add tags only when it creates an instance or a security group. `ec2:RunInstances` isn't limited further
+   - The SSM automation role can launch the load generator only into a security group tagged `FIS-Experiment=DatabaseIOExhaustion`, run commands only on instances tagged `ManagedBy=FIS-SSM-Automation` and `FIS-Experiment=DatabaseIOExhaustion`, terminate only such instances, and add tags only when it launches an instance. It has no permission to create, change or delete security groups
 
 3. **SSM Document**:
    - Deploy the SSM automation document (`database-io-exhaustion-automation.yaml`) to your account, naming it `DatabaseIOExhaustion-Automation`
 
+### If you used an earlier version of this experiment
+
+- Update the SSM document, the automation role's policy and the experiment template's `documentParameters` together: remove `VpcId` and `DatabaseSecurityGroupId`, and add `LoadGeneratorSecurityGroupId`. A template that still passes the old parameters fails to start the automation with `InvalidAutomationExecutionParametersException`. If you update the existing document with `aws ssm update-document`, make the new version the default, because FIS runs the default version: `aws ssm update-document-default-version --name DatabaseIOExhaustion-Automation --document-version <new version>`
+- Create the load generator's security group as Prerequisites item 2 describes. The `FIS-Ready=True` tag on your database's security group is no longer used
+- Earlier versions had no self-shutdown, so a load generator an interrupted run left can still be running. While no experiment from this template is running, list them with `aws ec2 describe-instances --filters Name=tag:FIS-Experiment,Values=DatabaseIOExhaustion Name=instance-state-name,Values=pending,running,stopping,stopped --query "Reservations[].Instances[].[InstanceId,State.Name,LaunchTime]"`, terminate each with `aws ec2 terminate-instances --instance-ids <instance ID>`, and wait with `aws ec2 wait instance-terminated --instance-ids <instance ID>`. Earlier versions also left tables on a stop. Still with no experiment running, list every table whose name starts with `fis_io_`: in Manual restore's queries use the pattern `fis\_io\_%` (`fis[_]io[_]%` on SQL Server, `FIS\_IO\_%` on Oracle), and drop the tables as it describes
+- Earlier versions created a security group for each run and added a rule for it to your database's security group. To list any that an interrupted run left: `aws ec2 describe-security-groups --filters Name=tag:FIS-Experiment,Values=DatabaseIOExhaustion Name=tag:ManagedBy,Values=FIS-SSM-Automation --query "SecurityGroups[].[GroupId,GroupName]"`. Your new group doesn't carry `ManagedBy`, so it isn't listed. For each group listed, find the rule that names it with `aws ec2 describe-security-group-rules --filters Name=group-id,Values=<database security group ID> --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='<old group ID>'].SecurityGroupRuleId"`, remove it with `aws ec2 revoke-security-group-ingress --group-id <database security group ID> --security-group-rule-ids <rule ID>`, then delete the group with `aws ec2 delete-security-group --group-id <old group ID>`
+
 ## Parameters
 
-The experiment requires the following parameters. Each has an allowed pattern, so a value with spaces, quotes or shell characters is rejected before the run starts.
+The experiment requires the following parameters. Each has an allowed pattern or a list of allowed values, so a value with spaces, quotes or shell characters is rejected before the run starts.
 
 ### Database Configuration
 - **DatabaseEngine**: `postgres`, `mysql`, `sqlserver`, or `oracle` (default: `postgres`)
@@ -139,8 +178,7 @@ The experiment requires the following parameters. Each has an allowed pattern, s
 
 ### Infrastructure
 - **SubnetId**: Subnet ID where load generator will be launched
-- **VpcId**: VPC ID where the load generator will be launched (used to create security group)
-- **DatabaseSecurityGroupId**: Security group ID of the target database, must be tagged `FIS-Ready=True` (automation will add temporary ingress rule)
+- **LoadGeneratorSecurityGroupId**: The security group you created for the load generator (see Prerequisites), in the subnet's VPC and tagged `FIS-Experiment=DatabaseIOExhaustion`. Without the tag, the launch fails with `UnauthorizedOperation`
 - **InstanceType**: EC2 instance type for Load Generator (default: t3.medium - use larger instances for high thread counts)
 
 ## Executing the Experiment
@@ -150,7 +188,7 @@ The experiment requires the following parameters. Each has an allowed pattern, s
   2. Select the experiment template "Database-io-exhaustion"
   3. Select **Actions / Update Experiment Template**
   4. Select the **ExhaustDatabaseIO** Action
-  5. Update the **Document parameters** to match your target e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": "5432", "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx", "WorkerThreads": "50", "ExperimentDuration": "PT10M", "IOPattern": "mixed", "SeedRowCount": "500", "MinActiveWorkerPercentage": "50", "SubnetId": "subnet-0123456789abcdef0", "VpcId": "vpc-0123456789abcdef0", "DatabaseSecurityGroupId": "sg-0123456789abcdef0", "InstanceType": "t3.medium"}
+  5. Update the **Document parameters** to match your target e.g. {"DatabaseEngine": "postgres", "DatabaseEndpoint": "database-1.cluster-1234abcde.eu-west-1.rds.amazonaws.com", "DatabasePort": "5432", "DatabaseName": "postgres", "DatabaseUser": "postgres", "DatabasePasswordSecretArn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!cluster-xxxx", "WorkerThreads": "50", "ExperimentDuration": "PT10M", "IOPattern": "mixed", "SeedRowCount": "500", "MinActiveWorkerPercentage": "50", "SubnetId": "subnet-0123456789abcdef0", "LoadGeneratorSecurityGroupId": "sg-0123456789abcdef0", "InstanceType": "t3.medium"}
   6. **Note** there is no target defined in the FIS experiment template since this is managed through the SSM Automation document and the Document parameters you just entered, so **do not amend the target section of the template**
   7. Select **Save** and then **Update experiment template**
   8. You can now **Start experiment**
@@ -159,36 +197,33 @@ The experiment requires the following parameters. Each has an allowed pattern, s
 
 Each step has its own timeout, given in brackets. The whole runbook, at its longest, fits inside the FIS action's `maxDuration` of PT180M.
 
-### Phase 1: Infrastructure Creation
-1. Creates a temporary security group in your VPC named `FIS-DatabaseIO-LoadGen-<execution-id>`, tagged `ManagedBy=FIS-SSM-Automation` and `FIS-Experiment=DatabaseIOExhaustion` (60 s)
-2. Revokes the security group's default allow-all outbound rule, then adds explicit egress rules: load generator → database port, and load generator → HTTPS (443) for SSM, Secrets Manager, and package repositories. Only these two rules exist afterward (60 s)
-3. Adds an ingress rule to the database security group allowing the database port from the load generator's security group. The IAM policy allows this only if the database security group is tagged `FIS-Ready=True` (60 s)
-4. Launches an EC2 instance in your subnet with the new security group, the client token set to the automation execution ID, `InstanceInitiatedShutdownBehavior=terminate`, user data that schedules the instance's own shutdown 200 minutes after its first boot (so that if no cleanup runs at all, it still terminates itself after the experiment's `maxDuration` has passed), and the tags `FIS-Experiment=DatabaseIOExhaustion`, `ManagedBy=FIS-SSM-Automation` and `AutoCleanup=true` (300 s)
-5. Waits for the SSM Agent to report online (300 s)
+### Phase 1: Launch
+1. Launches an EC2 instance in your subnet with your load generator security group, the client token set to the automation execution ID, `InstanceInitiatedShutdownBehavior=terminate`, user data that schedules the instance's own shutdown 200 minutes after its first boot (so that if no cleanup runs at all, it still terminates itself after the experiment's `maxDuration` has passed), and the tags `FIS-Experiment=DatabaseIOExhaustion`, `ManagedBy=FIS-SSM-Automation` and `AutoCleanup=true` (300 s)
+2. Waits for the SSM Agent to report online (300 s)
 
 ### Phase 2: Bootstrap
-6. Schedules the instance's shutdown again, 200 minutes from now, in case the user data didn't run. Then installs the database client for `DatabaseEngine` (900 s)
+3. Schedules the instance's shutdown again, 200 minutes from now, in case the user data didn't run. Then installs the database client for `DatabaseEngine` (900 s)
 
 ### Phase 3: I/O Exhaustion
-7. Creates `/var/lib/fis-database-io-exhaustion` (root only, mode 0700; the step fails if it exists with another owner or mode) and a subdirectory for this execution, and writes the load script and the cleanup script there
-8. Starts the load script and records its PID and start time in that directory. The script retrieves the database password from Secrets Manager using the **EC2 instance role**, refuses an `ExperimentDuration` outside `PT1S`-`PT110M`, then launches `WorkerThreads` threads, each:
-   - Creating its own table `fis_io_<execution-suffix>_<thread_id>`, where `<execution-suffix>` is the last 8 characters of the automation execution ID, so tables never collide with other tables or with a concurrent run's
+4. Creates `/var/lib/fis-database-io-exhaustion` (root only, mode 0700; the step fails if it exists with another owner or mode) and a subdirectory for this execution, and writes the load script and the cleanup script there
+5. Starts the load script and records its PID and start time in that directory. The script retrieves the database password from Secrets Manager using the **EC2 instance role**, refuses an `ExperimentDuration` outside `PT1S`-`PT110M`, then launches `WorkerThreads` threads, each:
+   - Creating its own table `fis_io_<execution-suffix>_<thread_id>`, where `<execution-suffix>` is the last 8 characters of the automation execution ID. Two runs get the same suffix only by chance, about 1 in 4 billion. Don't give your own tables names starting with `fis_io_`: the cleanup drops tables that match the run's pattern
    - Connecting with a 10-second connect timeout (on Oracle, `TRANSPORT_CONNECT_TIMEOUT=10` in the connect descriptor); on PostgreSQL with `application_name=fis_io_<execution-suffix>`
    - Seeding `SeedRowCount` rows, then performing I/O based on `IOPattern` until `ExperimentDuration` ends:
      - **Write**: INSERT rows with 4KB text + 8KB binary payload
-     - **Read**: SELECT with random ordering, COUNT queries, size queries
+     - **Read**: SELECT with random ordering, plus COUNT and size queries on PostgreSQL
      - **Mixed**: All of the above plus random UPDATE operations
-   - Dropping its own table when it finishes (errors in this drop are ignored; step 10 catches what it leaves)
-9. Waits for the workers until 300 seconds after the duration ends. The step fails if any worker is still running then, or if fewer than `MinActiveWorkerPercentage` of the workers recorded I/O. The summary (active workers, total operations and errors, `FaultInjected`) is in the `ExhaustDatabaseIO` command output; the automation's own outputs are the instance ID and the security group ID (7,500 s; the command is bounded at 7,320 s)
+   - Dropping its own table when it finishes (errors in this drop are ignored; step 7 catches what it leaves)
+6. Waits for the workers until 300 seconds after the duration ends. The step fails if any worker is still running then, or if fewer than `MinActiveWorkerPercentage` of the workers recorded I/O. The summary (active workers, total operations and errors, `FaultInjected`) is in the `ExhaustDatabaseIO` command output; the automation's own output is the instance ID (7,500 s; the command is bounded at 7,320 s)
 
 ### Phase 4: Cleanup
-10. **CleanupTables** (300 s): stops this run's load process if it is still running, by its recorded PID while the start time still matches, or by its command line naming this run's own script path. It never signals another run's process. It then connects to the database with a 3-second lock timeout (and an 8-second statement timeout on PostgreSQL), ends this run's own sessions (on PostgreSQL by their `application_name`; on MySQL and SQL Server, this user's sessions running a statement other than a drop on this run's tables; on SQL Server only if the user has `VIEW SERVER STATE`, and otherwise it logs a warning), drops every `fis_io_<execution-suffix>_*` table, and retries within a 180-second deadline. A statement a killed client started can keep its table locked on the server until the server notices the client is gone, which is why it ends those sessions and retries. It then lists the tables again: if any remain, or anything failed, the step fails and its output names them, and the run ends Failed. The next step still runs
-11. **CleanupInfrastructure** (540 s): finds this run's instance by its client token and terminates it, finds this run's security group by its name, reads the database security group, revokes any ingress rule there whose source is this run's group, then reads the database security group back. A run whose ingress change was refused has no rule there, so nothing is revoked or reported. Within a 480-second deadline it then waits for termination (until 15 seconds before the deadline), listing the instances by client token again on every poll and terminating any it hadn't seen, and deletes the security group, retrying while the group is still in use. Before each retry it lists the instances again, reads the database security group again and revokes any rule there whose source is this run's group, since a cancelled step can still add one after the first read. No earlier than 20 seconds after it started, it lists the instances and the security group once more, restores the database security group for every group still listed and deletes it, and reads the group back. Last, it reads the database security group once more for rules naming any group this run listed, deleted or not, and revokes them: a rule that names a deleted group can remain if it was added just after the delete, before EC2 had seen it, or if your database's security group is in a peered VPC, where the delete doesn't wait for it ([VPC peering security groups](https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-security-groups.html)). The later listings are there because EC2's lists are eventually consistent, so the first listing can miss an instance or group created seconds earlier ([eventual consistency](https://docs.aws.amazon.com/ec2/latest/devguide/eventual-consistency.html)). Each EC2 call has a 5-second connect timeout, a 10-second read timeout and three attempts, and no call starts within 8 seconds of the deadline. Each problem is recorded once per kind, so a later failure replaces it and a later success of the same kind, such as a good read, listing or delete, drops it; the others still run. A delete that is throttled or gets no answer is retried, as one that finds the group still in use is. A delete answering that the group doesn't exist isn't taken as proof, since EC2 can answer that for a group created moments earlier ([error codes](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html)): the last listing decides, as it also does for a delete that failed. The step then fails naming what is left, from the last listing that succeeded if a final one couldn't run. Its output and its error also give this run's table pattern `fis_io_<execution-suffix>_*`, so tables left by a table step that never ran can still be found. It finds everything from what this run set at creation, not from earlier steps' outputs, so it also cleans up after a step that failed partway. A failure in any earlier step goes straight to this step, after Phase 3 by way of CleanupTables
+7. **CleanupTables** (300 s): stops this run's load process if it is still running, by its recorded PID while the start time still matches, or by its command line naming this run's own script path. It never signals another run's process. It then connects to the database with a 3-second lock timeout (and an 8-second statement timeout on PostgreSQL), ends this run's own sessions (on PostgreSQL by their `application_name`; on MySQL and SQL Server, this user's sessions running a statement other than a drop on this run's tables; on SQL Server only if the user has `VIEW SERVER STATE`, and otherwise it logs a warning), drops every `fis_io_<execution-suffix>_*` table, and retries within a 180-second deadline. A statement a killed client started can keep its table locked on the server until the server notices the client is gone, which is why it ends those sessions and retries. It then lists the tables again: if any remain, or the cleanup couldn't finish, the step fails and its output names them, and the run ends Failed. The next step still runs
+8. **CleanupInfrastructure** (180 s): finds this run's instance by its client token and terminates it. EC2's lists are eventually consistent, so a listing can miss an instance launched seconds earlier ([eventual consistency](https://docs.aws.amazon.com/ec2/latest/devguide/eventual-consistency.html)). The step therefore keeps listing, every 5 seconds while an instance isn't yet shutting down, and terminates any it hasn't yet asked EC2 to terminate, until a listing started at least 20 seconds after the step began shows nothing still running, within a 120-second deadline. AWS doesn't say how long a new instance can stay unlisted, so this is a margin, not a guarantee: an instance it misses is still set to shut itself down, and the load generator check under Stop Conditions finds it. A listing that fails is retried. Each EC2 call has a 5-second connect timeout, a 10-second read timeout and three attempts, and no call starts within 8 seconds of the deadline. The step then fails naming any instance that isn't shutting down or terminated, for example one with termination protection, and a listing that kept failing. Its output and its error also give this run's table pattern `fis_io_<execution-suffix>_*`, so tables left by a table step that never ran can still be found. It finds the instance by the client token this run set at launch, not from earlier steps' outputs, so it also cleans up after a step that failed partway. A failure in any earlier step goes straight to this step, after Phase 3 by way of CleanupTables
 
 ### What else is affected
 - **Every other client of the database**: the load uses the database's I/O, buffer cache, CPU and `WorkerThreads` + 1 connections, and replicas may lag. Run it only against a database whose other users expect the fault
 - **Storage**: the tables grow throughout the run. On RDS with storage autoscaling, this can raise the allocated storage, which can't be reduced afterwards. Aurora storage grows and shrinks on its own
-- **The database security group**: it gains one ingress rule for the database port from the load generator's security group, which only the load generator uses, so no other source gains access. If the group is managed by CloudFormation or the CDK, the rule shows up as drift while it exists, and a stack update during the run may remove it
+- **The database security group**: it keeps the rule you added for the load generator's group between runs. Outside a run that group has no members, so no other source gains access. The experiment doesn't change the group
 - **The subnet**: one instance and one network interface for the length of the run
 
 ## Stop Conditions
@@ -202,32 +237,34 @@ and does not include stop conditions by default.
 
 A stop cancels the automation. Systems Manager then runs the cancel workflow for at most two minutes, so the runbook has a separate, shorter cleanup for it:
 
-- **Before the load starts** (Phases 1 and 2): `CleanupInfrastructureOnCancel` (60 s) terminates the instance if one was launched, revokes the ingress rule, and deletes the security group. No tables exist yet
+- **Before the load starts** (Phases 1 and 2): `CleanupInfrastructureOnCancel` (60 s) terminates the instance if one was launched. No tables exist yet
 - **During the load or CleanupTables**: `StopLoadAndDropTablesOnCancel` (45 s; it gives up after 30 s if the SSM Agent doesn't take the command) stops this run's load process and drops its tables, retrying within a 25-second deadline, then `CleanupInfrastructureOnCancel` runs
 - **During CleanupInfrastructure**: `CleanupInfrastructureOnCancel` runs again; it is safe to run twice
 
-The stop path revokes the ingress rule right after it asks EC2 to terminate the instance, before it waits for termination. `CleanupInfrastructureOnCancel` does what CleanupInfrastructure does, including the later listings and the last read, but gives each EC2 call a 2-second connect timeout, a 3-second read timeout and two attempts, starts no call within 8 seconds of its 50-second deadline, and stops waiting for termination 15 seconds before that deadline. If the instance hasn't terminated by then, the temporary security group is left and the step fails naming it. A cancelled script step's EC2 calls can still reach EC2 after the stop path has started (in the tests, 1 to 2 seconds after the stop), so a stop while AuthorizeInboundFromLoadGenerator runs can add the ingress rule after the stop path's first read of your database's security group. The temporary group can't be deleted while a rule on another group in the same VPC names it ([DeleteSecurityGroup](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeleteSecurityGroup.html)), so before each retry of the delete, and again for every group the last listing still shows, the stop path reads your database's security group again and revokes any rule there whose source is this run's group. Its last read catches such a rule that arrived after the delete. A stop just after the launch or the group's creation can leave an instance or group that even the later listings don't show yet; the instance's user data schedules its shutdown 200 minutes after first boot, and an empty group can be removed as Manual restore describes. The tests didn't observe the user data's own schedule: every check ran after InstallDatabaseClient had scheduled the shutdown again. On MySQL, SQL Server or Oracle, a statement the killed load started can also keep a table locked past the 25-second deadline; the table step then fails naming the table.
+`CleanupInfrastructureOnCancel` does what CleanupInfrastructure does, but gives each EC2 call a 2-second connect timeout, a 3-second read timeout and two attempts, starts no call within 8 seconds of its 50-second deadline, and stops listing 15 seconds before that deadline. A stop just after the launch can leave an instance that even the later listing doesn't show yet. Its user data schedules its shutdown 200 minutes after first boot, and the load generator check below finds it. The tests didn't observe the user data's own schedule: every check ran after InstallDatabaseClient had scheduled the shutdown again. On MySQL, SQL Server or Oracle, a statement the killed load started can also keep a table locked past the 25-second deadline; the table step then fails naming the table.
 
-In the tests on Aurora PostgreSQL, a stop at peak load cleaned up within 37 to 56 seconds, with the rule, instance and group gone within 51 seconds. A stop during LaunchLoadGenerator took longer, because the cancelled launch step itself runs for 96 to 150 seconds before the cleanup can start: the cancel workflow ended 125 to 198 seconds after the stop, and the ingress rule stayed for 100 to 155 seconds. At peak load, 21 to 31 seconds passed between `CleanupInfrastructureOnCancel`'s terminate request and the group's deletion, and the step stops waiting for termination about 35 seconds after it starts, so on `t3.medium` in `eu-central-1` a termination a few seconds slower than any seen would leave the empty security group, which the step then names (see Known limitations below). A stop during CleanupInfrastructure left the cancelled step's script running beside `CleanupInfrastructureOnCancel`: both terminated the instance, one deleted the group, and the cancel step's output named only the instance, although nothing was left. On every stop during a command step, the automation role's `ssm:CancelCommand` call is denied; the stop's own steps end the command, so nothing depends on it.
+In the tests, a stop at peak load with no lock held ended the run 36 to 41 seconds after the stop, and the cleanup's terminate call reached EC2 about 8 to 11 seconds after it. A stop during LaunchLoadGenerator takes longer, because the cancelled launch step keeps running until the launch finishes, 147 to 164 seconds after the stop in the tests, before the cleanup can start; those runs ended 178 to 195 seconds after the stop. A stop during CleanupInfrastructure ended the run about 32 seconds after the stop, with both cleanup copies run and no step failed. On a stop during a command step, CloudTrail usually shows the automation role's `ssm:CancelCommand` call denied, because the role isn't allowed it. The stop's own steps end the load instead: in five stops 0.5 to 3 seconds after the load step started, the load had already started on the instance, and the stop's table step ended it and dropped its tables. A stop in the fraction of a second before the load command starts wasn't reached, so whether that command can still start afterwards wasn't tested.
 
-**After every stop, check the automation's step results**, because FIS shows the experiment Stopped whether or not the cleanup finished. Find the execution ID as in Manual restore below, then run `aws ssm describe-automation-step-executions --automation-execution-id <execution ID> --query "StepExecutions[].[StepName,StepStatus,FailureMessage]"`. If `StopLoadAndDropTablesOnCancel` or `CleanupInfrastructureOnCancel` failed, remove what its message names as Manual restore describes. A stopped experiment can't be resumed; start a new one ([stop an experiment](https://docs.aws.amazon.com/fis/latest/userguide/stop-experiment.html)).
+**After every stop, check three things**, because FIS shows the experiment Stopped whether or not the cleanup finished. Find the execution ID as in Manual restore below, and wait until the automation has ended: `aws ssm get-automation-execution --automation-execution-id <execution ID> --query "AutomationExecution.AutomationExecutionStatus"` shows anything other than `InProgress` or `Cancelling` (normally `Cancelled`, `Failed` or `Success`). FIS shows Stopped within seconds, but after a stop during the launch the cleanup doesn't start for up to about three minutes, so an earlier check finds an instance the cleanup hasn't reached yet. Then:
 
-A stop doesn't undo the load's effects on the database, such as storage growth or replica lag; the database recovers on its own once the load ends.
+- **The step results**: `aws ssm describe-automation-step-executions --automation-execution-id <execution ID> --query "StepExecutions[].[StepName,StepStatus,FailureMessage]"`. If `StopLoadAndDropTablesOnCancel` or `CleanupInfrastructureOnCancel` failed, remove what its message names as Manual restore describes
+- **The load generator**: `aws ec2 describe-instances --filters Name=tag:FIS-Experiment,Values=DatabaseIOExhaustion Name=instance-state-name,Values=pending,running,stopping,stopped --query "Reservations[].Instances[].[InstanceId,State.Name,LaunchTime]"`. This lists every load generator that is still alive, and needs no execution ID. If it lists an instance while no experiment from this template is running, that instance's cleanup didn't finish (see Known limitations): terminate it with `aws ec2 terminate-instances --instance-ids <instance ID>`
+- **The tables**, if the stop came during the load (`ExhaustDatabaseIO` shows `Cancelled`) or the load generator check found an instance: list this run's tables as Manual restore describes. A load command that hadn't yet started on the instance when you stopped isn't cancelled, and whether it can still start and create tables wasn't tested
+
+A stopped experiment can't be resumed; start a new one ([stop an experiment](https://docs.aws.amazon.com/fis/latest/userguide/stop-experiment.html)).
+
+A stop doesn't undo the load's effects on the database. I/O and replica lag recover on their own once the load ends. On RDS with storage autoscaling, allocated storage that grew doesn't shrink; Aurora storage shrinks on its own.
 
 ### Known limitations
 
-A stop has to finish its cleanup inside the Systems Manager cancellation window, which runs for about two minutes. Within that window:
-
-- **A slow instance termination can leave the empty temporary security group.** The stop path revokes the ingress rule on your database's security group early, then waits for the load generator to terminate before deleting the temporary group, but only until about 35 seconds into the step (its 50-second deadline less a 15-second margin). In the tests the group was deleted 21 to 31 seconds after the terminate request, on every peak-load stop, so a termination a few seconds slower than any seen would leave the temporary group, now empty and unreferenced, and the step names it; remove it with the Manual restore command below.
-- **A stop during the failure path can skip the cleanup.** If the load has failed (for example an unreachable database or fewer active workers than `MinActiveWorkerPercentage`) and a stop lands in the brief window while the table-cleanup step runs, Systems Manager can end the automation `Failed` without running the stop cleanup, leaving the load generator, its security group and the ingress rule while the experiment shows as stopped. It was seen in one of the three failure-path stops that landed in that window during testing. It is Systems Manager's cancellation behavior on an already-failing automation, not something the document controls. The load generator terminates itself 200 minutes after it boots; remove the security group and the ingress rule with Manual restore.
-- **The stop cleanup is not instant.** Under slow EC2 responses `CleanupInfrastructureOnCancel` can take most of the two-minute window; it still completes and names anything it could not remove.
-- **A killed load can leave a locked table on some engines.** If a statement holds a lock on one of the run's tables past the table step's deadline, the drop times out and the step names that table to drop by hand; this was shown on Oracle with a lock held on purpose (ORA-00054). In the stops tested, the killed load's own sessions ended within about 1.5 seconds and left no locked table, including a SQL Server login without `VIEW SERVER STATE` or `ALTER ANY CONNECTION`, which still dropped every table. A stop in the first minute, while the rows are seeded, was not tested; it is the likeliest moment for a lock to be held on Oracle or SQL Server.
-
-- **On a busy database the stop's table drop can run out of time.** The stop path gives the table drop a 25-second deadline. In the tests, when other load shared the writer, three stops reached that deadline with 1, 13 and 41 tables still present; the step failed naming them, and Manual restore drops them. No Aurora PostgreSQL peak-load stop in this campaign ran without other load on the writer, so this wasn't tested with the writer otherwise idle; on RDS MySQL, Oracle and SQL Server, single-run stops dropped all 50 tables in seconds. The cause wasn't established.
+- **A stop at the wrong moment can skip the cleanup.** If a stop arrives in the fraction of a second as `CleanupTables` finishes, Systems Manager can end the automation without running either stop step. In the tests, 14 stops were aimed at that moment and 13 arrived while `CleanupTables` was finishing. 4 of those 13 skipped the cleanup, all on runs whose load worked; none of 20 stops at other moments did, and earlier tests also saw it on a run whose load had failed. The same moment at the end of the other command steps wasn't hit in testing, so assume it can happen there too. The load generator is left running, no step names it, and FIS shows the experiment as stopped. By that moment the table step has finished, so the run's tables are gone unless that step failed to drop some. The instance is set to shut itself down about 200 minutes after it launched. The tests saw the shutdown scheduled but terminated every leftover by hand, so the shutdown itself wasn't observed. The load generator check under Stop Conditions finds the instance sooner. If it happens at the end of the load step instead, tables can be left too; the checks under Stop Conditions find both. The experiment doesn't change security groups, so nothing else is left.
+- **The stop cleanup isn't instant.** Under slow responses the two stop steps can take most of the two-minute cancel window (their timeouts are 45 and 60 seconds). They are built to finish and name what they couldn't remove, but this wasn't tested with slow responses. If `StopLoadAndDropTablesOnCancel` failed because the SSM Agent didn't take its command, its message names no tables: list them as Manual restore describes.
+- **A killed load can leave a locked table on some engines.** If a statement holds a lock on one of the run's tables past the table step's deadline, the drop times out and the step names that table to drop by hand; this was shown on Oracle with a lock held on purpose (ORA-00054). In the stops at peak load, no table was left locked. On SQL Server the killed load's own sessions were gone within about 1.5 seconds; on MySQL 16 of them were still running a statement when the cleanup checked, and it ended them. A SQL Server login without `VIEW SERVER STATE` or `ALTER ANY CONNECTION` still dropped every table. A stop in the first minute, while the rows are seeded, was tested once on Aurora PostgreSQL, where every table was dropped; on Oracle and SQL Server, where it is the likeliest moment for a lock to be held, it wasn't tested.
+- **On a busy database the stop's table drop can run out of time.** The stop path gives the table drop a 25-second deadline. In earlier tests on Aurora PostgreSQL, when other runs' load shared the writer, three stops reached that deadline with 1, 13 and 41 tables still present; the step failed naming them, and Manual restore drops them. With the writer otherwise idle, two stops 5 minutes into the load dropped all 50 tables in 4 to 5 seconds. Single-run stops on RDS MySQL, Oracle and SQL Server also dropped all 50, in 4 to 8 seconds. The cause wasn't established.
 
 ### Manual restore
 
-If a run ends Failed or Stopped and its output names something left, remove it as follows. First find the automation execution ID: FIS starts the runbook by its ARN, so list recent executions and pick the one for this document:
+If a run ends Failed or Stopped and its output names something left, or the checks after a stop find something left, remove it as follows. First find the automation execution ID: FIS starts the runbook by its ARN, so list recent executions and pick the one for this document:
 
 ```
 aws ssm describe-automation-executions \
@@ -241,7 +278,7 @@ aws ssm describe-automation-executions \
   - SQL Server: `SELECT name FROM sys.tables WHERE schema_id = SCHEMA_ID() AND name LIKE 'fis[_]io[_]<suffix>[_]%';`, then `DROP TABLE [<name>];`
   - Oracle (names are upper case): `SELECT table_name FROM user_tables WHERE table_name LIKE 'FIS\_IO\_<SUFFIX>\_%' ESCAPE '\';`, then `DROP TABLE "<NAME>" PURGE;`
 - **Instance**: `aws ec2 describe-instances --filters Name=client-token,Values=<execution ID> --query "Reservations[].Instances[].[InstanceId,State.Name]"`, then `aws ec2 terminate-instances --instance-ids <instance ID>`
-- **Ingress rule and security group**: `aws ec2 describe-security-groups --filters Name=group-name,Values=FIS-DatabaseIO-LoadGen-<execution ID> --query "SecurityGroups[].GroupId"`, then `aws ec2 revoke-security-group-ingress --group-id <database security group ID> --ip-permissions "IpProtocol=tcp,FromPort=<port>,ToPort=<port>,UserIdGroupPairs=[{GroupId=<load generator security group ID>}]"`, and once the instance has terminated, `aws ec2 delete-security-group --group-id <load generator security group ID>`. If that group is already gone but a rule on the database security group still names it, list that rule's ID with `aws ec2 describe-security-group-rules --filters Name=group-id,Values=<database security group ID> --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='<load generator security group ID>'].SecurityGroupRuleId"` and remove it with `aws ec2 revoke-security-group-ingress --group-id <database security group ID> --security-group-rule-ids <rule ID>` ([DescribeSecurityGroupRules](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeSecurityGroupRules.html), [RevokeSecurityGroupIngress](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_RevokeSecurityGroupIngress.html))
+- **When you stop using the experiment**: remove the rule from your database's security group with `aws ec2 revoke-security-group-ingress --group-id <database security group ID> --ip-permissions 'IpProtocol=tcp,FromPort=<port>,ToPort=<port>,UserIdGroupPairs=[{GroupId=<load generator security group ID>}]'`, then, once no load generator is running, delete the group with `aws ec2 delete-security-group --group-id <load generator security group ID>`
 
 ## Next Steps
 

@@ -79,15 +79,10 @@ parameters:
     allowedPattern: '^subnet-[0-9a-f]{8,17}$'
     description: 'Subnet ID for load generator instance. Must route to the database, and to SSM/SSM Messages, Secrets Manager, and package repository endpoints - see README Prerequisites'
 
-  VpcId:
-    type: String
-    allowedPattern: '^vpc-[0-9a-f]{8,17}$'
-    description: 'VPC ID where the load generator will be launched'
-
-  DatabaseSecurityGroupId:
+  LoadGeneratorSecurityGroupId:
     type: String
     allowedPattern: '^sg-[0-9a-f]{8,17}$'
-    description: 'Security group ID of the target database (automation will add a temporary ingress rule). Must be tagged FIS-Ready=True'
+    description: 'Security group you created for the load generator, in the VPC of SubnetId and tagged FIS-Experiment=DatabaseIOExhaustion. Your database security group must allow it on DatabasePort. See README Prerequisites'
 
   InstanceType:
     type: String
@@ -101,137 +96,6 @@ parameters:
     default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
 
 mainSteps:
-  - name: CreateSecurityGroup
-    action: 'aws:executeAwsApi'
-    timeoutSeconds: 60
-    isCritical: true
-    onFailure: 'step:CleanupInfrastructure'
-    onCancel: 'step:CleanupInfrastructureOnCancel'
-    inputs:
-      Service: ec2
-      Api: CreateSecurityGroup
-      GroupName: 'FIS-DatabaseIO-LoadGen-{{ automation:EXECUTION_ID }}'
-      Description: 'Temporary security group for FIS database I/O exhaustion experiment'
-      VpcId: '{{ VpcId }}'
-      TagSpecifications:
-        - ResourceType: 'security-group'
-          Tags:
-            - Key: 'Name'
-              Value: 'FIS-DatabaseIO-LoadGenerator'
-            - Key: 'FIS-Experiment'
-              Value: 'DatabaseIOExhaustion'
-            - Key: 'AutoCleanup'
-              Value: 'true'
-            - Key: 'ManagedBy'
-              Value: 'FIS-SSM-Automation'
-    outputs:
-      - Name: SecurityGroupId
-        Selector: '$.GroupId'
-        Type: String
-
-  - name: ConfigureSecurityGroupEgress
-    action: 'aws:executeScript'
-    timeoutSeconds: 60
-    isCritical: true
-    onFailure: 'step:CleanupInfrastructure'
-    onCancel: 'step:CleanupInfrastructureOnCancel'
-    inputs:
-      Runtime: python3.11
-      Handler: configure_egress
-      Script: |
-        import boto3
-        from botocore.exceptions import ClientError
-
-        def configure_egress(events, context):
-            ec2 = boto3.client('ec2')
-
-            security_group_id = events['SecurityGroupId']
-            database_sg_id = events['DatabaseSecurityGroupId']
-            port = int(events['DatabasePort'])
-
-            # Replace the new group's allow-all egress with the database port and HTTPS only.
-            try:
-                ec2.revoke_security_group_egress(
-                    GroupId=security_group_id,
-                    IpPermissions=[{
-                        'IpProtocol': '-1',
-                        'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
-                    }]
-                )
-            except ClientError as e:
-                if e.response['Error']['Code'] != 'InvalidPermission.NotFound':
-                    raise
-
-            ec2.authorize_security_group_egress(
-                GroupId=security_group_id,
-                IpPermissions=[{
-                    'IpProtocol': 'tcp',
-                    'FromPort': port,
-                    'ToPort': port,
-                    'UserIdGroupPairs': [{
-                        'GroupId': database_sg_id,
-                        'Description': 'Allow outbound to database'
-                    }]
-                }]
-            )
-
-            response = ec2.authorize_security_group_egress(
-                GroupId=security_group_id,
-                IpPermissions=[{
-                    'IpProtocol': 'tcp',
-                    'FromPort': 443,
-                    'ToPort': 443,
-                    'IpRanges': [{
-                        'CidrIp': '0.0.0.0/0',
-                        'Description': 'HTTPS for SSM, Secrets Manager, and package repositories'
-                    }]
-                }]
-            )
-
-            return {'StatusCode': 200, 'Response': response}
-      InputPayload:
-        SecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
-        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
-        DatabasePort: '{{ DatabasePort }}'
-
-  - name: AuthorizeInboundFromLoadGenerator
-    action: 'aws:executeScript'
-    timeoutSeconds: 60
-    isCritical: true
-    onFailure: 'step:CleanupInfrastructure'
-    onCancel: 'step:CleanupInfrastructureOnCancel'
-    inputs:
-      Runtime: python3.11
-      Handler: authorize_ingress
-      Script: |
-        import boto3
-
-        def authorize_ingress(events, context):
-            ec2 = boto3.client('ec2')
-
-            database_sg_id = events['DatabaseSecurityGroupId']
-            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
-            port = int(events['DatabasePort'])
-
-            response = ec2.authorize_security_group_ingress(
-                GroupId=database_sg_id,
-                IpPermissions=[{
-                    'IpProtocol': 'tcp',
-                    'FromPort': port,
-                    'ToPort': port,
-                    'UserIdGroupPairs': [{
-                        'GroupId': load_gen_sg_id,
-                        'Description': 'Allow inbound from FIS load generator'
-                    }]
-                }]
-            )
-
-            return {'StatusCode': 200, 'Response': response}
-      InputPayload:
-        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
-        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
-        DatabasePort: '{{ DatabasePort }}'
-
   - name: LaunchLoadGenerator
     action: 'aws:runInstances'
     timeoutSeconds: 300
@@ -250,7 +114,7 @@ mainSteps:
       UserData: 'IyEvYmluL2Jhc2gKc2h1dGRvd24gLWggKzIwMAo='
       SubnetId: '{{ SubnetId }}'
       SecurityGroupIds:
-        - '{{ CreateSecurityGroup.SecurityGroupId }}'
+        - '{{ LoadGeneratorSecurityGroupId }}'
       IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
       MetadataOptions:
         HttpTokens: 'required'
@@ -959,9 +823,9 @@ mainSteps:
           exec bash "$RUN_DIR/cleanup.sh" 10 180 200
 
   - name: CleanupInfrastructure
-    # Normal and failure path. 480 s deadline: waits for termination, then deletes the security group.
+    # Normal and failure path: terminate this run's load generator, within a 120 s deadline.
     action: 'aws:executeScript'
-    timeoutSeconds: 540
+    timeoutSeconds: 180
     isCritical: true
     onFailure: 'Abort'
     onCancel: 'step:CleanupInfrastructureOnCancel'
@@ -974,53 +838,22 @@ mainSteps:
         import time
         import boto3
         from botocore.config import Config
-        from botocore.exceptions import ClientError
 
         def cleanup_infrastructure(events, context):
-            # Undo this run's instance (by client token), ingress rule and security group (by name); raise naming what's left.
+            # Terminate this run's instances, found by client token; raise naming any not shutting down.
             xid = events['ExecutionId']
-            db_sg = events['DatabaseSecurityGroupId']
-            port = int(events['DatabasePort'])
             start = time.time()
             deadline = start + int(events['DeadlineSeconds'])
             tables = 'fis_io_' + (re.sub('[^0-9a-zA-Z]', '', xid)[-8:].lower() or 'default') + '_*'
             # Each call gives up within about 48 s (3 attempts of 5 s connect and 10 s read, and backoff).
             ec2 = boto3.client('ec2', config=Config(connect_timeout=5, read_timeout=10,
                                                     retries={'total_max_attempts': 3, 'mode': 'standard'}))
-            sg_filter = [{'Name': 'vpc-id', 'Values': [events['VpcId']]},
-                         {'Name': 'group-name', 'Values': ['FIS-DatabaseIO-LoadGen-' + xid]}]
-            # One problem per kind: a later failure replaces it, a later success drops it.
-            problems, done, asked, listed, seen, deleted = {}, [], set(), [], set(), set()
-
-            def code(e):
-                return e.response.get('Error', {}).get('Code', '') if isinstance(e, ClientError) else ''
-
-            def late(what):
-                # No call starts within 8 s of the deadline, so the step raises before its timeout.
-                if time.time() > deadline - 8:
-                    problems[what] = what + ': not done before the deadline'
-                    return True
-
-            def attempt(what, fn):
-                if late(what):
-                    return None
-                try:
-                    r = fn()
-                except Exception as e:
-                    problems[what] = what + ': ' + str(e)
-                    return None
-                problems.pop(what, None)
-                return r
-
-            def list_groups():
-                # listed keeps the last good listing; seen, every group any listing showed.
-                pages = ec2.get_paginator('describe_security_groups').paginate(Filters=sg_filter)
-                listed[:] = [g['GroupId'] for p in pages for g in p['SecurityGroups']]
-                seen.update(listed)
-                return list(listed)
+            done, asked, seen = [], set(), {}
+            known = {'err': 'not listed', 'pending': [], 'term': None}
 
             def sweep():
-                # Terminate this run's instances; return those not terminated, or None if the listing failed.
+                # Terminate this run's instances; return those not yet shutting down, or None if the listing failed.
+                # No call starts within 8 s of the deadline, so the step raises before its timeout.
                 if time.time() > deadline - 8:
                     return None
                 try:
@@ -1029,8 +862,9 @@ mainSteps:
                 except Exception as e:
                     known['err'] = str(e)
                     return None
-                found = [i['InstanceId'] for p in pages for r in p['Reservations'] for i in r['Instances']
-                         if i['State']['Name'] != 'terminated']
+                insts = [i for p in pages for r in p['Reservations'] for i in r['Instances']]
+                seen.update((i['InstanceId'], i['State']['Name']) for i in insts)
+                found = [i['InstanceId'] for i in insts if i['State']['Name'] not in ('shutting-down', 'terminated')]
                 known.update(err=None, pending=found)
                 new = [i for i in found if i not in asked]
                 if new and time.time() <= deadline - 8:
@@ -1043,114 +877,35 @@ mainSteps:
                         known['term'] = 'terminating ' + ', '.join(new) + ': ' + str(e)
                 return found
 
-            known = {'err': 'not listed', 'pending': [], 'term': None}
+            # EC2 lists are eventually consistent, so an instance launched seconds before a stop can be missing at
+            # first. List until a listing started at least 20 s after the start shows nothing still running; a
+            # failed listing is retried. The wait ends 15 s before the deadline.
+            swept = time.time()
             pending = sweep()
-            groups = attempt('listing the security group', list_groups) or []
-
-            def referencing(gids):
-                sgs = ec2.describe_security_groups(GroupIds=[db_sg])['SecurityGroups']
-                return sorted(set(p.get('GroupId') for sg in sgs for perm in sg.get('IpPermissions', [])
-                                  for p in perm.get('UserIdGroupPairs', []) if p.get('GroupId') in gids))
-
-            def restore(gids):
-                # Revoke only rules naming this run's groups; a read that finds none drops earlier errors.
-                refs = attempt('reading ' + db_sg, lambda: referencing(gids))
-                for gid in refs or []:
-                    what = 'revoking ingress from ' + gid + ' on ' + db_sg
-                    if late(what):
-                        continue
-                    try:
-                        ec2.revoke_security_group_ingress(GroupId=db_sg, IpPermissions=[{'IpProtocol': 'tcp',
-                            'FromPort': port, 'ToPort': port, 'UserIdGroupPairs': [{'GroupId': gid}]}])
-                    except Exception as e:
-                        if code(e) != 'InvalidPermission.NotFound':
-                            problems[what] = what + ': ' + str(e)
-                if refs:
-                    refs = attempt('reading ' + db_sg, lambda: referencing(gids))
-                    if refs:
-                        problems['rule'] = db_sg + ' still allows ingress from ' + ', '.join(refs)
-                    elif refs is not None:
-                        done.append(db_sg + ' restored')
-                if refs == []:
-                    for k in [k for k in problems if k == 'rule' or k.startswith('revoking ingress from ')]:
-                        del problems[k]
-
-            # Restore the database's group before the wait.
-            if groups:
-                restore(groups)
-
-            # A failed listing is retried; the wait ends 15 s before the deadline.
-            while pending != [] and time.time() < deadline - 15:
-                time.sleep(5)
+            while time.time() < deadline - 15 and (pending != [] or swept < start + 20):
+                wait = 5 if pending != [] else start + 20 - time.time()
+                time.sleep(max(0, min(wait, deadline - 15 - time.time())))
+                swept = time.time()
                 pending = sweep()
 
-            def delete(gid):
-                what = 'deleting ' + gid
-                while time.time() < deadline - 12:
-                    try:
-                        ec2.delete_security_group(GroupId=gid)
-                    except Exception as e:
-                        c = code(e)
-                        if c == 'InvalidGroup.NotFound':
-                            # Gone, or created so recently that EC2 doesn't know it yet: the last listing decides.
-                            problems.pop(what, None)
-                            return
-                        problems[what] = what + ': ' + str(e)
-                        if c not in ('', 'DependencyViolation', 'InvalidGroup.InUse', 'RequestLimitExceeded'):
-                            return
-                        # In use, throttled or unanswered (it may have worked): retry until the cutoff.
-                        sweep()
-                        restore([gid])
-                        time.sleep(max(0, min(3, deadline - 12 - time.time())))
-                        continue
-                    done.append('deleted ' + gid)
-                    problems.pop(what, None)
-                    deleted.add(gid)
-                    return
-
-            for gid in groups:
-                delete(gid)
-
-            # Lists are eventually consistent: from 20 s after the start, list again and remove what's still listed.
-            time.sleep(max(0, min(start + 20, deadline - 12) - time.time()))
-            left_instances = sweep()
-            if left_instances is None:
-                if known['err']:
-                    problems['instances'] = 'listing instances: ' + known['err']
-                left_instances = known['pending']
-            if left_instances:
-                problems['left'] = ('not yet terminated: ' + ', '.join(left_instances) +
-                                    ('; ' + known['term'] if known['term'] else ''))
-            left = attempt('listing the security group', list_groups)
+            problems, left = [], pending
+            if pending is None:
+                problems.append('listing instances: ' + (known['err'] or 'not done before the deadline'))
+                left = known['pending']
             if left:
-                restore(left)
-                for gid in left:
-                    delete(gid)
-                left = attempt('listing the security group', list_groups)
-            # A rule added just after a delete, or kept across a peering, still names the group: read once more.
-            if seen:
-                restore(sorted(seen))
-            if left is not None:
-                # A good last listing decides for a failed delete too.
-                for gid in seen - set(left):
-                    problems.pop('deleting ' + gid, None)
-            left = [g for g in (listed if left is None else left) if g not in deleted]
-            if left:
-                problems['groups'] = 'still present: ' + ', '.join(left)
-
+                problems.append('not shutting down: ' + ', '.join(left) +
+                                ('; ' + known['term'] if known['term'] else ''))
             done = list(dict.fromkeys(done))
-            print('; '.join(done) or 'Nothing of this run was found.')
+            report = done + [k + ' is ' + v for k, v in seen.items()]
+            print('; '.join(report) or 'Nothing of this run was found.')
             if problems:
-                raise RuntimeError('Cleanup of execution ' + xid + ' is incomplete: ' + '; '.join(problems.values()) +
+                raise RuntimeError('Cleanup of execution ' + xid + ' is incomplete: ' + '; '.join(problems) +
                                    '. Tables ' + tables + ' may also remain if a table step failed.'
                                    ' See the README Stop Conditions section for the manual restore.')
-            return {'Done': done, 'Tables': tables}
+            return {'Done': done, 'Instances': seen, 'Tables': tables}
       InputPayload:
         ExecutionId: '{{ automation:EXECUTION_ID }}'
-        VpcId: '{{ VpcId }}'
-        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
-        DatabasePort: '{{ DatabasePort }}'
-        DeadlineSeconds: '480'
+        DeadlineSeconds: '120'
 
   - name: StopLoadAndDropTablesOnCancel
     # Stop path. Automation runs the cancel workflow for at most two minutes, so this step is held
@@ -1202,13 +957,10 @@ mainSteps:
         import time
         import boto3
         from botocore.config import Config
-        from botocore.exceptions import ClientError
 
         def cleanup_infrastructure(events, context):
-            # CleanupInfrastructure's script without its comments, with shorter EC2 bounds.
+            # Terminate this run's instances, found by client token; raise naming any not shutting down.
             xid = events['ExecutionId']
-            db_sg = events['DatabaseSecurityGroupId']
-            port = int(events['DatabasePort'])
             start = time.time()
             deadline = start + int(events['DeadlineSeconds'])
             tables = 'fis_io_' + (re.sub('[^0-9a-zA-Z]', '', xid)[-8:].lower() or 'default') + '_*'
@@ -1216,36 +968,12 @@ mainSteps:
             # started 8 s before the 50 s deadline still ends before the step's 60 s.
             ec2 = boto3.client('ec2', config=Config(connect_timeout=2, read_timeout=3,
                                                     retries={'total_max_attempts': 2, 'mode': 'standard'}))
-            sg_filter = [{'Name': 'vpc-id', 'Values': [events['VpcId']]},
-                         {'Name': 'group-name', 'Values': ['FIS-DatabaseIO-LoadGen-' + xid]}]
-            problems, done, asked, listed, seen, deleted = {}, [], set(), [], set(), set()
-
-            def code(e):
-                return e.response.get('Error', {}).get('Code', '') if isinstance(e, ClientError) else ''
-
-            def late(what):
-                if time.time() > deadline - 8:
-                    problems[what] = what + ': not done before the deadline'
-                    return True
-
-            def attempt(what, fn):
-                if late(what):
-                    return None
-                try:
-                    r = fn()
-                except Exception as e:
-                    problems[what] = what + ': ' + str(e)
-                    return None
-                problems.pop(what, None)
-                return r
-
-            def list_groups():
-                pages = ec2.get_paginator('describe_security_groups').paginate(Filters=sg_filter)
-                listed[:] = [g['GroupId'] for p in pages for g in p['SecurityGroups']]
-                seen.update(listed)
-                return list(listed)
+            done, asked, seen = [], set(), {}
+            known = {'err': 'not listed', 'pending': [], 'term': None}
 
             def sweep():
+                # Terminate this run's instances; return those not yet shutting down, or None if the listing failed.
+                # No call starts within 8 s of the deadline, so the step raises before its timeout.
                 if time.time() > deadline - 8:
                     return None
                 try:
@@ -1254,8 +982,9 @@ mainSteps:
                 except Exception as e:
                     known['err'] = str(e)
                     return None
-                found = [i['InstanceId'] for p in pages for r in p['Reservations'] for i in r['Instances']
-                         if i['State']['Name'] != 'terminated']
+                insts = [i for p in pages for r in p['Reservations'] for i in r['Instances']]
+                seen.update((i['InstanceId'], i['State']['Name']) for i in insts)
+                found = [i['InstanceId'] for i in insts if i['State']['Name'] not in ('shutting-down', 'terminated')]
                 known.update(err=None, pending=found)
                 new = [i for i in found if i not in asked]
                 if new and time.time() <= deadline - 8:
@@ -1268,107 +997,35 @@ mainSteps:
                         known['term'] = 'terminating ' + ', '.join(new) + ': ' + str(e)
                 return found
 
-            known = {'err': 'not listed', 'pending': [], 'term': None}
+            # EC2 lists are eventually consistent, so an instance launched seconds before a stop can be missing at
+            # first. List until a listing started at least 20 s after the start shows nothing still running; a
+            # failed listing is retried. The wait ends 15 s before the deadline.
+            swept = time.time()
             pending = sweep()
-            groups = attempt('listing the security group', list_groups) or []
-
-            def referencing(gids):
-                sgs = ec2.describe_security_groups(GroupIds=[db_sg])['SecurityGroups']
-                return sorted(set(p.get('GroupId') for sg in sgs for perm in sg.get('IpPermissions', [])
-                                  for p in perm.get('UserIdGroupPairs', []) if p.get('GroupId') in gids))
-
-            def restore(gids):
-                refs = attempt('reading ' + db_sg, lambda: referencing(gids))
-                for gid in refs or []:
-                    what = 'revoking ingress from ' + gid + ' on ' + db_sg
-                    if late(what):
-                        continue
-                    try:
-                        ec2.revoke_security_group_ingress(GroupId=db_sg, IpPermissions=[{'IpProtocol': 'tcp',
-                            'FromPort': port, 'ToPort': port, 'UserIdGroupPairs': [{'GroupId': gid}]}])
-                    except Exception as e:
-                        if code(e) != 'InvalidPermission.NotFound':
-                            problems[what] = what + ': ' + str(e)
-                if refs:
-                    refs = attempt('reading ' + db_sg, lambda: referencing(gids))
-                    if refs:
-                        problems['rule'] = db_sg + ' still allows ingress from ' + ', '.join(refs)
-                    elif refs is not None:
-                        done.append(db_sg + ' restored')
-                if refs == []:
-                    for k in [k for k in problems if k == 'rule' or k.startswith('revoking ingress from ')]:
-                        del problems[k]
-
-            if groups:
-                restore(groups)
-
-            while pending != [] and time.time() < deadline - 15:
-                time.sleep(5)
+            while time.time() < deadline - 15 and (pending != [] or swept < start + 20):
+                wait = 5 if pending != [] else start + 20 - time.time()
+                time.sleep(max(0, min(wait, deadline - 15 - time.time())))
+                swept = time.time()
                 pending = sweep()
 
-            def delete(gid):
-                what = 'deleting ' + gid
-                while time.time() < deadline - 12:
-                    try:
-                        ec2.delete_security_group(GroupId=gid)
-                    except Exception as e:
-                        c = code(e)
-                        if c == 'InvalidGroup.NotFound':
-                            problems.pop(what, None)
-                            return
-                        problems[what] = what + ': ' + str(e)
-                        if c not in ('', 'DependencyViolation', 'InvalidGroup.InUse', 'RequestLimitExceeded'):
-                            return
-                        sweep()
-                        restore([gid])
-                        time.sleep(max(0, min(3, deadline - 12 - time.time())))
-                        continue
-                    done.append('deleted ' + gid)
-                    problems.pop(what, None)
-                    deleted.add(gid)
-                    return
-
-            for gid in groups:
-                delete(gid)
-
-            time.sleep(max(0, min(start + 20, deadline - 12) - time.time()))
-            left_instances = sweep()
-            if left_instances is None:
-                if known['err']:
-                    problems['instances'] = 'listing instances: ' + known['err']
-                left_instances = known['pending']
-            if left_instances:
-                problems['left'] = ('not yet terminated: ' + ', '.join(left_instances) +
-                                    ('; ' + known['term'] if known['term'] else ''))
-            left = attempt('listing the security group', list_groups)
+            problems, left = [], pending
+            if pending is None:
+                problems.append('listing instances: ' + (known['err'] or 'not done before the deadline'))
+                left = known['pending']
             if left:
-                restore(left)
-                for gid in left:
-                    delete(gid)
-                left = attempt('listing the security group', list_groups)
-            if seen:
-                restore(sorted(seen))
-            if left is not None:
-                for gid in seen - set(left):
-                    problems.pop('deleting ' + gid, None)
-            left = [g for g in (listed if left is None else left) if g not in deleted]
-            if left:
-                problems['groups'] = 'still present: ' + ', '.join(left)
-
+                problems.append('not shutting down: ' + ', '.join(left) +
+                                ('; ' + known['term'] if known['term'] else ''))
             done = list(dict.fromkeys(done))
-            print('; '.join(done) or 'Nothing of this run was found.')
+            report = done + [k + ' is ' + v for k, v in seen.items()]
+            print('; '.join(report) or 'Nothing of this run was found.')
             if problems:
-                raise RuntimeError('Cleanup of execution ' + xid + ' is incomplete: ' + '; '.join(problems.values()) +
+                raise RuntimeError('Cleanup of execution ' + xid + ' is incomplete: ' + '; '.join(problems) +
                                    '. Tables ' + tables + ' may also remain if a table step failed.'
                                    ' See the README Stop Conditions section for the manual restore.')
-            return {'Done': done, 'Tables': tables}
+            return {'Done': done, 'Instances': seen, 'Tables': tables}
       InputPayload:
         ExecutionId: '{{ automation:EXECUTION_ID }}'
-        VpcId: '{{ VpcId }}'
-        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
-        DatabasePort: '{{ DatabasePort }}'
         DeadlineSeconds: '50'
 
 outputs:
   - LaunchLoadGenerator.InstanceId
-  - CreateSecurityGroup.SecurityGroupId
