@@ -1,0 +1,1279 @@
+schemaVersion: '0.3'
+description: 'Create ephemeral load generator to run deliberately long-running database queries, so that long-running-query monitoring and alarms can be validated'
+assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/DatabaseSlowQuery-SSM-Automation-Role'
+
+parameters:
+  DatabaseEngine:
+    type: String
+    description: 'Database engine type'
+    default: 'postgres'
+    allowedValues:
+      - postgres
+      - mysql
+      - sqlserver
+      - oracle
+
+  DatabaseEndpoint:
+    type: String
+    description: 'Database endpoint hostname'
+
+  DatabasePort:
+    type: String
+    description: 'Database port number'
+    default: '5432'
+
+  DatabaseName:
+    type: String
+    description: 'Database name to connect to, or service name for Oracle'
+    default: 'postgres'
+
+  DatabaseUser:
+    type: String
+    description: 'Database username'
+    default: 'postgres'
+
+  DatabasePasswordSecretArn:
+    type: String
+    description: 'ARN of Secrets Manager secret containing database password. Retrieved on the EC2 load generator using its instance profile role - see database-slow-query-ec2-instance-role-iam-policy.json'
+
+  QueryPattern:
+    type: String
+    description: 'realistic = a real read-only query that scans rows and then sleeps for the remainder, so it examines real rows and has a real plan while still running for an exact duration. This is the recommended pattern: it is visible to slow query logs and Performance Insights as well as to duration-based detection. sleep = waits for QueryDuration consuming almost no resources and examining no rows, which isolates whether your detection is genuinely duration-based. cpu = real CPU-bound work with an approximate duration tuned by CpuWorkUnits.'
+    default: 'realistic'
+    allowedValues:
+      - realistic
+      - sleep
+      - cpu
+
+  QueryDuration:
+    type: String
+    description: 'How long each individual query should run, in ISO8601 format - this is the value your long-running-query monitoring has to notice, and the main dial to turn. PT15M (the default) represents a genuinely problematic long-running query; use PT1M-PT5M for a quick check of an alarm threshold, or PT30M and above to test escalation and on-call response. Exact for QueryPattern=realistic and sleep (the scan adds a second or two for realistic); for cpu the duration comes from CpuWorkUnits instead and this value is only a reference.'
+    default: 'PT15M'
+
+  ExperimentDuration:
+    type: String
+    description: 'Total time to keep issuing long-running queries, in ISO8601 format. Each worker issues queries back to back until this elapses, so roughly ExperimentDuration / QueryDuration queries per worker. At the default it equals QueryDuration, so each worker runs exactly one query - raise it to repeat the query and test whether a second occurrence alarms as well as the first. A worker never starts a query that cannot finish before the experiment ends.'
+    default: 'PT15M'
+
+  ConcurrentQueries:
+    type: String
+    description: 'Number of long-running queries to run concurrently, each on its own connection'
+    default: '3'
+    allowedPattern: '^[1-9][0-9]{0,2}$'
+
+  LongQueryThresholdSeconds:
+    type: String
+    description: 'The threshold your monitoring uses to define a long-running query, in seconds. The experiment reports how many queries exceeded it and the maximum duration actually observed in the database session view, so you can compare that against whether your alarm fired.'
+    default: '60'
+    allowedPattern: '^[1-9][0-9]{0,4}$'
+
+  MinLongQueriesObserved:
+    type: String
+    description: 'Minimum number of queries that must run for at least LongQueryThresholdSeconds for the experiment to be treated as a successful fault injection. If this threshold is not met, ExecuteSlowQueries fails and the automation exits non-zero - commonly because a server-side statement timeout cancelled the queries early.'
+    default: '1'
+    allowedPattern: '^[0-9]+$'
+
+  CpuWorkUnits:
+    type: String
+    description: 'Size of one CPU burn unit for QueryPattern=cpu. The experiment times a single burn at startup and then repeats it enough times to fill QueryDuration, so this controls granularity rather than total duration - aim for a unit that takes roughly half a second to a second. Too small and calibration is noisy; too large and the query overshoots QueryDuration by up to one unit. On SQL Server the burn is not repeated, so this value alone sets the duration. Ignored for realistic and sleep.'
+    default: '100000'
+    allowedPattern: '^[1-9][0-9]{0,11}$'
+
+  TargetTableName:
+    type: String
+    description: 'Optional table for QueryPattern=realistic to scan, as table or schema.table. The query is read-only (COUNT(*) only) and never modifies it. Pick a table large enough that the scan is meaningful. Leave empty to use a synthetic row source instead, which needs no existing table. Must be a plain or schema-qualified identifier.'
+    default: ''
+    allowedPattern: '^$|^[A-Za-z_][A-Za-z0-9_$#]*(\.[A-Za-z_][A-Za-z0-9_$#]*)?$'
+
+  ScanRowCount:
+    type: String
+    description: 'Rows generated by the synthetic row source when TargetTableName is empty, for QueryPattern=realistic. Large enough to clear thresholds such as MySQL min_examined_row_limit and to register as real work. Ignored when TargetTableName is set, or for other query patterns.'
+    default: '500000'
+    allowedPattern: '^[1-9][0-9]{2,9}$'
+
+  SubnetId:
+    type: String
+    description: 'Subnet ID for load generator instance. Must route to the database, and to SSM/SSM Messages, Secrets Manager, and package repository endpoints - see README Prerequisites'
+
+  VpcId:
+    type: String
+    description: 'VPC ID where the load generator will be launched'
+
+  DatabaseSecurityGroupId:
+    type: String
+    description: 'Security group ID of the target database (automation will add a temporary ingress rule). Must be tagged FIS-Ready=True'
+
+  InstanceType:
+    type: String
+    description: 'EC2 instance type. The load generator does almost no work in this experiment - the queries run on the database - so the default is sufficient for most runs.'
+    default: 't3.small'
+
+  LatestAmiId:
+    type: String
+    description: 'Amazon Linux 2023 AMI ID'
+    default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+
+mainSteps:
+  - name: CreateSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: CreateSecurityGroup
+      GroupName: 'FIS-SlowQuery-LoadGen-{{ automation:EXECUTION_ID }}'
+      Description: 'Temporary security group for FIS database slow query experiment'
+      VpcId: '{{ VpcId }}'
+      TagSpecifications:
+        - ResourceType: 'security-group'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-SlowQuery-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseSlowQuery'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: SecurityGroupId
+        Selector: '$.GroupId'
+        Type: String
+
+  - name: ConfigureSecurityGroupEgress
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: configure_egress
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def configure_egress(events, context):
+            ec2 = boto3.client('ec2')
+
+            security_group_id = events['SecurityGroupId']
+            database_sg_id = events['DatabaseSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            # A newly created VPC security group starts with an allow-all outbound
+            # rule. Remove it so the load generator's egress is limited to the
+            # database port plus the HTTPS traffic it needs for SSM and package
+            # installation, rather than unrestricted outbound access.
+            try:
+                ec2.revoke_security_group_egress(
+                    GroupId=security_group_id,
+                    IpPermissions=[{
+                        'IpProtocol': '-1',
+                        'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                    }]
+                )
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'InvalidPermission.NotFound':
+                    raise
+
+            ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': database_sg_id,
+                        'Description': 'Allow outbound to database'
+                    }]
+                }]
+            )
+
+            response = ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 443,
+                    'ToPort': 443,
+                    'IpRanges': [{
+                        'CidrIp': '0.0.0.0/0',
+                        'Description': 'HTTPS for SSM, Secrets Manager, and package repositories'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        SecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: AuthorizeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_ingress
+      Script: |
+        import boto3
+
+        def authorize_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            response = ec2.authorize_security_group_ingress(
+                GroupId=database_sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': load_gen_sg_id,
+                        'Description': 'Allow inbound from FIS load generator'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: LaunchLoadGenerator
+    action: 'aws:runInstances'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      ImageId: '{{ LatestAmiId }}'
+      InstanceType: '{{ InstanceType }}'
+      MinInstanceCount: 1
+      MaxInstanceCount: 1
+      SubnetId: '{{ SubnetId }}'
+      SecurityGroupIds:
+        - '{{ CreateSecurityGroup.SecurityGroupId }}'
+      IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
+        HttpEndpoint: 'enabled'
+      TagSpecifications:
+        - ResourceType: 'instance'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-SlowQuery-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseSlowQuery'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: InstanceId
+        Selector: '$.InstanceIds[0]'
+        Type: String
+
+  - name: WaitForSSMAgent
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.InstanceInformationList[0].PingStatus'
+      DesiredValues:
+        - Online
+
+  - name: InstallDatabaseClient
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 600
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            ENGINE="{{ DatabaseEngine }}"
+
+            echo "Installing database client for engine: $ENGINE"
+
+            if [ "$ENGINE" = "postgres" ]; then
+                dnf install -y postgresql15 python3-pip
+                pip3 install psycopg2-binary
+                echo "PostgreSQL client installed"
+
+            elif [ "$ENGINE" = "mysql" ]; then
+                dnf install -y mariadb105 python3-pip
+                pip3 install mysql-connector-python
+                echo "MySQL client installed"
+
+            elif [ "$ENGINE" = "sqlserver" ]; then
+                curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
+                ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
+                pip3 install pyodbc
+                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+                source ~/.bashrc
+                echo "SQL Server tools installed"
+
+            elif [ "$ENGINE" = "oracle" ]; then
+                dnf install -y python3-pip libaio
+                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm
+                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm
+                pip3 install oracledb
+                echo "Oracle Instant Client and oracledb installed"
+            else
+                echo "Unsupported database engine: $ENGINE"
+                exit 1
+            fi
+
+            # Install AWS CLI and boto3 for Secrets Manager access
+            dnf install -y aws-cli
+            pip3 install boto3
+
+            echo "Installation complete"
+
+  - name: ExecuteSlowQueries
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateLingeringQueries'
+    onCancel: 'step:TerminateLingeringQueries'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 14400
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            cat > /tmp/fis_slow_common.py << 'PYTHON_EOF'
+            import re
+            import json
+            import boto3
+
+            def parse_iso8601_duration(duration):
+                seconds = 0
+                duration = duration.replace('PT', '')
+
+                if 'H' in duration:
+                    hours, duration = duration.split('H')
+                    seconds += int(hours) * 3600
+
+                if 'M' in duration:
+                    minutes, duration = duration.split('M')
+                    seconds += int(minutes) * 60
+
+                if 'S' in duration:
+                    secs = duration.replace('S', '')
+                    if secs:
+                        seconds += int(secs)
+
+                return seconds
+
+            def query_marker(execution_id):
+                # Stamped into every statement and used as the client application name,
+                # so cleanup only touches this execution's sessions and the queries can
+                # be found in slow query logs, Performance Insights and session views.
+                suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
+                return 'FIS-SLOW-QUERY-' + suffix
+
+            # Only a plain or schema-qualified identifier is accepted, and only ever as
+            # the source of a COUNT(*), so this cannot be steered into modifying data.
+            IDENTIFIER = re.compile(r'^[A-Za-z_][A-Za-z0-9_$#]*(\.[A-Za-z_][A-Za-z0-9_$#]*)?$')
+
+            SYNTHETIC_SOURCE = {
+                'postgres':  '(SELECT md5(n::text) AS v FROM generate_series(1, %d) n)',
+                'mysql':     '(SELECT COLUMN_NAME AS v FROM information_schema.COLUMNS)',
+                'sqlserver': '(SELECT TOP (%d) a.name AS v FROM sys.all_objects a CROSS JOIN sys.all_objects b)',
+                'oracle':    '(SELECT LEVEL AS v FROM dual CONNECT BY LEVEL <= %d)',
+            }
+
+            def row_source(engine, target_table, scan_rows):
+                target_table = (target_table or '').strip()
+                if target_table:
+                    if not IDENTIFIER.match(target_table):
+                        raise ValueError(
+                            'TargetTableName must be a plain or schema-qualified identifier, got: '
+                            + target_table)
+                    return target_table, 'table ' + target_table
+                template = SYNTHETIC_SOURCE[engine]
+                if '%d' in template:
+                    return template % scan_rows, 'synthetic source of %d rows' % scan_rows
+                return template, 'synthetic source (information_schema.COLUMNS)'
+
+            def get_password(secret_arn, region):
+                sm = boto3.client('secretsmanager', region_name=region)
+                response = sm.get_secret_value(SecretId=secret_arn)
+                try:
+                    secret = json.loads(response['SecretString'])
+                except ValueError:
+                    return response['SecretString']
+                return secret.get('password', response['SecretString'])
+            PYTHON_EOF
+
+            cat > /tmp/slow_query.py << 'PYTHON_EOF'
+            import sys
+            import time
+            import json
+            import threading
+
+            sys.path.insert(0, '/tmp')
+            from fis_slow_common import parse_iso8601_duration, query_marker, get_password, row_source
+
+            # ---------------------------------------------------------------- postgres
+
+            def connect_postgres(cfg, marker):
+                import psycopg2
+                return psycopg2.connect(
+                    host=cfg['endpoint'], port=cfg['port'], database=cfg['dbname'],
+                    user=cfg['user'], password=cfg['password'], connect_timeout=10,
+                    application_name=marker
+                )
+
+            def slow_sql_postgres(marker, pattern, seconds, work_units, source, iterations=1):
+                if pattern == 'sleep':
+                    return "SELECT /* " + marker + " */ pg_sleep(" + str(seconds) + ")"
+                if pattern == 'realistic':
+                    # Scan then sleep: real rows and a real plan, exact duration.
+                    return ("WITH scan AS (SELECT count(*) AS rows_examined FROM " + source + " src) "
+                            "SELECT /* " + marker + " */ rows_examined, pg_sleep(" + str(seconds) + ") FROM scan")
+                # Sustained CPU with every row source BOUNDED: an inner burn of
+                # work_units rows repeated `iterations` times by the outer series,
+                # correlated on the outer row (g + i) so it cannot be cached and run
+                # once. An unbounded row source fills local storage - see README.
+                return ("SELECT /* " + marker + " */ sum(("
+                        "SELECT count(*) FROM generate_series(1, " + str(work_units) + ") g "
+                        "WHERE md5(repeat((g + i)::text, 500)) IS NOT NULL"
+                        ")) AS work_done FROM generate_series(1, " + str(iterations) + ") i")
+
+            def observe_postgres(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT count(*), COALESCE(MAX(EXTRACT(EPOCH FROM (now() - query_start))), 0) "
+                    "FROM pg_stat_activity WHERE application_name = %s AND state = 'active' "
+                    "AND pid <> pg_backend_pid()", (marker,))
+                row = cur.fetchone()
+                cur.close()
+                return int(row[0]), float(row[1])
+
+            def terminate_postgres(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE application_name = %s AND pid <> pg_backend_pid()", (marker,))
+                killed = len(cur.fetchall())
+                cur.close()
+                return killed
+
+            def server_timeout_postgres(conn):
+                cur = conn.cursor()
+                cur.execute("SHOW statement_timeout")
+                value = cur.fetchone()[0]
+                cur.close()
+                return 'statement_timeout=' + str(value)
+
+            # ------------------------------------------------------------------- mysql
+
+            def connect_mysql(cfg, marker):
+                import mysql.connector
+                return mysql.connector.connect(
+                    host=cfg['endpoint'], port=cfg['port'], database=cfg['dbname'],
+                    user=cfg['user'], password=cfg['password'], connection_timeout=10,
+                    conn_attrs={'program_name': marker}
+                )
+
+            def slow_sql_mysql(marker, pattern, seconds, work_units, source, iterations=1):
+                if pattern == 'sleep':
+                    return "SELECT /* " + marker + " */ SLEEP(" + str(seconds) + ")"
+                if pattern == 'realistic':
+                    return ("SELECT /* " + marker + " */ s.rows_examined, SLEEP(" + str(seconds) + ") "
+                            "FROM (SELECT COUNT(*) AS rows_examined FROM " + source + " src) s")
+                # BENCHMARK repeats an expression N times inside one statement and
+                # produces no rows at all, so it burns CPU with no temp-file risk and
+                # scales linearly - iterations simply multiplies the repeat count.
+                return ("SELECT /* " + marker + " */ BENCHMARK("
+                        + str(work_units * max(1, iterations)) + ", MD5(RAND()))")
+
+            def observe_mysql(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(TIME), 0) FROM information_schema.PROCESSLIST "
+                    "WHERE INFO LIKE %s AND ID <> CONNECTION_ID()", ('%' + marker + '%',))
+                row = cur.fetchone()
+                cur.close()
+                return int(row[0]), float(row[1])
+
+            def terminate_mysql(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT ID FROM information_schema.PROCESSLIST "
+                    "WHERE INFO LIKE %s AND ID <> CONNECTION_ID()", ('%' + marker + '%',))
+                ids = [r[0] for r in cur.fetchall()]
+                killed = 0
+                for pid in ids:
+                    try:
+                        cur.execute("KILL %s" % int(pid))
+                        killed += 1
+                    except Exception:
+                        pass
+                cur.close()
+                return killed
+
+            def server_timeout_mysql(conn):
+                cur = conn.cursor()
+                cur.execute("SELECT @@max_execution_time")
+                value = cur.fetchone()[0]
+                cur.close()
+                return 'max_execution_time=' + str(value) + 'ms (0 = no limit; applies to SELECT only)'
+
+            # --------------------------------------------------------------- sqlserver
+
+            def connect_sqlserver(cfg, marker):
+                import pyodbc
+                conn_str = ('DRIVER={ODBC Driver 18 for SQL Server};SERVER=' + cfg['endpoint']
+                            + ',' + str(cfg['port']) + ';DATABASE=' + cfg['dbname']
+                            + ';UID=' + cfg['user'] + ';PWD=' + cfg['password']
+                            + ';TrustServerCertificate=yes;APP=' + marker)
+                return pyodbc.connect(conn_str, timeout=10)
+
+            def slow_sql_sqlserver(marker, pattern, seconds, work_units, source, iterations=1):
+                delay = '%02d:%02d:%02d' % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+                if pattern == 'sleep':
+                    return "WAITFOR DELAY '" + delay + "' /* " + marker + " */"
+                if pattern == 'realistic':
+                    # No sleep expression works inside a SELECT, so this is a
+                    # two-statement batch; dm_exec_requests times the whole batch.
+                    return ("SELECT /* " + marker + " */ COUNT_BIG(*) AS rows_examined FROM " + source + " src; "
+                            "WAITFOR DELAY '" + delay + "' /* " + marker + " */")
+                # Not multiplied by iterations: scaling TOP would rebuild the unbounded
+                # row source this design avoids, so SQL Server stays work-bounded.
+                return ("SELECT /* " + marker + " */ COUNT_BIG(*) FROM ("
+                        "SELECT TOP (" + str(work_units) + ") "
+                        "HASHBYTES('SHA2_256', CAST(NEWID() AS VARCHAR(40))) AS h "
+                        "FROM sys.all_objects a CROSS JOIN sys.all_objects b CROSS JOIN sys.all_objects c) q")
+
+            def observe_sqlserver(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(DATEDIFF(SECOND, r.start_time, GETDATE())), 0) "
+                    "FROM sys.dm_exec_requests r JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id "
+                    "WHERE s.program_name = ? AND r.session_id <> @@SPID", marker)
+                row = cur.fetchone()
+                cur.close()
+                return int(row[0]), float(row[1])
+
+            def terminate_sqlserver(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT s.session_id FROM sys.dm_exec_sessions s "
+                    "WHERE s.program_name = ? AND s.session_id <> @@SPID", marker)
+                ids = [r[0] for r in cur.fetchall()]
+                killed = 0
+                for spid in ids:
+                    try:
+                        cur.execute("KILL %s" % int(spid))
+                        killed += 1
+                    except Exception:
+                        pass
+                cur.close()
+                return killed
+
+            def server_timeout_sqlserver(conn):
+                return 'SQL Server has no server-side statement timeout; only client-side timeouts apply'
+
+            # ------------------------------------------------------------------ oracle
+
+            def connect_oracle(cfg, marker):
+                import oracledb
+                oracledb.init_oracle_client()
+                dsn = oracledb.makedsn(cfg['endpoint'], cfg['port'], service_name=cfg['dbname'])
+                conn = oracledb.connect(user=cfg['user'], password=cfg['password'], dsn=dsn)
+                # v$session.module identifies this execution's sessions.
+                cur = conn.cursor()
+                cur.callproc('DBMS_APPLICATION_INFO.SET_MODULE', [marker, 'slow-query'])
+                cur.close()
+                return conn
+
+            # DBMS_PIPE.RECEIVE_MESSAGE is a function so it can be called from SQL,
+            # unlike DBMS_SESSION.SLEEP - letting the fault be a single SELECT with its
+            # own SQL_ID rather than an opaque PL/SQL block. Probed in main().
+            ORACLE_CAPS = {'sql_sleep': False}
+
+            def probe_oracle_sql_sleep(conn):
+                try:
+                    cur = conn.cursor()
+                    # A zero timeout returns immediately, so this only tests privilege.
+                    cur.execute("SELECT DBMS_PIPE.RECEIVE_MESSAGE('fis-probe', 0) FROM dual")
+                    cur.fetchone()
+                    cur.close()
+                    return True
+                except Exception:
+                    return False
+
+            def slow_sql_oracle(marker, pattern, seconds, work_units, source, iterations=1):
+                if pattern == 'realistic':
+                    if ORACLE_CAPS['sql_sleep']:
+                        # One statement, so v$sql and AWR show one long-running SELECT.
+                        return ("SELECT /* " + marker + " */ "
+                                "(SELECT COUNT(*) FROM " + source + " src) AS rows_examined, "
+                                "DBMS_PIPE.RECEIVE_MESSAGE('" + marker + "', " + str(seconds) + ") AS waited "
+                                "FROM dual")
+                    return ("DECLARE n NUMBER; BEGIN /* " + marker + " */ "
+                            "SELECT COUNT(*) INTO n FROM " + source + " src; "
+                            "DBMS_SESSION.SLEEP(" + str(seconds) + "); END;")
+                if pattern == 'sleep':
+                    if ORACLE_CAPS['sql_sleep']:
+                        return ("SELECT /* " + marker + " */ "
+                                "DBMS_PIPE.RECEIVE_MESSAGE('" + marker + "', " + str(seconds) + ") AS waited "
+                                "FROM dual")
+                    # DBMS_SESSION.SLEEP needs no extra grant on 18c and later
+                    # (DBMS_LOCK.SLEEP required an explicit EXECUTE grant).
+                    return "BEGIN /* " + marker + " */ DBMS_SESSION.SLEEP(" + str(seconds) + "); END;"
+                # Heavy per-row work (SHA-256 over 2000 bytes) so a burn unit reaches a
+                # usable duration at a small row count: CONNECT BY is memory-bound and
+                # raises ORA-30009 at millions of levels - see README.
+                return ("SELECT /* " + marker + " */ SUM(("
+                        "SELECT COUNT(*) FROM (SELECT LEVEL AS g FROM dual CONNECT BY LEVEL <= "
+                        + str(work_units) + ") "
+                        "WHERE STANDARD_HASH(RPAD(TO_CHAR(g + o.i), 2000, 'x'), 'SHA256') IS NOT NULL"
+                        ")) AS work_done FROM (SELECT LEVEL AS i FROM dual CONNECT BY LEVEL <= "
+                        + str(iterations) + ") o")
+
+            def observe_oracle(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*), NVL(MAX(last_call_et), 0) FROM v$session "
+                    "WHERE module = :1 AND status = 'ACTIVE' AND sid <> SYS_CONTEXT('USERENV','SID')",
+                    [marker])
+                row = cur.fetchone()
+                cur.close()
+                return int(row[0]), float(row[1])
+
+            def terminate_oracle(conn, marker):
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT sid, serial# FROM v$session "
+                    "WHERE module = :1 AND sid <> SYS_CONTEXT('USERENV','SID')", [marker])
+                sessions = cur.fetchall()
+                killed = 0
+                for sid, serial in sessions:
+                    try:
+                        # RDS Oracle does not permit ALTER SYSTEM KILL SESSION for the
+                        # master user; the rdsadmin package is the supported route.
+                        cur.callproc('rdsadmin.rdsadmin_util.kill', [int(sid), int(serial), 'IMMEDIATE'])
+                        killed += 1
+                    except Exception:
+                        try:
+                            cur.execute("ALTER SYSTEM KILL SESSION '%d,%d' IMMEDIATE" % (int(sid), int(serial)))
+                            killed += 1
+                        except Exception:
+                            pass
+                cur.close()
+                return killed
+
+            def server_timeout_oracle(conn):
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT limit FROM user_resource_limits WHERE resource_name = 'CPU_PER_CALL'")
+                    row = cur.fetchone()
+                    value = row[0] if row else 'UNKNOWN'
+                finally:
+                    cur.close()
+                return 'profile CPU_PER_CALL=' + str(value) + ' (UNLIMITED = no per-call CPU cap)'
+
+            ENGINES = {
+                'postgres': (connect_postgres, slow_sql_postgres, observe_postgres, terminate_postgres, server_timeout_postgres),
+                'mysql':    (connect_mysql,    slow_sql_mysql,    observe_mysql,    terminate_mysql,    server_timeout_mysql),
+                'sqlserver':(connect_sqlserver,slow_sql_sqlserver,observe_sqlserver,terminate_sqlserver,server_timeout_sqlserver),
+                'oracle':   (connect_oracle,   slow_sql_oracle,   observe_oracle,   terminate_oracle,   server_timeout_oracle),
+            }
+
+            # Engines whose cpu pattern repeats a calibrated burn to reach about
+            # QueryDuration. SQL Server is absent - see README.
+            CPU_CALIBRATED_ENGINES = ('postgres', 'mysql', 'oracle')
+
+            # How often the observer samples the engine's session view. Short enough
+            # to catch a query inside a modest threshold, long enough not to be load.
+            OBSERVER_INTERVAL_SECONDS = 10
+
+            # ------------------------------------------------------------------ worker
+
+            def query_worker(worker_id, engine, cfg, marker, pattern, query_seconds,
+                             work_units, source, iterations, deadline, threshold, results, lock):
+                connect, build_sql, _obs, _term, _to = ENGINES[engine]
+                sql = build_sql(marker, pattern, query_seconds, work_units, source, iterations)
+                conn = None
+                try:
+                    conn = connect(cfg, marker)
+                    conn.autocommit = True
+                    # Always issue one query, then only start another if it can finish
+                    # inside ExperimentDuration, so the run does not overshoot.
+                    while True:
+                        cur = conn.cursor()
+                        started = time.time()
+                        try:
+                            cur.execute(sql)
+                            try:
+                                cur.fetchall()
+                            except Exception:
+                                pass
+                            elapsed = time.time() - started
+                            with lock:
+                                results['durations'].append(round(elapsed, 1))
+                                if elapsed >= threshold:
+                                    results['over_threshold'] += 1
+                        except Exception as e:
+                            elapsed = time.time() - started
+                            with lock:
+                                results['errors'] += 1
+                                results['error_samples'].append(
+                                    'worker %d after %.1fs: %s' % (worker_id, elapsed, str(e)[:160]))
+                            # Cancelled far short of target is almost always a
+                            # server-side statement timeout - worth surfacing.
+                            if elapsed < query_seconds * 0.5:
+                                with lock:
+                                    results['short_cancellations'] += 1
+                                time.sleep(2)
+                        finally:
+                            try:
+                                cur.close()
+                            except Exception:
+                                pass
+
+                        if time.time() + query_seconds > deadline:
+                            break
+                except Exception as e:
+                    with lock:
+                        results['errors'] += 1
+                        results['error_samples'].append('worker %d connect failed: %s' % (worker_id, str(e)[:160]))
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+            # A burn unit this short makes calibration unreliable: per-iteration
+            # overhead starts to dominate and the repeat count stops scaling linearly.
+            MIN_BURN_UNIT_SECONDS = 0.5
+            # Calibrate over several iterations: a standalone burn costs more than the
+            # same burn repeated in one statement (24% on Oracle) - see README.
+            CALIBRATION_ITERATIONS = 4
+            # Ceiling on the burn unit: row generation is memory-bound on both engines.
+            # Kept low because duration comes from repeating units, not enlarging them.
+            MAX_BURN_UNITS = 1000000
+
+            def calibrate_cpu(engine, cfg, marker, work_units, target_seconds):
+                # Time a burn unit, then repeat it enough to fill QueryDuration. A clock
+                # predicate cannot do this: PostgreSQL needs an unbounded row source and
+                # Oracle evaluates clock functions once per statement. The unit is grown
+                # first because the right size differs ~30x by engine - see README.
+                connect, build_sql, _obs, _term, _to = ENGINES[engine]
+                units = work_units
+                unit_seconds = 0.0
+                attempts = []
+
+                conn = connect(cfg, marker + '-calib')
+                try:
+                    conn.autocommit = True
+                    good_units = None
+                    for _ in range(5):
+                        try:
+                            cur = conn.cursor()
+                            sql = build_sql(marker + '-calib', 'cpu', target_seconds, units,
+                                            None, CALIBRATION_ITERATIONS)
+                            started = time.time()
+                            cur.execute(sql)
+                            try:
+                                cur.fetchall()
+                            except Exception:
+                                pass
+                            unit_seconds = (time.time() - started) / CALIBRATION_ITERATIONS
+                            cur.close()
+                        except Exception as e:
+                            # Growing the unit can hit a resource limit; fall back to
+                            # the last size that worked rather than failing the run.
+                            print("Calibration: %d units failed (%s) - falling back to the "
+                                  "last size that worked" % (units, str(e)[:120]))
+                            if good_units is None:
+                                raise
+                            units = good_units[0]
+                            unit_seconds = good_units[1]
+                            break
+
+                        good_units = (units, unit_seconds)
+                        attempts.append((units, unit_seconds))
+
+                        if unit_seconds >= MIN_BURN_UNIT_SECONDS or units >= MAX_BURN_UNITS:
+                            break
+                        scale = MIN_BURN_UNIT_SECONDS / max(unit_seconds, 0.001)
+                        units = min(MAX_BURN_UNITS, int(units * min(40.0, max(2.0, scale * 1.2))))
+                finally:
+                    conn.close()
+
+                if unit_seconds <= 0.001:
+                    return 1, unit_seconds, units, attempts
+                iterations = max(1, int(round(target_seconds / unit_seconds)))
+                return iterations, unit_seconds, units, attempts
+
+            def observer(engine, cfg, marker, deadline, threshold, results, lock, stop_flag):
+                connect, _sql, observe, _term, _to = ENGINES[engine]
+                conn = None
+                try:
+                    conn = connect(cfg, marker + '-observer')
+                    conn.autocommit = True
+                    while time.time() < deadline and not stop_flag['stop']:
+                        # Sample before sleeping so short runs still observe once.
+                        try:
+                            active, max_age = observe(conn, marker)
+                            with lock:
+                                results['max_observed_seconds'] = max(results['max_observed_seconds'], max_age)
+                                results['max_concurrent_observed'] = max(results['max_concurrent_observed'], active)
+                                results['samples'] += 1
+                                if max_age >= threshold:
+                                    results['observed_over_threshold'] = True
+                        except Exception as e:
+                            with lock:
+                                results['observer_error'] = str(e)[:160]
+                        # Short slices so the thread stops promptly when workers finish.
+                        for _ in range(OBSERVER_INTERVAL_SECONDS):
+                            if stop_flag['stop'] or time.time() >= deadline:
+                                break
+                            time.sleep(1)
+                except Exception as e:
+                    print('Observer unavailable (%s) - server-side visibility will not be reported'
+                          % str(e)[:120], file=sys.stderr)
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+            def main():
+                engine = sys.argv[1]
+                endpoint = sys.argv[2]
+                port = int(sys.argv[3])
+                dbname = sys.argv[4]
+                user = sys.argv[5]
+                secret_arn = sys.argv[6]
+                pattern = sys.argv[7]
+                query_duration_iso = sys.argv[8]
+                experiment_duration_iso = sys.argv[9]
+                concurrent = int(sys.argv[10])
+                threshold = float(sys.argv[11])
+                min_long_queries = int(sys.argv[12])
+                work_units = int(sys.argv[13])
+                target_table = sys.argv[14]
+                scan_rows = int(sys.argv[15])
+                region = sys.argv[16]
+                execution_id = sys.argv[17]
+
+                query_seconds = parse_iso8601_duration(query_duration_iso)
+                experiment_seconds = parse_iso8601_duration(experiment_duration_iso)
+                marker = query_marker(execution_id)
+
+                print("=== Database Slow Query Injection ===")
+                print("Engine: %s" % engine)
+                print("Endpoint: %s:%d" % (endpoint, port))
+                print("Database: %s" % dbname)
+                print("User: %s" % user)
+                print("Query pattern: %s" % pattern)
+                print("Per-query duration: %ds" % query_seconds)
+                print("Experiment duration: %ds" % experiment_seconds)
+                print("Concurrent queries: %d" % concurrent)
+                print("Long query threshold: %ds" % threshold)
+                print("Query marker: %s" % marker)
+                iterations = 1
+                if pattern == 'cpu':
+                    print("CPU work units per burn: %d" % work_units)
+                    if engine not in CPU_CALIBRATED_ENGINES:
+                        print("CPU mode: work-bounded on this engine - duration comes from "
+                              "CpuWorkUnits, not QueryDuration; calibrate from the duration below")
+
+                try:
+                    source, source_label = row_source(engine, target_table, scan_rows)
+                except ValueError as e:
+                    print("ERROR: %s" % str(e))
+                    sys.exit(1)
+                if pattern == 'realistic':
+                    print("Scan source: %s" % source_label)
+                print("=====================================")
+
+                print("Retrieving database password from Secrets Manager...")
+                try:
+                    password = get_password(secret_arn, region)
+                except Exception as e:
+                    print("ERROR: Failed to retrieve password: %s" % str(e))
+                    sys.exit(1)
+                print("Password retrieved successfully")
+
+                cfg = {'endpoint': endpoint, 'port': port, 'dbname': dbname,
+                       'user': user, 'password': password}
+
+                connect, build_sql, _obs, _term, server_timeout = ENGINES[engine]
+
+                # Report any server-side cancellation limit up front: it is the most
+                # common reason a slow-query experiment fails to produce slow queries.
+                try:
+                    probe = connect(cfg, marker + '-probe')
+                    probe.autocommit = True
+                    print("Server-side statement limit: %s" % server_timeout(probe))
+                    if engine == 'oracle':
+                        ORACLE_CAPS['sql_sleep'] = probe_oracle_sql_sleep(probe)
+                        if ORACLE_CAPS['sql_sleep']:
+                            print("Statement form: single SQL statement (DBMS_PIPE.RECEIVE_MESSAGE "
+                                  "is executable), so the fault has its own SQL_ID and elapsed "
+                                  "time in v$sql and AWR")
+                        else:
+                            print("Statement form: anonymous PL/SQL block (DBMS_PIPE is not "
+                                  "executable by this user). The session is still ACTIVE for the "
+                                  "full duration, but top-SQL views will attribute the time to the "
+                                  "block rather than to a recognisable SELECT. Grant EXECUTE ON "
+                                  "SYS.DBMS_PIPE to get the single-statement form.")
+                    probe.close()
+                except Exception as e:
+                    print("Could not probe server-side statement limit: %s" % str(e)[:160])
+
+                if pattern == 'cpu' and engine in CPU_CALIBRATED_ENGINES:
+                    try:
+                        iterations, unit_seconds, work_units, attempts = calibrate_cpu(
+                            engine, cfg, marker, work_units, query_seconds)
+                        if len(attempts) > 1:
+                            print("Calibration: grew the burn unit over %d attempts (%s)"
+                                  % (len(attempts),
+                                     ', '.join('%d units=%.2fs' % a for a in attempts)))
+                        print("Calibration: one burn of %d units takes %.2fs in bulk "
+                              "(measured over %d iterations), so %d repeats fill the %ds target"
+                              % (work_units, unit_seconds, CALIBRATION_ITERATIONS,
+                                 iterations, query_seconds))
+                        if unit_seconds < MIN_BURN_UNIT_SECONDS:
+                            print("WARNING: the burn unit is only %.2fs even at the %d unit "
+                                  "ceiling, so the delivered duration may fall short of "
+                                  "QueryDuration. Treat the reported query duration as the "
+                                  "truth rather than QueryDuration."
+                                  % (unit_seconds, MAX_BURN_UNITS))
+                    except Exception as e:
+                        print("ERROR: CPU calibration failed: %s" % str(e)[:200])
+                        sys.exit(1)
+
+                print("Statement to be issued:")
+                print("  %s" % build_sql(marker, pattern, query_seconds, work_units, source, iterations)[:400])
+
+                results = {'durations': [], 'over_threshold': 0, 'errors': 0,
+                           'error_samples': [], 'short_cancellations': 0,
+                           'max_observed_seconds': 0.0, 'max_concurrent_observed': 0,
+                           'observed_over_threshold': False, 'samples': 0,
+                           'observer_error': None}
+                lock = threading.Lock()
+                stop_flag = {'stop': False}
+                deadline = time.time() + experiment_seconds
+
+                threads = []
+                obs = threading.Thread(target=observer, args=(
+                    engine, cfg, marker, deadline, threshold, results, lock, stop_flag))
+                obs.daemon = True
+                obs.start()
+
+                for i in range(concurrent):
+                    t = threading.Thread(target=query_worker, args=(
+                        i + 1, engine, cfg, marker, pattern, query_seconds, work_units,
+                        source, iterations, deadline, threshold, results, lock))
+                    t.start()
+                    threads.append(t)
+                    time.sleep(0.2)
+
+                print("Issuing %d concurrent long-running queries for %ds..."
+                      % (concurrent, experiment_seconds))
+
+                for t in threads:
+                    t.join()
+                stop_flag['stop'] = True
+                obs.join(timeout=15)
+
+                durations = results['durations']
+                completed = len(durations)
+                longest = max(durations) if durations else 0.0
+
+                print("=== Slow Query Injection Complete ===")
+                print("Queries completed: %d" % completed)
+                print("Queries at or over %ds: %d" % (threshold, results['over_threshold']))
+                print("Longest query (client-measured): %.1fs" % longest)
+                print("Longest query (seen in database session view): %.1fs" % results['max_observed_seconds'])
+                print("Peak concurrent long queries in session view: %d" % results['max_concurrent_observed'])
+                print("Session view samples taken: %d" % results['samples'])
+                if results['observer_error']:
+                    print("Observer error: %s" % results['observer_error'])
+                print("Query errors: %d" % results['errors'])
+                print("Cancelled well short of target: %d" % results['short_cancellations'])
+                for sample in results['error_samples'][:5]:
+                    print("  error: %s" % sample)
+                print("=====================================")
+
+                fault_injected = results['over_threshold'] >= min_long_queries
+
+                result = {
+                    "QueryMarker": marker,
+                    "QueryPattern": pattern,
+                    "ScanSource": source_label if pattern == 'realistic' else None,
+                    "OracleSingleStatementForm": ORACLE_CAPS['sql_sleep'] if engine == 'oracle' else None,
+                    "CpuBurnIterations": iterations if pattern == 'cpu' else None,
+                    "CpuBurnUnits": work_units if pattern == 'cpu' else None,
+                    "ConcurrentQueries": concurrent,
+                    "QueriesCompleted": completed,
+                    "QueriesOverThreshold": results['over_threshold'],
+                    "LongQueryThresholdSeconds": threshold,
+                    "LongestQuerySeconds": round(longest, 1),
+                    "LongestObservedInSessionViewSeconds": round(results['max_observed_seconds'], 1),
+                    "PeakConcurrentInSessionView": results['max_concurrent_observed'],
+                    "SessionViewSamples": results['samples'],
+                    "VisibleToServerSideMonitoring": results['observed_over_threshold'],
+                    "QueryErrors": results['errors'],
+                    "ShortCancellations": results['short_cancellations'],
+                    "FaultInjected": fault_injected
+                }
+                print(json.dumps(result))
+
+                if not fault_injected:
+                    print("ERROR: Fault was not reliably injected - only %d queries reached the %ds "
+                          "threshold (minimum required: %d)."
+                          % (results['over_threshold'], threshold, min_long_queries))
+                    if completed and longest < 1.0:
+                        print("       Queries completed almost instantly (%.1fs). The statement did "
+                              "not run for the requested duration at all - for QueryPattern=cpu "
+                              "raise CpuWorkUnits, since cpu duration comes from that and not from "
+                              "QueryDuration." % longest)
+                    if results['short_cancellations']:
+                        print("       %d queries were cancelled well short of their target duration, "
+                              "which usually means a server-side statement timeout is shorter than "
+                              "QueryDuration. Check the reported statement limit above."
+                              % results['short_cancellations'])
+                    sys.exit(1)
+
+                if results['samples'] == 0:
+                    print("NOTE: the observer could not read the session view, so server-side "
+                          "visibility was not assessed. The queries still ran - this only means "
+                          "the experiment could not confirm what monitoring would see. Grant the "
+                          "database user read access to the session view to enable this check.")
+                elif not results['observed_over_threshold']:
+                    print("NOTE: queries ran long enough client-side, but no sample caught one at "
+                          "or over the %ds threshold in the session view. Either the sample "
+                          "interval (%ds) is coarse relative to the threshold, or the queries are "
+                          "not visible there. Monitoring that polls the session view on a similar "
+                          "interval would miss them too - which is itself a finding."
+                          % (threshold, OBSERVER_INTERVAL_SECONDS))
+
+            if __name__ == '__main__':
+                main()
+            PYTHON_EOF
+
+            python3 /tmp/slow_query.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ QueryPattern }}" \
+              "{{ QueryDuration }}" \
+              "{{ ExperimentDuration }}" \
+              "{{ ConcurrentQueries }}" \
+              "{{ LongQueryThresholdSeconds }}" \
+              "{{ MinLongQueriesObserved }}" \
+              "{{ CpuWorkUnits }}" \
+              "{{ TargetTableName }}" \
+              "{{ ScanRowCount }}" \
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}"
+
+  - name: TerminateLingeringQueries
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 600
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            cat > /tmp/terminate_queries.py << 'PYTHON_EOF'
+            import sys
+            import json
+            import time
+
+            sys.path.insert(0, '/tmp')
+
+            # Also runs when ExecuteSlowQueries failed. If its modules were never
+            # written then no query was issued, so skipping is correct.
+            try:
+                from fis_slow_common import query_marker, get_password
+                from slow_query import ENGINES
+            except ImportError as e:
+                print("Nothing to clean up: the query modules were never written to the "
+                      "load generator (%s), so no slow queries were started." % str(e)[:120])
+                sys.exit(0)
+
+            # How long to wait for terminated sessions to actually disappear from the
+            # session view before reporting them as stuck.
+            SESSION_CLEAR_TIMEOUT_SECONDS = 30
+
+            def main():
+                engine = sys.argv[1]
+                endpoint = sys.argv[2]
+                port = int(sys.argv[3])
+                dbname = sys.argv[4]
+                user = sys.argv[5]
+                secret_arn = sys.argv[6]
+                region = sys.argv[7]
+                execution_id = sys.argv[8]
+
+                marker = query_marker(execution_id)
+                connect, _sql, observe, terminate, _to = ENGINES[engine]
+
+                print("=== Terminate Lingering Slow Queries ===")
+                print("Marker: %s" % marker)
+
+                password = get_password(secret_arn, region)
+                cfg = {'endpoint': endpoint, 'port': port, 'dbname': dbname,
+                       'user': user, 'password': password}
+
+                conn = connect(cfg, marker + '-cleanup')
+                try:
+                    conn.autocommit = True
+                    before, max_age = observe(conn, marker)
+                    print("Sessions still active for this execution: %d (oldest %.0fs)" % (before, max_age))
+                    killed = terminate(conn, marker)
+                    print("Sessions terminated: %d" % killed)
+
+                    # Termination is a signal, not a synchronous kill: the session takes
+                    # a moment to leave the session view, so poll rather than re-read
+                    # immediately and wrongly report a cleanup failure.
+                    after = before
+                    deadline = time.time() + SESSION_CLEAR_TIMEOUT_SECONDS
+                    while time.time() < deadline:
+                        after, _ = observe(conn, marker)
+                        if after == 0:
+                            break
+                        time.sleep(2)
+
+                    if after == 0:
+                        print("Sessions still active after cleanup: 0 (all cleared)")
+                    else:
+                        print("WARNING: %d session(s) for this execution were still visible after "
+                              "%ds. They may yet clear, but check for a session that is not "
+                              "responding to termination."
+                              % (after, SESSION_CLEAR_TIMEOUT_SECONDS))
+                    print(json.dumps({"QueryMarker": marker, "SessionsTerminated": killed,
+                                      "SessionsRemaining": after,
+                                      "SessionsCleared": after == 0}))
+                finally:
+                    conn.close()
+                print("========================================")
+
+            if __name__ == '__main__':
+                main()
+            PYTHON_EOF
+
+            python3 /tmp/terminate_queries.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}"
+
+  - name: TerminateInstance
+    action: 'aws:changeInstanceState'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      DesiredState: terminated
+
+  - name: WaitForInstanceTermination
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'Continue'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - terminated
+
+  - name: RevokeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Runtime: python3.11
+      Handler: revoke_ingress
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def revoke_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            try:
+                response = ec2.revoke_security_group_ingress(
+                    GroupId=database_sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': port,
+                        'ToPort': port,
+                        'UserIdGroupPairs': [{
+                            'GroupId': load_gen_sg_id
+                        }]
+                    }]
+                )
+                return {'StatusCode': 200, 'Response': response}
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                    return {'StatusCode': 200, 'Response': 'Ingress rule already absent'}
+                return {'StatusCode': 500, 'Error': str(e)}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: CleanupSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: DeleteSecurityGroup
+      GroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+
+outputs:
+  - LaunchLoadGenerator.InstanceId
+  - CreateSecurityGroup.SecurityGroupId
