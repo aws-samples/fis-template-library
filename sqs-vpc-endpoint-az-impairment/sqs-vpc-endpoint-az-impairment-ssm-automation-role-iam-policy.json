@@ -1,0 +1,31 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowDescribeEndpointsAndSubnets",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeVpcEndpoints",
+                "ec2:DescribeSubnets"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowPolicyChangeOnTaggedEndpoints",
+            "Effect": "Allow",
+            "Action": "ec2:ModifyVpcEndpoint",
+            "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:vpc-endpoint/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/FIS-Ready": "True"
+                }
+            }
+        },
+        {
+            "Sid": "AllowReadingTheAutomationStatus",
+            "Effect": "Allow",
+            "Action": "ssm:GetAutomationExecution",
+            "Resource": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:automation-execution/*"
+        }
+    ]
+}

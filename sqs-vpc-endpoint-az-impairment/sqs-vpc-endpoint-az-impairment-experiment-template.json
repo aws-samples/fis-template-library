@@ -1,0 +1,29 @@
+{
+    "description": "SQS VPC endpoint AZ impairment - denies Amazon SQS requests made through tagged SQS interface VPC endpoints from subnets in one Availability Zone, while clients in the other Availability Zones keep working",
+    "roleArn": "arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR ROLE NAME>",
+    "actions": {
+        "deny-sqs-from-az": {
+            "actionId": "aws:ssm:start-automation-execution",
+            "description": "Add a deny statement for requests from subnets in the target Availability Zone to the endpoint policy of every SQS interface VPC endpoint tagged FIS-Ready=True, wait, then remove it. The statement is also removed if the experiment is stopped.",
+            "parameters": {
+                "documentArn": "arn:aws:ssm:<YOUR REGION>:<YOUR AWS ACCOUNT>:document/sqs-vpc-endpoint-az-impairment-automation",
+                "documentParameters": "{\"AvailabilityZone\":\"<YOUR TARGET AZ>\",\"Duration\":\"PT10M\",\"TagKey\":\"FIS-Ready\",\"TagValue\":\"True\",\"AutomationAssumeRole\":\"arn:aws:iam::<YOUR AWS ACCOUNT>:role/<YOUR SSM ROLE NAME>\"}",
+                "maxDuration": "PT20M"
+            }
+        }
+    },
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "targets": {},
+    "tags": {
+        "Name": "sqs-vpc-endpoint-az-impairment",
+        "Purpose": "chaos-engineering"
+    },
+    "experimentOptions": {
+        "accountTargeting": "single-account",
+        "emptyTargetResolutionMode": "skip"
+    }
+}

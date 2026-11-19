@@ -1,0 +1,225 @@
+description: "Impair Amazon SQS for clients in one Availability Zone by adding a deny statement to the endpoint policy of tagged SQS interface VPC endpoints. The statement denies sqs:* for requests whose source IP is in a subnet of the target Availability Zone. The statement is removed when the duration ends, when the automation is cancelled (for example when the FIS experiment is stopped), and when adding the statement or waiting fails."
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  AvailabilityZone:
+    type: String
+    description: "Availability Zone to impair, as a name (for example us-east-1a) or an ID (for example use1-az1). Every subnet in this Availability Zone in the VPC of each target endpoint is impaired."
+    allowedPattern: "^[a-z]{2}(-[a-z]+)+-[0-9]+[a-z]$|^[a-z]{2,4}[0-9]+-az[0-9]+$"
+  Duration:
+    type: String
+    description: "How long to keep the deny statement in place, in ISO 8601 format (for example PT10M)."
+    default: "PT10M"
+    allowedPattern: "^PT([0-9]+H)?([0-9]+M)?([0-9]+S)?$"
+  TagKey:
+    type: String
+    description: "Tag key that marks the SQS interface VPC endpoints to impair."
+    default: "FIS-Ready"
+    allowedPattern: "^[a-zA-Z0-9+\\-=._:/@ ]{1,128}$"
+  TagValue:
+    type: String
+    description: "Tag value that marks the SQS interface VPC endpoints to impair."
+    default: "True"
+    allowedPattern: "^[a-zA-Z0-9+\\-=._:/@ ]{0,256}$"
+  AutomationAssumeRole:
+    type: String
+    description: "ARN of the IAM role that this automation assumes."
+    allowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:role/[\\w+=,.@/-]+$"
+
+mainSteps:
+  - name: FindTargets
+    action: aws:executeScript
+    onFailure: Abort
+    timeoutSeconds: 120
+    description: "Find the available SQS interface VPC endpoints that carry the tag, and the CIDR blocks of the subnets in the target Availability Zone of each endpoint's VPC. Nothing is changed in this step."
+    inputs:
+      Runtime: python3.11
+      Handler: find_targets
+      InputPayload:
+        AvailabilityZone: "{{ AvailabilityZone }}"
+        TagKey: "{{ TagKey }}"
+        TagValue: "{{ TagValue }}"
+      Script: |
+        import json
+        import boto3
+
+        def find_targets(events, context):
+            az = events["AvailabilityZone"]
+            ec2 = boto3.client("ec2")
+            region = ec2.meta.region_name
+            sqs_services = {f"com.amazonaws.{region}.sqs", f"com.amazonaws.{region}.sqs-fips"}
+
+            endpoints = []
+            for page in ec2.get_paginator("describe_vpc_endpoints").paginate(Filters=[
+                {"Name": f"tag:{events['TagKey']}", "Values": [events["TagValue"]]},
+                {"Name": "vpc-endpoint-type", "Values": ["Interface"]},
+            ]):
+                for ep in page["VpcEndpoints"]:
+                    if ep["ServiceName"] in sqs_services:
+                        endpoints.append(ep)
+            if not endpoints:
+                raise RuntimeError(f"No SQS interface VPC endpoint has the tag {events['TagKey']}={events['TagValue']}. Nothing was changed.")
+            not_available = [ep["VpcEndpointId"] for ep in endpoints if ep["State"].lower() != "available"]
+            if not_available:
+                raise RuntimeError(f"These tagged SQS endpoints are not in the available state: {not_available}. Nothing was changed.")
+
+            targets = []
+            for ep in sorted(endpoints, key=lambda e: e["VpcEndpointId"]):
+                cidrs = []
+                for page in ec2.get_paginator("describe_subnets").paginate(Filters=[{"Name": "vpc-id", "Values": [ep["VpcId"]]}]):
+                    for subnet in page["Subnets"]:
+                        if az not in (subnet["AvailabilityZone"], subnet["AvailabilityZoneId"]):
+                            continue
+                        cidrs.append(subnet["CidrBlock"])
+                        cidrs.extend(a["Ipv6CidrBlock"] for a in subnet.get("Ipv6CidrBlockAssociationSet", [])
+                                     if a.get("Ipv6CidrBlockState", {}).get("State") == "associated")
+                if not cidrs:
+                    raise RuntimeError(f"VPC {ep['VpcId']} of endpoint {ep['VpcEndpointId']} has no subnet in {az}. Nothing was changed.")
+                targets.append({"VpcEndpointId": ep["VpcEndpointId"], "VpcId": ep["VpcId"], "Cidrs": sorted(set(cidrs))})
+                print(f"Target {ep['VpcEndpointId']} in {ep['VpcId']}: deny sqs:* from {sorted(set(cidrs))}")
+            return {"Targets": json.dumps(targets)}
+    outputs:
+      - Name: Targets
+        Selector: $.Payload.Targets
+        Type: String
+
+  - name: ApplyDeny
+    action: aws:executeScript
+    onFailure: step:RemoveDeny
+    onCancel: step:RemoveDeny
+    timeoutSeconds: 120
+    description: "Add the deny statement to each target endpoint policy. Every other statement is kept. If a statement from an earlier run is still present it is replaced, so the policy never holds two copies. Systems Manager does not stop a running script when the automation is cancelled, so before each policy change the script checks that its own automation is still running and changes nothing more if it is not."
+    inputs:
+      Runtime: python3.11
+      Handler: apply_deny
+      InputPayload:
+        Targets: "{{ FindTargets.Targets }}"
+        ExecutionId: "{{automation:EXECUTION_ID}}"
+      Script: |
+        import json
+        import boto3
+
+        SID = "FISDenySqsFromAvailabilityZone"
+        MAX_POLICY_CHARS = 20480
+
+        def apply_deny(events, context):
+            targets = json.loads(events["Targets"])
+            ec2 = boto3.client("ec2")
+            ssm = boto3.client("ssm")
+
+            def still_running():
+                status = ssm.get_automation_execution(AutomationExecutionId=events["ExecutionId"])["AutomationExecution"]["AutomationExecutionStatus"]
+                return status in ("Pending", "InProgress", "Waiting")
+
+            # Build every new policy first, so a policy that would be too large stops the run before any endpoint is changed.
+            planned = []
+            for t in targets:
+                ep = ec2.describe_vpc_endpoints(VpcEndpointIds=[t["VpcEndpointId"]])["VpcEndpoints"][0]
+                policy = json.loads(ep["PolicyDocument"])
+                statements = policy.get("Statement", [])
+                if isinstance(statements, dict):
+                    statements = [statements]
+                statements = [s for s in statements if s.get("Sid") != SID]
+                statements.append({
+                    "Sid": SID,
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "sqs:*",
+                    "Resource": "*",
+                    "Condition": {
+                        "IpAddress": {"aws:VpcSourceIp": t["Cidrs"]},
+                        "StringEquals": {"aws:SourceVpc": t["VpcId"]},
+                    },
+                })
+                policy["Statement"] = statements
+                text = json.dumps(policy)
+                if len(text) > MAX_POLICY_CHARS:
+                    raise RuntimeError(f"Adding the deny statement would make the policy of {t['VpcEndpointId']} {len(text)} characters, over the {MAX_POLICY_CHARS} limit. Nothing was changed.")
+                planned.append((t["VpcEndpointId"], text))
+
+            applied = []
+            for endpoint_id, text in planned:
+                if not still_running():
+                    print(f"The automation is no longer running (it was cancelled or failed). Not changing {endpoint_id} or any later endpoint.")
+                    break
+                ec2.modify_vpc_endpoint(VpcEndpointId=endpoint_id, PolicyDocument=text)
+                applied.append(endpoint_id)
+                print(f"Added {SID} to the endpoint policy of {endpoint_id}")
+            return {"Applied": applied}
+
+  - name: WaitForDuration
+    action: aws:sleep
+    onFailure: step:RemoveDeny
+    onCancel: step:RemoveDeny
+    description: "Keep the deny statement in place for the requested duration."
+    inputs:
+      Duration: "{{ Duration }}"
+
+  - name: RemoveDeny
+    action: aws:executeScript
+    timeoutSeconds: 300
+    isEnd: true
+    description: "Remove the deny statement from every target endpoint policy. Every other statement is kept. The step keeps checking for 30 seconds and removes the statement again if it reappears, because a cancelled ApplyDeny script can still finish a policy change it had already started. This step runs at the end of the duration, when the automation is cancelled, and when ApplyDeny or WaitForDuration fails. It fails if any endpoint still holds the statement at the end."
+    inputs:
+      Runtime: python3.11
+      Handler: remove_deny
+      InputPayload:
+        Targets: "{{ FindTargets.Targets }}"
+      Script: |
+        import json
+        import time
+        import boto3
+
+        SID = "FISDenySqsFromAvailabilityZone"
+        SETTLE_SECONDS = 30
+        POLL_SECONDS = 3
+
+        def statements_of(ep):
+            statements = json.loads(ep["PolicyDocument"]).get("Statement", [])
+            return [statements] if isinstance(statements, dict) else statements
+
+        def remove_deny(events, context):
+            targets = json.loads(events["Targets"])
+            endpoint_ids = [t["VpcEndpointId"] for t in targets]
+            ec2 = boto3.client("ec2")
+            removals = {e: 0 for e in endpoint_ids}
+            errors = {}
+            deadline = time.time() + SETTLE_SECONDS
+            while True:
+                for endpoint_id in endpoint_ids:
+                    try:
+                        ep = ec2.describe_vpc_endpoints(VpcEndpointIds=[endpoint_id])["VpcEndpoints"][0]
+                        policy = json.loads(ep["PolicyDocument"])
+                        statements = statements_of(ep)
+                        kept = [s for s in statements if s.get("Sid") != SID]
+                        if len(kept) != len(statements):
+                            if kept:
+                                policy["Statement"] = kept
+                                ec2.modify_vpc_endpoint(VpcEndpointId=endpoint_id, PolicyDocument=json.dumps(policy))
+                            else:
+                                ec2.modify_vpc_endpoint(VpcEndpointId=endpoint_id, ResetPolicy=True)
+                            removals[endpoint_id] += 1
+                            print(f"{endpoint_id}: removed {SID} (removal {removals[endpoint_id]})")
+                        errors.pop(endpoint_id, None)
+                    except Exception as e:
+                        errors[endpoint_id] = str(e)
+                if time.time() >= deadline:
+                    break
+                time.sleep(POLL_SECONDS)
+
+            still_present = []
+            for endpoint_id in endpoint_ids:
+                try:
+                    ep = ec2.describe_vpc_endpoints(VpcEndpointIds=[endpoint_id])["VpcEndpoints"][0]
+                    if any(s.get("Sid") == SID for s in statements_of(ep)):
+                        still_present.append(endpoint_id)
+                except Exception as e:
+                    still_present.append(f"{endpoint_id} ({e})")
+            for endpoint_id in endpoint_ids:
+                if not removals[endpoint_id] and endpoint_id not in still_present:
+                    print(f"{endpoint_id}: the policy does not hold {SID}")
+            if still_present or errors:
+                raise RuntimeError("The deny statement may still be in place. Remove the statement with Sid "
+                                   f"{SID} from these endpoint policies yourself: {sorted(set(still_present) | set(errors))}. Errors: {errors}")
+            print(f"Checked every endpoint for {SETTLE_SECONDS} seconds; none holds {SID}")
+            return {"Restored": endpoint_ids, "Removals": removals}
