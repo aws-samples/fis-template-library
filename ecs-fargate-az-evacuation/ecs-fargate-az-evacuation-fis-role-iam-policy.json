@@ -41,6 +41,7 @@
         "ec2:DescribeSubnets",
         "ec2:DescribeVpcs",
         "ec2:DescribeNetworkAcls",
+        "ec2:DescribeNetworkInterfaces",
         "ec2:DescribeManagedPrefixLists",
         "ec2:GetManagedPrefixListEntries"
       ],
@@ -63,8 +64,7 @@
       "Effect": "Allow",
       "Action": [
         "ec2:CreateNetworkAclEntry",
-        "ec2:DeleteNetworkAcl",
-        "ec2:ReplaceNetworkAclAssociation"
+        "ec2:DeleteNetworkAcl"
       ],
       "Resource": "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
       "Condition": {
@@ -72,6 +72,15 @@
           "aws:ResourceTag/managedByFIS": "true"
         }
       }
+    },
+    {
+      "Sid": "AllowReplaceNetworkAclAssociation",
+      "Effect": "Allow",
+      "Action": "ec2:ReplaceNetworkAclAssociation",
+      "Resource": [
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:network-acl/*",
+        "arn:aws:ec2:<YOUR REGION>:<YOUR AWS ACCOUNT>:subnet/*"
+      ]
     },
     {
       "Sid": "AllowSSMSendCommand",
