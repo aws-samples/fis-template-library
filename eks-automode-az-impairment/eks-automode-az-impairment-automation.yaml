@@ -42,22 +42,27 @@ parameters:
     type: String
     description: >-
       Subnet ID in which to launch the ephemeral K8s client instance. MUST be a
-      subnet that can reach the cluster's Kubernetes API endpoint (i.e. the
-      cluster has private endpoint access enabled and this subnet is permitted
-      to reach it) AND can reach the AWS Systems Manager endpoints (via NAT or
-      the com.amazonaws.<region>.ssm / .ssmmessages / .ec2messages interface
-      endpoints) so the SSM Agent can register. Do NOT use a subnet in the
-      target AZ being impaired, or the network disruption will also sever the
-      client instance.
+      subnet that can reach the cluster's Kubernetes API endpoint: the cluster
+      has private endpoint access enabled and the cluster security group allows
+      TCP 443 from this subnet's CIDR (the client gets a new security group on
+      every run). The subnet also needs outbound internet access, for example
+      through a NAT gateway: the client installs packages from the internet and
+      calls the EKS, EC2 and CloudWatch Logs APIs, so the ssm, ssmmessages and
+      ec2messages interface endpoints alone are not enough. Do NOT use a subnet
+      in the target AZ being impaired, or the network disruption will also
+      sever the client instance.
   VpcId:
     type: String
     description: VPC ID in which the temporary security group is created
   InstanceProfileName:
     type: String
     description: >-
-      Name of an existing EC2 instance profile with the
-      AmazonSSMManagedInstanceCore managed policy attached, so the ephemeral
-      instance can register with SSM and receive the runCommand.
+      Name of an existing EC2 instance profile whose role has the
+      AmazonSSMManagedInstanceCore managed policy (so the ephemeral instance can
+      register with SSM and receive the runCommand), the inline policy from
+      eks-automode-az-impairment-instance-profile-iam-policy.json, and an EKS
+      access entry bound by the RBAC manifest, because the Kubernetes calls run
+      under this role.
     default: 'SSM-Managed-Instance-Profile'
   InstanceType:
     type: String
@@ -234,6 +239,7 @@ mainSteps:
             export CLUSTER_NAME='{{ ClusterName }}'
             export TARGET_AZ='{{ TargetAZ }}'
             export NODE_POOL_NAME='{{ NodePoolName }}'
+            export AWS_DEFAULT_REGION='{{ global:REGION }}'
             cat > /tmp/eks_impair.py <<'PYEOF'
             import os
             import sys
@@ -410,7 +416,11 @@ mainSteps:
                 ca_file.close()
                 try:
                     token = get_token(cluster_name)
-                    http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name)
+                    # Bounded waits: an unreachable endpoint address fails in seconds, not minutes, so the
+                    # client moves on to the next address and an unreachable API fails the step quickly.
+                    http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name,
+                                               timeout=urllib3.Timeout(connect=5.0, read=30.0),
+                                               retries=urllib3.Retry(total=3, connect=3, read=1, backoff_factor=1))
 
                     cordon_nodes(http, endpoint, token, target_az)
                     patch_result = patch_nodepool(http, endpoint, token, cluster_name, target_az, node_pool_name)
@@ -470,6 +480,7 @@ mainSteps:
             export CLUSTER_NAME='{{ ClusterName }}'
             export TARGET_AZ='{{ TargetAZ }}'
             export NODE_POOL_NAME='{{ NodePoolName }}'
+            export AWS_DEFAULT_REGION='{{ global:REGION }}'
             cat > /tmp/eks_restore.py <<'PYEOF'
             import os
             import json
@@ -527,7 +538,11 @@ mainSteps:
 
                 try:
                     token = get_token(cluster_name)
-                    http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name)
+                    # Bounded waits: an unreachable endpoint address fails in seconds, not minutes, so the
+                    # client moves on to the next address and an unreachable API fails the step quickly.
+                    http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=ca_file.name,
+                                               timeout=urllib3.Timeout(connect=5.0, read=30.0),
+                                               retries=urllib3.Retry(total=3, connect=3, read=1, backoff_factor=1))
                 except Exception:
                     if os.path.exists(ca_file.name):
                         os.unlink(ca_file.name)
