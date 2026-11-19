@@ -64,13 +64,15 @@ SSM Automation Document
     ↓
 8. Hold connections for specified duration
     ↓
-9. Release connections
+9. Release connections at the end of ExperimentDuration
     ↓
-10. Terminate EC2 instance
+10. Stop the harness if it is still running (after an early stop): SIGTERM, then SIGKILL after 15s
     ↓
-11. Remove ingress rule from database SG
+11. Terminate EC2 instance
     ↓
-12. Delete temporary security group
+12. Remove ingress rule from database SG
+    ↓
+13. Delete temporary security group
 ```
 
 ## Prerequisites
@@ -150,40 +152,45 @@ The experiment requires the following parameters:
 6. Waits for SSM Agent to report online status
 
 ### Phase 2: Bootstrap (1-2 minutes)
-4. Installs appropriate database client based on `DatabaseEngine` parameter
+7. Installs appropriate database client based on `DatabaseEngine` parameter
 
 ### Phase 3: Connection Exhaustion (Duration: ExperimentDuration)
-5. Retrieves RDS password from Secrets Manager
-6. Validates and adjusts `RampTimeSeconds` if it exceeds `ExperimentDuration`
-7. Gradually opens connections over `RampTimeSeconds` in `RampSteps` increments:
-   - Each step opens `MaxConnections / RampSteps` connections
-   - Time between steps: `RampTimeSeconds / RampSteps` seconds
-   - **Each connection holds until experiment end**: Connections opened at T=0 hold for full `ExperimentDuration`, connections opened at T=60s hold for `ExperimentDuration - 60s`
-   - **Keepalive mechanism**: Each connection sends a lightweight query (`SELECT 1`) every 30 seconds to prevent idle timeouts
-   - Example: 10-minute experiment, 5-minute ramp, 10 steps
-     * Step 1 (T=0): Open 10 connections → hold for 10 minutes with keepalive
-     * Step 5 (T=2.5m): Open 10 connections → hold for 7.5 minutes with keepalive
-     * Step 10 (T=5m): Open 10 connections → hold for 5 minutes with keepalive
-   - Set `RampTimeSeconds=0` to open all connections immediately (all hold for full duration)
-8. Each connection runs a keepalive loop that sends periodic queries to maintain the connection
-9. All connections release simultaneously at experiment end
+8. Retrieves RDS password from Secrets Manager
+9. Validates and adjusts `RampTimeSeconds` if it exceeds `ExperimentDuration`
+10. Gradually opens connections over `RampTimeSeconds` in `RampSteps` increments:
+    - Each step opens `MaxConnections / RampSteps` connections
+    - Time between steps: `RampTimeSeconds / RampSteps` seconds
+    - **Each connection holds until experiment end**: Connections opened at T=0 hold for full `ExperimentDuration`, connections opened at T=60s hold for `ExperimentDuration - 60s`
+    - **Keepalive mechanism**: Each connection sends a lightweight query (`SELECT 1`) every 30 seconds to prevent idle timeouts
+    - Example: 10-minute experiment, 5-minute ramp, 10 steps
+      * Step 1 (T=0): Open 10 connections → hold for 10 minutes with keepalive
+      * Step 5 (T=2.5m): Open 10 connections → hold for 7.5 minutes with keepalive
+      * Step 10 (T=5m): Open 10 connections → hold for 5 minutes with keepalive
+    - Set `RampTimeSeconds=0` to open all connections immediately (all hold for full duration)
+11. Each connection runs a keepalive loop that sends periodic queries to maintain the connection
+12. All connections release at experiment end. The load generator also installs a `SIGTERM` handler, so if the
+    experiment is stopped early the `StopHarness` step makes it close every open connection at once (the worker
+    threads are daemon threads, so the process exits as soon as the connections are closed).
 
 ### Phase 4: Cleanup
-10. Releases all database connections
-11. Terminates the EC2 instance
-12. Waits for instance termination to complete
-13. Removes the ingress rule from the database security group
-14. Deletes the temporary security group
-15. Returns execution summary
+13. Runs the `StopHarness` step: sends the load generator `SIGTERM` (waits up to 15 s, then `SIGKILL`) so its
+    connections close while the instance network is still up. On a normal finish the harness has already exited and
+    the step is a no-op.
+14. Terminates the EC2 instance
+15. Waits for instance termination to complete
+16. Removes the ingress rule from the database security group
+17. Deletes the temporary security group
+18. Returns execution summary
 
 ## Stop Conditions
 
-The experiment template does not have any specific stop conditions defined by default. It will continue to run until:
-- All actions complete successfully or one fails
-- Manually stopped via FIS console/API
-- A custom CloudWatch alarm triggers (if configured)
-
-## Observability and Stop Conditions
+The experiment template does not have any specific stop conditions defined by default. It runs until the
+`ExperimentDuration` elapses and the load generator script closes its connections, or until it is stopped (manually, by
+a CloudWatch alarm you configure, or by the action's `maxDuration`). After an early stop or a failure, the automation's
+`StopHarness` step sends the script `SIGTERM` so it closes its database connections before the instance is terminated,
+which frees the connection slots shortly after the stop. (Terminating the instance with the connections still open
+would instead leave the server to drop them on its own TCP keepalive, which on RDS for PostgreSQL defaults is about
+6 minutes, so the exhaustion would outlive the stop.)
 
 Stop conditions are based on an AWS CloudWatch alarm based on an operational or business metric requiring an immediate end of the fault injection. This template makes no assumptions about your application and the relevant metrics and does not include stop conditions by default.
 
@@ -205,13 +212,13 @@ As you adapt this scenario to your needs, we recommend:
    SHOW VARIABLES LIKE 'max_connections';
    SHOW STATUS LIKE 'Threads_connected';
    ```
-4. **Implement Safeguards**: Ensure your application has:
+6. **Implement Safeguards**: Ensure your application has:
    - Connection limiting with max pool size limits
    - Connection timeout configurations
    - Retry logic with exponential backoff
    - Circuit breakers for database calls
-5. **Monitor Cleanup**: Verify the EC2 instance is terminated after the experiment
-6. **Cost Optimization**: Use smaller instance types (t3.micro) if connection count allows
+7. **Monitor Cleanup**: Verify the EC2 instance is terminated after the experiment
+8. **Cost Optimization**: Use smaller instance types (t3.micro) if connection count allows
 
 ## Connection Keepalive and Timeout Handling
 
