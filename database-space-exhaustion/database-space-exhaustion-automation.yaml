@@ -1,0 +1,1091 @@
+schemaVersion: '0.3'
+description: 'Create ephemeral load generator to exhaust database storage space by filling it with a user-specified amount of data, hold the condition for a user-specified duration, then reclaim the space'
+assumeRole: 'arn:aws:iam::{{ global:ACCOUNT_ID }}:role/DatabaseSpaceExhaustion-SSM-Automation-Role'
+
+parameters:
+  DatabaseEngine:
+    type: String
+    description: 'Database engine type'
+    default: 'postgres'
+    allowedValues:
+      - postgres
+      - mysql
+      - sqlserver
+      - oracle
+
+  DatabaseEndpoint:
+    type: String
+    description: 'Database endpoint hostname'
+
+  DatabasePort:
+    type: String
+    description: 'Database port number'
+    default: '5432'
+
+  DatabaseName:
+    type: String
+    description: 'Database name to connect to, or service name for Oracle. Target a dedicated test database rather than a system database - do not point this at sqlserver master or the mysql schema, since this experiment writes gigabytes into it.'
+    default: 'postgres'
+
+  DatabaseUser:
+    type: String
+    description: 'Database username'
+    default: 'postgres'
+
+  DatabasePasswordSecretArn:
+    type: String
+    description: 'ARN of Secrets Manager secret containing database password. Retrieved on the EC2 load generator using its instance profile role - see database-space-exhaustion-ec2-instance-role-iam-policy.json'
+
+  TargetSpaceGB:
+    type: String
+    description: 'How much storage space to consume, in GiB, spread evenly across the worker threads. This space is held for ExperimentDuration and then reclaimed. WARNING: if RDS storage autoscaling is enabled on the target this will trigger a volume expansion that is typically LARGER than this value, cannot be reversed, and continues to cost money after the experiment ends. Transaction log growth adds further space on top. See the README section on storage autoscaling before raising this.'
+    default: '10'
+    allowedPattern: '^[0-9]+(\.[0-9]+)?$'
+
+  ExperimentDuration:
+    type: String
+    description: 'How long to hold the exhausted-space condition once TargetSpaceGB has been written, in ISO8601 format (e.g. PT10M for 10 minutes, PT1H for 1 hour). This is the hold phase only - the fill phase runs before it and is bounded by FillTimeout.'
+    default: 'PT10M'
+
+  WorkerThreads:
+    type: String
+    description: 'Number of concurrent worker threads writing data. Each worker fills its own table with TargetSpaceGB / WorkerThreads of data.'
+    default: '5'
+
+  RowSizeMB:
+    type: String
+    description: 'Size in MiB of the binary payload written per row. Larger rows fill space with fewer statements; smaller rows produce more row-level churn.'
+    default: '1'
+
+  FillTimeout:
+    type: String
+    description: 'Maximum time allowed for the fill phase in ISO8601 format (e.g. PT30M). If the target space has not been written by then, workers stop filling and the achieved space is checked against MinSpaceAchievedPercentage.'
+    default: 'PT30M'
+
+  MinSpaceAchievedPercentage:
+    type: String
+    description: 'Minimum percentage of TargetSpaceGB that must actually be measured as consumed for the experiment to be considered a successful fault injection. If this threshold is not met, FillDatabaseSpace fails, the space is still reclaimed, and the automation exits non-zero. On MySQL, space is measured from information_schema estimates rather than exact sizes - use 80 rather than 90 for a first MySQL run.'
+    default: '90'
+
+  RdsInstanceIdentifier:
+    type: String
+    description: 'Optional RDS DB instance identifier used for the free-storage preflight check. When supplied, the automation reads the AWS/RDS FreeStorageSpace metric and aborts before launching anything if TargetSpaceGB would not fit within the safety margin. Leave empty for Aurora, which does not publish FreeStorageSpace and auto-scales its volume.'
+    default: ''
+
+  FreeSpaceSafetyMarginPercentage:
+    type: String
+    description: 'Percentage of currently free storage that must remain free after writing TargetSpaceGB. Only applied when RdsInstanceIdentifier is supplied.'
+    default: '20'
+
+  SubnetId:
+    type: String
+    description: 'Subnet ID for load generator instance. Must route to the database, and to SSM/SSM Messages, Secrets Manager, and package repository endpoints - see README Prerequisites'
+
+  VpcId:
+    type: String
+    description: 'VPC ID where the load generator will be launched'
+
+  DatabaseSecurityGroupId:
+    type: String
+    description: 'Security group ID of the target database (automation will add a temporary ingress rule). Must be tagged FIS-Ready=True'
+
+  InstanceType:
+    type: String
+    description: 'EC2 instance type (use a network-optimised type such as m5.large or larger when writing tens of GiB)'
+    default: 't3.medium'
+
+  LatestAmiId:
+    type: String
+    description: 'Amazon Linux 2023 AMI ID'
+    default: '{{ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+
+mainSteps:
+  - name: PreflightCheckFreeStorage
+    action: 'aws:executeScript'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Runtime: python3.11
+      Handler: check_free_storage
+      Script: |
+        import boto3
+        from datetime import datetime, timedelta, timezone
+
+        def check_free_storage(events, context):
+            identifier = (events.get('RdsInstanceIdentifier') or '').strip()
+            target_gb = float(events['TargetSpaceGB'])
+            margin_percent = float(events['FreeSpaceSafetyMarginPercentage'])
+            target_bytes = target_gb * (1024 ** 3)
+
+            if target_gb <= 0:
+                raise Exception('TargetSpaceGB must be greater than zero')
+
+            # The preflight is opt-in: it needs an RDS DB instance identifier to
+            # read FreeStorageSpace from. Aurora does not publish that metric and
+            # grows its volume automatically, so Aurora users leave this empty and
+            # bound the experiment with TargetSpaceGB alone.
+            if not identifier:
+                return {
+                    'Checked': False,
+                    'TargetBytes': target_bytes,
+                    'Message': 'RdsInstanceIdentifier not supplied - free storage preflight skipped'
+                }
+
+            cloudwatch = boto3.client('cloudwatch')
+            end_time = datetime.now(timezone.utc)
+            stats = cloudwatch.get_metric_statistics(
+                Namespace='AWS/RDS',
+                MetricName='FreeStorageSpace',
+                Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': identifier}],
+                StartTime=end_time - timedelta(minutes=30),
+                EndTime=end_time,
+                Period=60,
+                Statistics=['Minimum']
+            )
+
+            datapoints = sorted(stats['Datapoints'], key=lambda d: d['Timestamp'])
+            if not datapoints:
+                raise Exception(
+                    'No AWS/RDS FreeStorageSpace datapoints found for DB instance '
+                    + identifier
+                    + '. Check the identifier, or leave RdsInstanceIdentifier empty for Aurora clusters.'
+                )
+
+            free_bytes = float(datapoints[-1]['Minimum'])
+            usable_bytes = free_bytes * (1.0 - margin_percent / 100.0)
+
+            if target_bytes > usable_bytes:
+                raise Exception(
+                    'Refusing to run: TargetSpaceGB of %.2f GiB exceeds the usable free storage of %.2f GiB '
+                    '(%.2f GiB free, keeping %.0f%% in reserve) on DB instance %s. '
+                    'Lower TargetSpaceGB, lower FreeSpaceSafetyMarginPercentage, or add storage.'
+                    % (target_gb, usable_bytes / (1024 ** 3), free_bytes / (1024 ** 3), margin_percent, identifier)
+                )
+
+            return {
+                'Checked': True,
+                'FreeStorageBytes': free_bytes,
+                'UsableBytes': usable_bytes,
+                'TargetBytes': target_bytes,
+                'Message': 'Preflight passed: %.2f GiB target fits within %.2f GiB usable free storage'
+                           % (target_gb, usable_bytes / (1024 ** 3))
+            }
+      InputPayload:
+        RdsInstanceIdentifier: '{{ RdsInstanceIdentifier }}'
+        TargetSpaceGB: '{{ TargetSpaceGB }}'
+        FreeSpaceSafetyMarginPercentage: '{{ FreeSpaceSafetyMarginPercentage }}'
+
+  - name: CreateSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Abort'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: CreateSecurityGroup
+      GroupName: 'FIS-DatabaseSpace-LoadGen-{{ automation:EXECUTION_ID }}'
+      Description: 'Temporary security group for FIS database space exhaustion experiment'
+      VpcId: '{{ VpcId }}'
+      TagSpecifications:
+        - ResourceType: 'security-group'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-DatabaseSpace-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseSpaceExhaustion'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: SecurityGroupId
+        Selector: '$.GroupId'
+        Type: String
+
+  - name: ConfigureSecurityGroupEgress
+    action: 'aws:executeScript'
+    onFailure: 'step:CleanupSecurityGroup'
+    onCancel: 'step:CleanupSecurityGroup'
+    inputs:
+      Runtime: python3.11
+      Handler: configure_egress
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def configure_egress(events, context):
+            ec2 = boto3.client('ec2')
+
+            security_group_id = events['SecurityGroupId']
+            database_sg_id = events['DatabaseSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            # A newly created VPC security group starts with an allow-all outbound
+            # rule. Remove it so the load generator's egress is limited to the
+            # database port plus the HTTPS traffic it needs for SSM and package
+            # installation, rather than unrestricted outbound access.
+            try:
+                ec2.revoke_security_group_egress(
+                    GroupId=security_group_id,
+                    IpPermissions=[{
+                        'IpProtocol': '-1',
+                        'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                    }]
+                )
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'InvalidPermission.NotFound':
+                    raise
+
+            ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': database_sg_id,
+                        'Description': 'Allow outbound to database'
+                    }]
+                }]
+            )
+
+            response = ec2.authorize_security_group_egress(
+                GroupId=security_group_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 443,
+                    'ToPort': 443,
+                    'IpRanges': [{
+                        'CidrIp': '0.0.0.0/0',
+                        'Description': 'HTTPS for SSM, Secrets Manager, and package repositories'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        SecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: AuthorizeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Runtime: python3.11
+      Handler: authorize_ingress
+      Script: |
+        import boto3
+
+        def authorize_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            response = ec2.authorize_security_group_ingress(
+                GroupId=database_sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': port,
+                    'ToPort': port,
+                    'UserIdGroupPairs': [{
+                        'GroupId': load_gen_sg_id,
+                        'Description': 'Allow inbound from FIS load generator'
+                    }]
+                }]
+            )
+
+            return {'StatusCode': 200, 'Response': response}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: LaunchLoadGenerator
+    action: 'aws:runInstances'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      ImageId: '{{ LatestAmiId }}'
+      InstanceType: '{{ InstanceType }}'
+      MinInstanceCount: 1
+      MaxInstanceCount: 1
+      SubnetId: '{{ SubnetId }}'
+      SecurityGroupIds:
+        - '{{ CreateSecurityGroup.SecurityGroupId }}'
+      IamInstanceProfileName: 'SSM-Managed-Instance-Profile'
+      MetadataOptions:
+        HttpTokens: 'required'
+        HttpEndpoint: 'enabled'
+      TagSpecifications:
+        - ResourceType: 'instance'
+          Tags:
+            - Key: 'Name'
+              Value: 'FIS-DatabaseSpace-LoadGenerator'
+            - Key: 'FIS-Experiment'
+              Value: 'DatabaseSpaceExhaustion'
+            - Key: 'AutoCleanup'
+              Value: 'true'
+            - Key: 'ManagedBy'
+              Value: 'FIS-SSM-Automation'
+    outputs:
+      - Name: InstanceId
+        Selector: '$.InstanceIds[0]'
+        Type: String
+
+  - name: WaitForSSMAgent
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      InstanceInformationFilterList:
+        - key: InstanceIds
+          valueSet:
+            - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.InstanceInformationList[0].PingStatus'
+      DesiredValues:
+        - Online
+
+  - name: InstallDatabaseClient
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 600
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            ENGINE="{{ DatabaseEngine }}"
+
+            echo "Installing database client for engine: $ENGINE"
+
+            if [ "$ENGINE" = "postgres" ]; then
+                dnf install -y postgresql15 python3-pip
+                pip3 install psycopg2-binary
+                echo "PostgreSQL client installed"
+
+            elif [ "$ENGINE" = "mysql" ]; then
+                dnf install -y mariadb105 python3-pip
+                pip3 install mysql-connector-python
+                echo "MySQL client installed"
+
+            elif [ "$ENGINE" = "sqlserver" ]; then
+                curl https://packages.microsoft.com/config/rhel/9/prod.repo | tee /etc/yum.repos.d/mssql-release.repo
+                ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel python3-pip
+                pip3 install pyodbc
+                echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+                source ~/.bashrc
+                echo "SQL Server tools installed"
+
+            elif [ "$ENGINE" = "oracle" ]; then
+                dnf install -y python3-pip libaio
+                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm
+                dnf install -y https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm
+                pip3 install oracledb
+                echo "Oracle Instant Client and oracledb installed"
+            else
+                echo "Unsupported database engine: $ENGINE"
+                exit 1
+            fi
+
+            # Install AWS CLI and boto3 for Secrets Manager access
+            dnf install -y aws-cli
+            pip3 install boto3
+
+            echo "Installation complete"
+
+  - name: FillDatabaseSpace
+    action: 'aws:runCommand'
+    onFailure: 'step:ReclaimDatabaseSpace'
+    onCancel: 'step:ReclaimDatabaseSpace'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 7200
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            cat > /tmp/fis_space_common.py << 'PYTHON_EOF'
+            import os
+            import re
+            import json
+            import random
+            import string
+            import boto3
+
+            def parse_iso8601_duration(duration):
+                seconds = 0
+                duration = duration.replace('PT', '')
+
+                if 'H' in duration:
+                    hours, duration = duration.split('H')
+                    seconds += int(hours) * 3600
+
+                if 'M' in duration:
+                    minutes, duration = duration.split('M')
+                    seconds += int(minutes) * 60
+
+                if 'S' in duration:
+                    secs = duration.replace('S', '')
+                    if secs:
+                        seconds += int(secs)
+
+                return seconds
+
+            def table_prefix(execution_id):
+                # Keep table names short and unique per execution so concurrent runs
+                # (or a stale table from a prior run) can never collide, and cleanup
+                # only ever drops objects this execution created. Kept short to stay
+                # under Oracle's 30-character unquoted identifier limit.
+                suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
+                return 'fis_sp_' + suffix
+
+            def get_password(secret_arn, region):
+                sm = boto3.client('secretsmanager', region_name=region)
+                response = sm.get_secret_value(SecretId=secret_arn)
+                try:
+                    secret = json.loads(response['SecretString'])
+                except ValueError:
+                    return response['SecretString']
+                return secret.get('password', response['SecretString'])
+
+            def random_payload(size_bytes):
+                # os.urandom output is incompressible, so engines with page or LOB
+                # compression enabled still consume the full requested space.
+                return os.urandom(size_bytes)
+
+            def batch_rows(rows_per_batch, remaining_bytes, row_bytes):
+                # Shrink the final batch so the worker lands on its target instead of
+                # overshooting by up to a whole batch. Matters most for small targets,
+                # where one full batch can be a large fraction of the requested space.
+                needed = -(-remaining_bytes // row_bytes)
+                return max(1, min(rows_per_batch, needed))
+            PYTHON_EOF
+
+            cat > /tmp/fill_space.py << 'PYTHON_EOF'
+            import sys
+            import time
+            import json
+            import threading
+
+            sys.path.insert(0, '/tmp')
+            from fis_space_common import parse_iso8601_duration, table_prefix, get_password, random_payload, batch_rows
+
+            def fill_worker_postgres(thread_id, cfg, table_name, target_bytes, row_bytes, deadline):
+                import psycopg2
+                written = 0
+                errors = 0
+                measured = 0
+                conn = None
+                try:
+                    conn = psycopg2.connect(
+                        host=cfg['endpoint'], port=cfg['port'], database=cfg['dbname'],
+                        user=cfg['user'], password=cfg['password'], connect_timeout=10
+                    )
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id BIGSERIAL PRIMARY KEY, padding BYTEA NOT NULL, created_at TIMESTAMP DEFAULT NOW())")
+                    # EXTERNAL storage keeps the payload out of the compressor, so the
+                    # bytes written on the wire are the bytes consumed on disk.
+                    cursor.execute(f"ALTER TABLE {table_name} ALTER COLUMN padding SET STORAGE EXTERNAL")
+
+                    rows_per_batch = max(1, (16 * 1024 * 1024) // row_bytes)
+
+                    while written < target_bytes and time.time() < deadline:
+                        try:
+                            rows = batch_rows(rows_per_batch, target_bytes - written, row_bytes)
+                            batch = [(psycopg2.Binary(random_payload(row_bytes)),)
+                                     for _ in range(rows)]
+                            cursor.executemany(f"INSERT INTO {table_name} (padding) VALUES (%s)", batch)
+                            written += rows * row_bytes
+                        except Exception as e:
+                            errors += 1
+                            print(f"Worker {thread_id} insert error: {str(e)}", file=sys.stderr)
+                            time.sleep(0.5)
+                            if errors > 10:
+                                break
+
+                    cursor.execute(f"SELECT pg_total_relation_size('{table_name}')")
+                    measured = int(cursor.fetchone()[0])
+                    cursor.close()
+
+                except Exception as e:
+                    print(f"Worker {thread_id} failed: {str(e)}", file=sys.stderr)
+                    errors += 1
+                finally:
+                    if conn:
+                        conn.close()
+
+                return {'written': written, 'measured': measured, 'errors': errors}
+
+            def fill_worker_mysql(thread_id, cfg, table_name, target_bytes, row_bytes, deadline):
+                import mysql.connector
+                written = 0
+                errors = 0
+                measured = 0
+                conn = None
+                try:
+                    conn = mysql.connector.connect(
+                        host=cfg['endpoint'], port=cfg['port'], database=cfg['dbname'],
+                        user=cfg['user'], password=cfg['password'], connection_timeout=10
+                    )
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    cursor.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id BIGINT AUTO_INCREMENT PRIMARY KEY, padding LONGBLOB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+
+                    rows_per_batch = max(1, (16 * 1024 * 1024) // row_bytes)
+
+                    while written < target_bytes and time.time() < deadline:
+                        try:
+                            rows = batch_rows(rows_per_batch, target_bytes - written, row_bytes)
+                            batch = [(random_payload(row_bytes),) for _ in range(rows)]
+                            cursor.executemany(f"INSERT INTO {table_name} (padding) VALUES (%s)", batch)
+                            written += rows * row_bytes
+                        except Exception as e:
+                            errors += 1
+                            print(f"Worker {thread_id} insert error: {str(e)}", file=sys.stderr)
+                            time.sleep(0.5)
+                            if errors > 10:
+                                break
+
+                    cursor.execute(f"ANALYZE TABLE {table_name}")
+                    cursor.fetchall()
+                    cursor.execute(
+                        "SELECT COALESCE(data_length + index_length, 0) FROM information_schema.tables "
+                        "WHERE table_schema = DATABASE() AND table_name = %s",
+                        (table_name,)
+                    )
+                    row = cursor.fetchone()
+                    measured = int(row[0]) if row else 0
+                    cursor.close()
+
+                except Exception as e:
+                    print(f"Worker {thread_id} failed: {str(e)}", file=sys.stderr)
+                    errors += 1
+                finally:
+                    if conn:
+                        conn.close()
+
+                return {'written': written, 'measured': measured, 'errors': errors}
+
+            def fill_worker_sqlserver(thread_id, cfg, table_name, target_bytes, row_bytes, deadline):
+                import pyodbc
+                written = 0
+                errors = 0
+                measured = 0
+                conn = None
+                try:
+                    conn_str = 'DRIVER={ODBC Driver 18 for SQL Server};SERVER=' + cfg['endpoint'] + ',' + str(cfg['port']) + ';DATABASE=' + cfg['dbname'] + ';UID=' + cfg['user'] + ';PWD=' + cfg['password'] + ';TrustServerCertificate=yes'
+                    conn = pyodbc.connect(conn_str, timeout=10)
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    cursor.execute(f"""
+                        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{table_name}' AND xtype='U')
+                        CREATE TABLE {table_name} (id BIGINT IDENTITY(1,1) PRIMARY KEY, padding VARBINARY(MAX) NOT NULL, created_at DATETIME DEFAULT GETDATE())
+                    """)
+
+                    rows_per_batch = max(1, (16 * 1024 * 1024) // row_bytes)
+
+                    while written < target_bytes and time.time() < deadline:
+                        try:
+                            rows = batch_rows(rows_per_batch, target_bytes - written, row_bytes)
+                            batch = [(random_payload(row_bytes),) for _ in range(rows)]
+                            cursor.fast_executemany = True
+                            cursor.executemany(f"INSERT INTO {table_name} (padding) VALUES (?)", batch)
+                            written += rows * row_bytes
+                        except Exception as e:
+                            errors += 1
+                            print(f"Worker {thread_id} insert error: {str(e)}", file=sys.stderr)
+                            time.sleep(0.5)
+                            if errors > 10:
+                                break
+
+                    cursor.execute(
+                        "SELECT COALESCE(SUM(reserved_page_count), 0) * 8192 FROM sys.dm_db_partition_stats "
+                        "WHERE object_id = OBJECT_ID(?)",
+                        (table_name,)
+                    )
+                    measured = int(cursor.fetchone()[0])
+                    cursor.close()
+
+                except Exception as e:
+                    print(f"Worker {thread_id} failed: {str(e)}", file=sys.stderr)
+                    errors += 1
+                finally:
+                    if conn:
+                        conn.close()
+
+                return {'written': written, 'measured': measured, 'errors': errors}
+
+            def fill_worker_oracle(thread_id, cfg, table_name, target_bytes, row_bytes, deadline):
+                import oracledb
+                written = 0
+                errors = 0
+                measured = 0
+                conn = None
+                try:
+                    oracledb.init_oracle_client()
+                    dsn = oracledb.makedsn(cfg['endpoint'], cfg['port'], service_name=cfg['dbname'])
+                    conn = oracledb.connect(user=cfg['user'], password=cfg['password'], dsn=dsn)
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+
+                    try:
+                        cursor.execute(f"""
+                            BEGIN
+                                EXECUTE IMMEDIATE 'CREATE TABLE {table_name} (id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, padding BLOB NOT NULL, created_at TIMESTAMP DEFAULT SYSTIMESTAMP)';
+                            EXCEPTION
+                                WHEN OTHERS THEN
+                                    IF SQLCODE != -955 THEN RAISE; END IF;
+                            END;
+                        """)
+                    except Exception as e:
+                        print(f"Worker {thread_id} create table warning: {str(e)}", file=sys.stderr)
+
+                    rows_per_batch = max(1, (16 * 1024 * 1024) // row_bytes)
+
+                    while written < target_bytes and time.time() < deadline:
+                        try:
+                            rows = batch_rows(rows_per_batch, target_bytes - written, row_bytes)
+                            batch = [(random_payload(row_bytes),) for _ in range(rows)]
+                            cursor.setinputsizes(oracledb.BLOB)
+                            cursor.executemany(f"INSERT INTO {table_name} (padding) VALUES (:1)", batch)
+                            written += rows * row_bytes
+                        except Exception as e:
+                            errors += 1
+                            print(f"Worker {thread_id} insert error: {str(e)}", file=sys.stderr)
+                            time.sleep(0.5)
+                            if errors > 10:
+                                break
+
+                    # The table, its LOB segment, and the LOB index all consume space.
+                    cursor.execute("""
+                        SELECT NVL(SUM(bytes), 0) FROM user_segments WHERE segment_name IN (
+                            SELECT UPPER(:1) FROM dual
+                            UNION ALL SELECT segment_name FROM user_lobs WHERE table_name = UPPER(:2)
+                            UNION ALL SELECT index_name FROM user_lobs WHERE table_name = UPPER(:3)
+                        )
+                    """, [table_name, table_name, table_name])
+                    measured = int(cursor.fetchone()[0])
+                    cursor.close()
+
+                except Exception as e:
+                    print(f"Worker {thread_id} failed: {str(e)}", file=sys.stderr)
+                    errors += 1
+                finally:
+                    if conn:
+                        conn.close()
+
+                return {'written': written, 'measured': measured, 'errors': errors}
+
+            FILL_WORKERS = {
+                'postgres': fill_worker_postgres,
+                'mysql': fill_worker_mysql,
+                'sqlserver': fill_worker_sqlserver,
+                'oracle': fill_worker_oracle
+            }
+
+            def main():
+                engine = sys.argv[1]
+                endpoint = sys.argv[2]
+                port = int(sys.argv[3])
+                dbname = sys.argv[4]
+                user = sys.argv[5]
+                secret_arn = sys.argv[6]
+                worker_threads = int(sys.argv[7])
+                target_space_gb = float(sys.argv[8])
+                row_size_mb = float(sys.argv[9])
+                fill_timeout_iso = sys.argv[10]
+                min_space_percent = float(sys.argv[11])
+                region = sys.argv[12]
+                execution_id = sys.argv[13]
+
+                if worker_threads < 1:
+                    print("ERROR: WorkerThreads must be at least 1")
+                    sys.exit(1)
+
+                row_bytes = int(row_size_mb * 1024 * 1024)
+                if row_bytes < 1024:
+                    print("ERROR: RowSizeMB is too small - use at least 0.001 (1 KiB)")
+                    sys.exit(1)
+
+                target_bytes = int(target_space_gb * (1024 ** 3))
+                per_worker_target = max(row_bytes, target_bytes // worker_threads)
+                fill_timeout = parse_iso8601_duration(fill_timeout_iso)
+                prefix = table_prefix(execution_id)
+
+                print("=== Database Space Exhaustion: Fill Phase ===")
+                print(f"Engine: {engine}")
+                print(f"Endpoint: {endpoint}:{port}")
+                print(f"Database: {dbname}")
+                print(f"User: {user}")
+                print(f"Target space: {target_space_gb} GiB")
+                print(f"Worker threads: {worker_threads}")
+                print(f"Per-worker target: {per_worker_target / (1024 ** 3):.2f} GiB")
+                print(f"Row payload size: {row_bytes / (1024 * 1024):.3f} MiB")
+                print(f"Fill timeout: {fill_timeout}s")
+                print(f"Table prefix: {prefix}")
+                print("=============================================")
+
+                print("Retrieving database password from Secrets Manager...")
+                try:
+                    password = get_password(secret_arn, region)
+                except Exception as e:
+                    print(f"ERROR: Failed to retrieve password: {str(e)}")
+                    sys.exit(1)
+                print("Password retrieved successfully")
+
+                cfg = {
+                    'endpoint': endpoint,
+                    'port': port,
+                    'dbname': dbname,
+                    'user': user,
+                    'password': password
+                }
+
+                worker_func = FILL_WORKERS[engine]
+                deadline = time.time() + fill_timeout
+                results = [None] * worker_threads
+                threads = []
+
+                print(f"Launching {worker_threads} fill worker threads...")
+
+                for i in range(worker_threads):
+                    table_name = f"{prefix}_{i + 1}"
+
+                    def run_worker(idx=i, tbl=table_name):
+                        results[idx] = worker_func(
+                            idx + 1, cfg, tbl, per_worker_target, row_bytes, deadline
+                        )
+
+                    thread = threading.Thread(target=run_worker)
+                    thread.start()
+                    threads.append(thread)
+                    time.sleep(0.1)
+
+                for thread in threads:
+                    thread.join()
+
+                total_written = sum(r['written'] for r in results if r)
+                total_measured = sum(r['measured'] for r in results if r)
+                total_errors = sum(r['errors'] for r in results if r)
+                achieved_percent = (total_measured / target_bytes * 100) if target_bytes else 0
+
+                print("=== Fill Phase Complete ===")
+                print(f"Bytes written: {total_written / (1024 ** 3):.2f} GiB")
+                print(f"Space measured in database: {total_measured / (1024 ** 3):.2f} GiB")
+                print(f"Target: {target_bytes / (1024 ** 3):.2f} GiB ({achieved_percent:.1f}% achieved)")
+                print(f"Worker errors: {total_errors}")
+                print("===========================")
+
+                fault_injected = total_measured > 0 and achieved_percent >= min_space_percent
+
+                result = {
+                    "TablePrefix": prefix,
+                    "WorkerThreads": worker_threads,
+                    "TargetBytes": target_bytes,
+                    "BytesWritten": total_written,
+                    "SpaceConsumedBytes": total_measured,
+                    "AchievedPercentage": round(achieved_percent, 1),
+                    "WorkerErrors": total_errors,
+                    "FaultInjected": fault_injected
+                }
+                print(json.dumps(result))
+
+                if not fault_injected:
+                    print(f"ERROR: Fault was not reliably injected - only {achieved_percent:.1f}% of the "
+                          f"{target_space_gb} GiB target was consumed (minimum required: {min_space_percent}%). "
+                          f"The space will still be reclaimed by the ReclaimDatabaseSpace step.")
+                    sys.exit(1)
+
+            if __name__ == '__main__':
+                main()
+            PYTHON_EOF
+
+            python3 /tmp/fill_space.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ WorkerThreads }}" \
+              "{{ TargetSpaceGB }}" \
+              "{{ RowSizeMB }}" \
+              "{{ FillTimeout }}" \
+              "{{ MinSpaceAchievedPercentage }}" \
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}"
+
+  - name: HoldSpaceExhaustion
+    action: 'aws:sleep'
+    onFailure: 'step:ReclaimDatabaseSpace'
+    onCancel: 'step:ReclaimDatabaseSpace'
+    inputs:
+      Duration: '{{ ExperimentDuration }}'
+
+  - name: ReclaimDatabaseSpace
+    action: 'aws:runCommand'
+    onFailure: 'step:TerminateInstance'
+    onCancel: 'step:TerminateInstance'
+    inputs:
+      DocumentName: 'AWS-RunShellScript'
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      TimeoutSeconds: 1800
+      Parameters:
+        commands:
+          - |
+            #!/bin/bash
+            set -e
+
+            cat > /tmp/reclaim_space.py << 'PYTHON_EOF'
+            import re
+            import sys
+            import json
+            import boto3
+
+            # Deliberately self-contained rather than importing the fill phase's
+            # helper module: this step also runs when the fill phase failed early,
+            # and must not depend on files that phase may not have written.
+            def table_prefix(execution_id):
+                suffix = re.sub(r'[^0-9a-zA-Z]', '', execution_id)[-8:].lower() or 'default'
+                return 'fis_sp_' + suffix
+
+            def get_password(secret_arn, region):
+                sm = boto3.client('secretsmanager', region_name=region)
+                response = sm.get_secret_value(SecretId=secret_arn)
+                try:
+                    secret = json.loads(response['SecretString'])
+                except ValueError:
+                    return response['SecretString']
+                return secret.get('password', response['SecretString'])
+
+            def reclaim_postgres(cfg, prefix):
+                import psycopg2
+                conn = psycopg2.connect(
+                    host=cfg['endpoint'], port=cfg['port'], database=cfg['dbname'],
+                    user=cfg['user'], password=cfg['password'], connect_timeout=10
+                )
+                try:
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname = current_schema() "
+                        "AND tablename LIKE %s",
+                        (prefix + '%',)
+                    )
+                    tables = [row[0] for row in cursor.fetchall()]
+                    for table in tables:
+                        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                    cursor.close()
+                    return tables
+                finally:
+                    conn.close()
+
+            def reclaim_mysql(cfg, prefix):
+                import mysql.connector
+                conn = mysql.connector.connect(
+                    host=cfg['endpoint'], port=cfg['port'], database=cfg['dbname'],
+                    user=cfg['user'], password=cfg['password'], connection_timeout=10
+                )
+                try:
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = DATABASE() AND table_name LIKE %s",
+                        (prefix + '%',)
+                    )
+                    tables = [row[0] for row in cursor.fetchall()]
+                    for table in tables:
+                        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                    cursor.close()
+                    return tables
+                finally:
+                    conn.close()
+
+            def reclaim_sqlserver(cfg, prefix):
+                import pyodbc
+                conn_str = 'DRIVER={ODBC Driver 18 for SQL Server};SERVER=' + cfg['endpoint'] + ',' + str(cfg['port']) + ';DATABASE=' + cfg['dbname'] + ';UID=' + cfg['user'] + ';PWD=' + cfg['password'] + ';TrustServerCertificate=yes'
+                conn = pyodbc.connect(conn_str, timeout=10)
+                try:
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT name FROM sys.tables WHERE name LIKE ?", (prefix + '%',))
+                    tables = [row[0] for row in cursor.fetchall()]
+                    for table in tables:
+                        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                    cursor.close()
+                    return tables
+                finally:
+                    conn.close()
+
+            def reclaim_oracle(cfg, prefix):
+                import oracledb
+                oracledb.init_oracle_client()
+                dsn = oracledb.makedsn(cfg['endpoint'], cfg['port'], service_name=cfg['dbname'])
+                conn = oracledb.connect(user=cfg['user'], password=cfg['password'], dsn=dsn)
+                try:
+                    conn.autocommit = True
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT table_name FROM user_tables WHERE table_name LIKE UPPER(:1)",
+                        [prefix + '%']
+                    )
+                    tables = [row[0] for row in cursor.fetchall()]
+                    for table in tables:
+                        cursor.execute(f"DROP TABLE {table} PURGE")
+                    cursor.close()
+                    return tables
+                finally:
+                    conn.close()
+
+            RECLAIMERS = {
+                'postgres': reclaim_postgres,
+                'mysql': reclaim_mysql,
+                'sqlserver': reclaim_sqlserver,
+                'oracle': reclaim_oracle
+            }
+
+            def main():
+                engine = sys.argv[1]
+                endpoint = sys.argv[2]
+                port = int(sys.argv[3])
+                dbname = sys.argv[4]
+                user = sys.argv[5]
+                secret_arn = sys.argv[6]
+                region = sys.argv[7]
+                execution_id = sys.argv[8]
+
+                prefix = table_prefix(execution_id)
+
+                print("=== Database Space Exhaustion: Reclaim Phase ===")
+                print(f"Dropping every table matching prefix: {prefix}")
+
+                password = get_password(secret_arn, region)
+
+                cfg = {
+                    'endpoint': endpoint,
+                    'port': port,
+                    'dbname': dbname,
+                    'user': user,
+                    'password': password
+                }
+
+                # Tables are discovered from the catalogue rather than regenerated from
+                # the worker count, so a run that failed part-way through - or one whose
+                # worker count changed - still has every table it created removed.
+                dropped = RECLAIMERS[engine](cfg, prefix)
+
+                print(f"Dropped {len(dropped)} table(s): {', '.join(dropped) if dropped else 'none found'}")
+                print(json.dumps({"TablePrefix": prefix, "DroppedTables": dropped}))
+                print("================================================")
+
+            if __name__ == '__main__':
+                main()
+            PYTHON_EOF
+
+            python3 /tmp/reclaim_space.py \
+              "{{ DatabaseEngine }}" \
+              "{{ DatabaseEndpoint }}" \
+              "{{ DatabasePort }}" \
+              "{{ DatabaseName }}" \
+              "{{ DatabaseUser }}" \
+              "{{ DatabasePasswordSecretArn }}" \
+              "{{ global:REGION }}" \
+              "{{ automation:EXECUTION_ID }}"
+
+  - name: TerminateInstance
+    action: 'aws:changeInstanceState'
+    onFailure: 'step:RevokeInboundFromLoadGenerator'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      DesiredState: terminated
+
+  - name: WaitForInstanceTermination
+    action: 'aws:waitForAwsResourceProperty'
+    timeoutSeconds: 300
+    onFailure: 'Continue'
+    onCancel: 'step:RevokeInboundFromLoadGenerator'
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ LaunchLoadGenerator.InstanceId }}'
+      PropertySelector: '$.Reservations[0].Instances[0].State.Name'
+      DesiredValues:
+        - terminated
+
+  - name: RevokeInboundFromLoadGenerator
+    action: 'aws:executeScript'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Runtime: python3.11
+      Handler: revoke_ingress
+      Script: |
+        import boto3
+        from botocore.exceptions import ClientError
+
+        def revoke_ingress(events, context):
+            ec2 = boto3.client('ec2')
+
+            database_sg_id = events['DatabaseSecurityGroupId']
+            load_gen_sg_id = events['LoadGeneratorSecurityGroupId']
+            port = int(events['DatabasePort'])
+
+            try:
+                response = ec2.revoke_security_group_ingress(
+                    GroupId=database_sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp',
+                        'FromPort': port,
+                        'ToPort': port,
+                        'UserIdGroupPairs': [{
+                            'GroupId': load_gen_sg_id
+                        }]
+                    }]
+                )
+                return {'StatusCode': 200, 'Response': response}
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'InvalidPermission.NotFound':
+                    return {'StatusCode': 200, 'Response': 'Ingress rule already absent'}
+                return {'StatusCode': 500, 'Error': str(e)}
+      InputPayload:
+        DatabaseSecurityGroupId: '{{ DatabaseSecurityGroupId }}'
+        LoadGeneratorSecurityGroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+        DatabasePort: '{{ DatabasePort }}'
+
+  - name: CleanupSecurityGroup
+    action: 'aws:executeAwsApi'
+    onFailure: 'Continue'
+    onCancel: 'Abort'
+    inputs:
+      Service: ec2
+      Api: DeleteSecurityGroup
+      GroupId: '{{ CreateSecurityGroup.SecurityGroupId }}'
+
+outputs:
+  - LaunchLoadGenerator.InstanceId
+  - CreateSecurityGroup.SecurityGroupId
